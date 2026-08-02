@@ -22,6 +22,40 @@ mark_pr_check_migration_complete() {
   chmod 0600 "$state/.pr-check-migration-scan-v1" "$state/.pr-check-migration-v1"
 }
 
+# Bring up the two-arm shape one live watcher can end up in: the arm that forked
+# it, plus a second arm that attached to the same healthy cycle (a manual
+# supervision repair overlapping automatic continuity). Sets OWNER_ARM,
+# ATTACHED_ARM and WATCHER_PID once both arms have reported. Not run in a
+# subshell, so a fixture failure stops the suite rather than being swallowed.
+OWNER_ARM=
+ATTACHED_ARM=
+WATCHER_PID=
+start_owner_and_attached_arms() {  # <state> <fakebin> <owner-out> <attached-out>
+  local state=$1 fakebin=$2 owner_out=$3 attached_out=$4 i
+  OWNER_ARM=
+  ATTACHED_ARM=
+  WATCHER_PID=
+  mark_pr_check_migration_complete "$state"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" > "$owner_out" 2> "$owner_out.err" &
+  OWNER_ARM=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$owner_out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  WATCHER_PID=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  grep -qF "watcher: started pid=$WATCHER_PID" "$owner_out" || fail "owning arm did not start and confirm a watcher: $(cat "$owner_out")"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=2 "$WATCH_ARM" > "$attached_out" 2> "$attached_out.err" &
+  ATTACHED_ARM=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF "watcher: attached pid=$WATCHER_PID" "$attached_out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$WATCHER_PID" "$attached_out" || fail "second arm did not attach to the live watcher: $(cat "$attached_out")"
+}
 
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
@@ -612,6 +646,157 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   pass "attached arm signals record a classified lifecycle entry"
 }
 
+test_attached_arm_accepts_a_cycle_that_delivered_its_wake() {
+  local dir state fakebin owner_out attached_out owner_status attached_status
+  dir=$(make_case two-arm-delivered)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  owner_out="$dir/owner-arm.out"
+  attached_out="$dir/attached-arm.out"
+  start_owner_and_attached_arms "$state" "$fakebin" "$owner_out" "$attached_out"
+  # A real wake ends the cycle successfully: the watcher prints its reason to the
+  # OWNING arm and exits, releasing the lock. No successor can appear inside the
+  # confirmation window, because the next cycle is armed only after that wake has
+  # been handled. The attached arm sees only a released lock, so it must consult
+  # the owner's lifecycle record rather than call a healthy close a failure.
+  printf 'done: two-arm delivered wake\n' >> "$state/wake.status"
+  wait_for_exit "$OWNER_ARM" 200
+  owner_status=$?
+  wait_for_exit "$ATTACHED_ARM" 200
+  attached_status=$?
+  [ "$owner_status" -eq 0 ] || fail "owning arm did not close clean on its delivered wake (status $owner_status): $(cat "$owner_out")"
+  grep -qF "signal: $state/wake.status" "$owner_out" || fail "owning arm did not surface the wake"
+  [ "$attached_status" -eq 0 ] || fail "attached arm failed a cycle that delivered its wake (status $attached_status): $(cat "$attached_out")"
+  grep -qF 'watcher: attached cycle ended after delivering its wake to the owning arm' "$attached_out" \
+    || fail "attached arm did not explain the delivered cycle close"
+  ! grep -qF 'watcher: FAILED' "$attached_out" || fail "attached arm raised a false supervision-loss alarm"
+  grep -q "arm_pid=$ATTACHED_ARM.*watcher_pid=$WATCHER_PID.*origin=attached.*reason=attached-cycle-delivered.*successor=delivered:$WATCHER_PID" "$state/.watch-cycle-exits.log" \
+    || fail "delivered attached cycle was not distinguished in the lifecycle ledger"
+  pass "attached arm accepts a cycle the owning arm closed on a real wake"
+}
+
+test_two_arms_both_fail_when_the_watcher_dies_without_a_wake() {
+  local dir state fakebin owner_out attached_out owner_status attached_status
+  dir=$(make_case two-arm-killed)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  owner_out="$dir/owner-arm.out"
+  attached_out="$dir/attached-arm.out"
+  start_owner_and_attached_arms "$state" "$fakebin" "$owner_out" "$attached_out"
+  # The counterfactual for the case above: same two arms, same released lock, but
+  # the watcher dies with no wake delivered. Real supervision loss must stay loud
+  # from BOTH arms - the delivered-close path may only accept positive evidence.
+  kill -9 "$WATCHER_PID" 2>/dev/null || fail "could not kill the watcher under test"
+  wait_for_exit "$OWNER_ARM" 200
+  owner_status=$?
+  wait_for_exit "$ATTACHED_ARM" 200
+  attached_status=$?
+  [ "$owner_status" -ne 0 ] && [ "$owner_status" -ne 124 ] || fail "owning arm did not fail for a killed watcher (status $owner_status): $(cat "$owner_out")"
+  grep -qF 'watcher: FAILED' "$owner_out" || fail "owning arm omitted the typed failure for a killed watcher"
+  [ "$attached_status" -ne 0 ] && [ "$attached_status" -ne 124 ] || fail "attached arm did not fail for a killed watcher (status $attached_status): $(cat "$attached_out")"
+  grep -qF 'watcher: FAILED - cycle ended without an actionable reason' "$attached_out" \
+    || fail "attached arm omitted the typed cycle-end failure for a killed watcher"
+  grep -q "arm_pid=$ATTACHED_ARM.*origin=attached.*reason=attached-cycle-ended.*successor=none" "$state/.watch-cycle-exits.log" \
+    || fail "killed attached cycle was not recorded as unexplained"
+  ! grep -q 'reason=attached-cycle-delivered' "$state/.watch-cycle-exits.log" \
+    || fail "a killed watcher was recorded as having delivered its wake"
+  pass "both arms still fail loudly when the watcher dies without delivering a wake"
+}
+
+test_attached_arm_ignores_an_actionable_record_from_a_reused_pid() {
+  local dir state fakebin armout peer identity armpid status i
+  dir=$(make_case attached-reused-pid)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  sleep 300 &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  # An actionable close recorded for the SAME pid long before this attachment
+  # began. The pid was reused, so that record says nothing about the cycle being
+  # followed now, and it must not license a clean close when this one dies.
+  printf 'arm_pid=1\twatcher_pid=%s\torigin=started\tstarted_at=1\tended_at=2\texit_code=0\tsignal=none\treason=actionable-signal\tbeacon_age=1\tlock_before=pid:none|identity:none\tlock_after=pid:none|identity:none\tsuccessor=none\n' \
+    "$peer" >> "$state/.watch-cycle-exits.log"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF "watcher: attached pid=$peer" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$peer" "$armout" || fail "arm did not attach to the seeded holder: $(cat "$armout")"
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+  wait_for_exit "$armpid" 120
+  status=$?
+  [ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "attached arm accepted a stale same-pid record as proof of delivery (status $status): $(cat "$armout")"
+  grep -qF 'watcher: FAILED - cycle ended without an actionable reason' "$armout" \
+    || fail "attached arm omitted the typed cycle-end failure behind a reused pid"
+  ! grep -q 'reason=attached-cycle-delivered' "$state/.watch-cycle-exits.log" \
+    || fail "a stale same-pid record was treated as this cycle's delivery"
+  pass "attached arm ignores an actionable record predating its attachment"
+}
+
+test_attached_arm_rejects_a_same_second_record_from_a_reused_pid() {
+  local dir state fakebin armout peer identity armpid status seeded arm_started i
+  dir=$(make_case attached-same-second-pid)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  sleep 300 &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF "watcher: attached pid=$peer" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$peer" "$armout" || fail "arm did not attach to the seeded holder: $(cat "$armout")"
+  # The boundary a whole-second timestamp cannot resolve: records for the same
+  # numeric pid closing at or after the second this attachment began, but from
+  # other processes that merely inherited the pid number. Seeded after the
+  # attach so ended_at is provably inside the window (asserted below), one with
+  # a foreign identity and one in the pre-identity ledger format.
+  seeded=$(date +%s)
+  printf 'arm_pid=1\twatcher_pid=%s\twatcher_identity=linux-starttime=1 cmdline-hex=00\torigin=started\tstarted_at=%s\tended_at=%s\texit_code=0\tsignal=none\treason=actionable-signal\tbeacon_age=1\tlock_before=pid:none|identity:none\tlock_after=pid:none|identity:none\tsuccessor=none\n' \
+    "$peer" "$seeded" "$seeded" >> "$state/.watch-cycle-exits.log"
+  printf 'arm_pid=2\twatcher_pid=%s\torigin=started\tstarted_at=%s\tended_at=%s\texit_code=0\tsignal=none\treason=actionable-signal\tbeacon_age=1\tlock_before=pid:none|identity:none\tlock_after=pid:none|identity:none\tsuccessor=none\n' \
+    "$peer" "$seeded" "$seeded" >> "$state/.watch-cycle-exits.log"
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+  wait_for_exit "$armpid" 120
+  status=$?
+  arm_started=$(awk -F '\t' -v a="arm_pid=$armpid" '$1 == a { for (i = 1; i <= NF; i += 1) if ($i ~ /^started_at=/) v = substr($i, 12) } END { print v }' "$state/.watch-cycle-exits.log")
+  case "$arm_started" in
+    ''|*[!0-9]*) fail "could not read the attached cycle's start from the lifecycle ledger" ;;
+  esac
+  [ "$seeded" -ge "$arm_started" ] || fail "fixture missed the boundary: seeded close $seeded predates cycle start $arm_started"
+  [ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "attached arm accepted a same-second reused-pid record as proof of delivery (status $status): $(cat "$armout")"
+  grep -qF 'watcher: FAILED - cycle ended without an actionable reason' "$armout" \
+    || fail "attached arm omitted the typed cycle-end failure at the same-second boundary"
+  ! grep -q 'reason=attached-cycle-delivered' "$state/.watch-cycle-exits.log" \
+    || fail "a same-second reused-pid record was treated as this cycle's delivery"
+  pass "attached arm rejects a same-second actionable record from a reused pid"
+}
+
 test_arm_starts_and_self_heals() {
   # Arming with no confirmable watcher must FORK one and confirm it live + fresh
   # before reporting 'started' - whether the lock is empty (clean start) or held
@@ -1032,6 +1217,10 @@ test_watcher_self_evicts_on_lock_takeover
 test_arm_self_eviction_is_loud_without_successor
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
+test_attached_arm_accepts_a_cycle_that_delivered_its_wake
+test_two_arms_both_fail_when_the_watcher_dies_without_a_wake
+test_attached_arm_ignores_an_actionable_record_from_a_reused_pid
+test_attached_arm_rejects_a_same_second_record_from_a_reused_pid
 test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
