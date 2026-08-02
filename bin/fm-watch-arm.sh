@@ -103,8 +103,27 @@ lock_snapshot() {
   printf 'pid:%s|identity:%s' "$(cycle_clean_field "${pid:-none}")" "$(cycle_clean_field "${identity:-none}")"
 }
 
+# The verified identity of the watcher the lock currently names, or "none" when
+# the lock does not name this pid or carries no identity. A pid alone cannot
+# survive pid reuse and neither can a whole-second timestamp, but this identity
+# is process-generation specific (proc starttime plus the full cmdline, or the
+# ps lstart fallback), and fm_watcher_healthy has already proven it belongs to
+# the live pid. Recording it per cycle lets a later reader tell THIS watcher
+# from an older process that merely inherited its pid number.
+locked_watcher_identity() {  # <watcher-pid>
+  local pid=$1 lock_pid lock_identity
+  lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
+  lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+  if [ -n "$pid" ] && [ "$lock_pid" = "$pid" ] && [ -n "$lock_identity" ]; then
+    cycle_clean_field "$lock_identity"
+    return 0
+  fi
+  printf 'none'
+}
+
 cycle_active=0
 cycle_watcher_pid=none
+cycle_watcher_identity=none
 cycle_origin=unknown
 cycle_started_at=0
 cycle_lock_before='pid:none|identity:none'
@@ -113,12 +132,17 @@ cycle_begin() {
   cycle_watcher_pid=$1
   cycle_origin=$2
   cycle_started_at=$(date +%s)
+  cycle_watcher_identity=$(locked_watcher_identity "$1")
   cycle_lock_before=$(lock_snapshot)
   cycle_active=1
 }
 
-cycle_refresh_lock_before() {
+# An owned cycle begins the instant the child is forked, before it can have
+# taken the lock, so re-read both the lock snapshot and this cycle's watcher
+# identity once the child is confirmed to be the healthy lock holder.
+cycle_refresh_verified_watcher() {
   [ "$cycle_active" -eq 1 ] || return 0
+  cycle_watcher_identity=$(locked_watcher_identity "$cycle_watcher_pid")
   cycle_lock_before=$(lock_snapshot)
 }
 
@@ -145,9 +169,10 @@ cycle_log_append() {
     sleep 0.02
     i=$((i + 1))
   done
-  printf 'arm_pid=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
+  printf 'arm_pid=%s\twatcher_pid=%s\twatcher_identity=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
     "$ARM_PID" \
     "$(cycle_clean_field "$cycle_watcher_pid")" \
+    "$(cycle_clean_field "$cycle_watcher_identity")" \
     "$(cycle_clean_field "$cycle_origin")" \
     "$cycle_started_at" \
     "$ended_at" \
@@ -270,10 +295,16 @@ fail_unexplained_cycle() {
 # therefore closes exactly like a dead one from here - the lock is released and
 # no successor appears, because the next cycle is armed only after the wake has
 # been handled, long past the confirmation window. The owner's own lifecycle
-# record is the missing evidence: an actionable close for THIS watcher pid, at
-# or after this attachment began, proves the cycle ended by delivering its wake.
-# Bounding on ended_at stops a recycled pid's older record standing in for this
-# cycle, so a genuinely dead or wedged watcher is still an unexplained close.
+# record is the missing evidence: an actionable close recorded for the watcher
+# THIS arm is following proves the cycle ended by delivering its wake.
+#
+# "The watcher this arm is following" must survive pid reuse, so the record has
+# to match on the verified per-process identity as well as the pid number. A pid
+# plus a whole-second timestamp is not enough: an old watcher that merely
+# inherited the same pid number, and whose own cycle closed in the same second
+# this attachment began, would otherwise pass as proof and let a genuinely dead
+# watcher return clean success. Both discriminators are required, and a record
+# written before identities were captured (identity "none") never qualifies.
 cycle_closed_actionably() {  # <watcher-pid>
   local pid=$1
   case "$pid" in
@@ -282,16 +313,20 @@ cycle_closed_actionably() {  # <watcher-pid>
   case "$cycle_started_at" in
     ''|*[!0-9]*|0) return 1 ;;
   esac
+  case "$cycle_watcher_identity" in
+    ''|none) return 1 ;;
+  esac
   [ -f "$CYCLE_LOG" ] || return 1
-  awk -F '\t' -v pid="watcher_pid=$pid" -v since="$cycle_started_at" '
+  awk -F '\t' -v pid="watcher_pid=$pid" -v ident="watcher_identity=$cycle_watcher_identity" -v since="$cycle_started_at" '
     {
-      matched = 0; actionable = 0; ended = -1
+      matched = 0; same_process = 0; actionable = 0; ended = -1
       for (i = 1; i <= NF; i += 1) {
         if ($i == pid) matched = 1
+        else if ($i == ident) same_process = 1
         else if ($i ~ /^reason=actionable-/) actionable = 1
         else if ($i ~ /^ended_at=/) ended = substr($i, 10) + 0
       }
-      if (matched && actionable && ended >= since) found = 1
+      if (matched && same_process && actionable && ended >= since) found = 1
     }
     END { exit(found ? 0 : 1) }
   ' "$CYCLE_LOG" 2>/dev/null
@@ -505,7 +540,7 @@ deadline=$(( $(date +%s) + CONFIRM_TIMEOUT + 1 ))
 while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
-      cycle_refresh_lock_before
+      cycle_refresh_verified_watcher
       cycle_mark_predecessor_successor "started:$child"
       echo "watcher: started pid=$child (beacon fresh)"
       wait "$child"

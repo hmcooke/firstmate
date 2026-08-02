@@ -41,11 +41,12 @@ The turn-end guard remains the final backstop rather than the normal continuity 
 An actionable child output returns that reason normally.
 A zero/empty child return rechecks the home lock and beacon, attaches to a verified healthy successor when one exists, or emits `watcher: FAILED - cycle ended without an actionable reason` and exits nonzero.
 An attached arm follows verified identity-matched successors and reports the same typed failure if that chain ends without one.
-Because the wake reason of a followed cycle reaches only the owning arm, an attached arm first consults the lifecycle ledger below: an actionable close recorded for that exact watcher PID at or after this attachment began proves the cycle ended by delivering its wake, and that arm closes clean with `watcher: attached cycle ended after delivering its wake to the owning arm`.
-Any other end of the chain, including a stale same-PID record predating the attachment, stays the typed nonzero failure.
+Because the wake reason of a followed cycle reaches only the owning arm, an attached arm first consults the lifecycle ledger below: an actionable close recorded for the watcher it is following proves the cycle ended by delivering its wake, and that arm closes clean with `watcher: attached cycle ended after delivering its wake to the owning arm`.
+Proof requires the record to match that watcher's verified process identity as well as its PID number and to have closed at or after the attachment began, because a PID number plus a whole-second timestamp cannot tell the followed watcher from an older process that inherited the same PID and closed in the same second.
+Any other end of the chain, including a same-PID record from a different process and a record written before identities were captured, stays the typed nonzero failure.
 
 The arm layer appends one tab-separated record per observed cycle to `state/.watch-cycle-exits.log`.
-Each record includes arm and watcher PIDs, start and end timestamps, exit code and signal, classified reason, beacon age, lock identity before and after close, and successor disposition.
+Each record includes arm and watcher PIDs, the watcher's verified process identity, start and end timestamps, exit code and signal, classified reason, beacon age, lock identity before and after close, and successor disposition.
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
 `state/.watch-triage.log` remains only the watcher's bounded absorbed-wake debug log and carries no lifecycle semantics.
 
@@ -57,7 +58,8 @@ Only the watcher process touches `state/.last-watcher-beat`; no helper process c
 `tests/fm-pi-watch-extension.test.sh` checks Pi's first-cycle-or-explicit-repair tool metadata and ownership-based redundant-call no-ops, then simulates actionable and empty child closes against the actual Pi and OpenCode close handlers, blocks prompt delivery to prove the successor launches first, verifies single-flight behavior, changes the session lock before close to prove ownership is rechecked, and hangs each successor arm to prove bounded fallback delivery includes the typed restoration failure.
 The same suite covers ordinary same-process session replacement for `/new`, `/resume`, and `/fork`, same-instance shutdown-plus-start, stale prior-generation callbacks, repeated transitions with exactly one live cycle, disappearance of the shutting-down refusal after a valid replacement activates, and terminal quit still refusing late rearm.
 `tests/fm-watcher-lock.test.sh` covers verified-successor attach, the typed self-eviction failure, bounded and successor-linked lifecycle rows, and a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
-It also runs the two-arm shape end to end: one owning arm and one attached arm on the same watcher, where a delivered wake closes both arms clean, a watcher killed without a wake still fails loudly from both, and a stale same-PID actionable record cannot stand in for the followed cycle.
+It also runs the two-arm shape end to end: one owning arm and one attached arm on the same watcher, where a delivered wake closes both arms clean and a watcher killed without a wake still fails loudly from both.
+Two further cases prove a reused PID cannot forge that proof: an actionable record predating the attachment, and one closing inside the same whole second the attachment began but carrying a different process identity or none at all.
 `tests/fm-subagent-pretool-check.test.sh` proves Claude retains only the non-status Bash seatbelts.
 `tests/fm-claude-stop-autoarm.test.sh` covers the auto-arm's scope, stale and live session owners, unchanged AFK and need boundaries, single-flight, and exit-2 translation.
 `FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-stop-autoarm-live-e2e.test.sh` starts with the reproduced stale-lock state, runs session start first, completes two tokenless cycles, and checks the competing-live-owner negative control.

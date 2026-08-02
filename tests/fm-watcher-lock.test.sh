@@ -745,6 +745,58 @@ test_attached_arm_ignores_an_actionable_record_from_a_reused_pid() {
   pass "attached arm ignores an actionable record predating its attachment"
 }
 
+test_attached_arm_rejects_a_same_second_record_from_a_reused_pid() {
+  local dir state fakebin armout peer identity armpid status seeded arm_started i
+  dir=$(make_case attached-same-second-pid)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  sleep 300 &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF "watcher: attached pid=$peer" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$peer" "$armout" || fail "arm did not attach to the seeded holder: $(cat "$armout")"
+  # The boundary a whole-second timestamp cannot resolve: records for the same
+  # numeric pid closing at or after the second this attachment began, but from
+  # other processes that merely inherited the pid number. Seeded after the
+  # attach so ended_at is provably inside the window (asserted below), one with
+  # a foreign identity and one in the pre-identity ledger format.
+  seeded=$(date +%s)
+  printf 'arm_pid=1\twatcher_pid=%s\twatcher_identity=linux-starttime=1 cmdline-hex=00\torigin=started\tstarted_at=%s\tended_at=%s\texit_code=0\tsignal=none\treason=actionable-signal\tbeacon_age=1\tlock_before=pid:none|identity:none\tlock_after=pid:none|identity:none\tsuccessor=none\n' \
+    "$peer" "$seeded" "$seeded" >> "$state/.watch-cycle-exits.log"
+  printf 'arm_pid=2\twatcher_pid=%s\torigin=started\tstarted_at=%s\tended_at=%s\texit_code=0\tsignal=none\treason=actionable-signal\tbeacon_age=1\tlock_before=pid:none|identity:none\tlock_after=pid:none|identity:none\tsuccessor=none\n' \
+    "$peer" "$seeded" "$seeded" >> "$state/.watch-cycle-exits.log"
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+  wait_for_exit "$armpid" 120
+  status=$?
+  arm_started=$(awk -F '\t' -v a="arm_pid=$armpid" '$1 == a { for (i = 1; i <= NF; i += 1) if ($i ~ /^started_at=/) v = substr($i, 12) } END { print v }' "$state/.watch-cycle-exits.log")
+  case "$arm_started" in
+    ''|*[!0-9]*) fail "could not read the attached cycle's start from the lifecycle ledger" ;;
+  esac
+  [ "$seeded" -ge "$arm_started" ] || fail "fixture missed the boundary: seeded close $seeded predates cycle start $arm_started"
+  [ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "attached arm accepted a same-second reused-pid record as proof of delivery (status $status): $(cat "$armout")"
+  grep -qF 'watcher: FAILED - cycle ended without an actionable reason' "$armout" \
+    || fail "attached arm omitted the typed cycle-end failure at the same-second boundary"
+  ! grep -q 'reason=attached-cycle-delivered' "$state/.watch-cycle-exits.log" \
+    || fail "a same-second reused-pid record was treated as this cycle's delivery"
+  pass "attached arm rejects a same-second actionable record from a reused pid"
+}
+
 test_arm_starts_and_self_heals() {
   # Arming with no confirmable watcher must FORK one and confirm it live + fresh
   # before reporting 'started' - whether the lock is empty (clean start) or held
@@ -1168,6 +1220,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_attached_arm_accepts_a_cycle_that_delivered_its_wake
 test_two_arms_both_fail_when_the_watcher_dies_without_a_wake
 test_attached_arm_ignores_an_actionable_record_from_a_reused_pid
+test_attached_arm_rejects_a_same_second_record_from_a_reused_pid
 test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
