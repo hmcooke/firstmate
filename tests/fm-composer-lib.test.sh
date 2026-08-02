@@ -13,6 +13,10 @@
 #      agent composer either way, bordered or bare.
 #   4. Real unsubmitted text reads `pending`; a known idle placeholder reads
 #      `empty`.
+#   5. A Unicode blank a harness renders in an otherwise-empty composer must not
+#      make it read as typed text (task fm-afk-wedge-investigate), and folding
+#      those blanks must not make a blank-only row with no prompt glyph
+#      injectable.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -125,6 +129,87 @@ test_real_text_is_pending() {
   pass "fm_composer_classify_content: real unsubmitted text reads pending (including a popup argument-hint fill)"
 }
 
+# --- Unicode blanks in an otherwise-empty composer --------------------------
+#
+# Regression, task fm-afk-wedge-investigate. Claude Code draws its idle prompt
+# prefix as `❯` + U+00A0 NO-BREAK SPACE. The callers' [![:space:]] trims cover
+# ASCII whitespace only, so the NBSP reached this classifier attached to the
+# glyph, matched none of the glyph cases, and a genuinely empty composer read
+# `pending` - which permanently deferred away-mode escalation delivery, because
+# the injector proceeds only on an affirmative `empty`.
+#
+# The blanks are built from octal escapes rather than pasted literals so the
+# captured byte sequences stay visible here and no editor or copy step can
+# silently normalize them back into ASCII spaces, which would quietly retire the
+# regression these tests exist to hold. bin/fm-composer-lib.sh owns why the
+# escapes are octal rather than the backslash-u form.
+FM_TEST_NBSP=$(printf '\302\240')       # U+00A0 NO-BREAK SPACE
+FM_TEST_FIGURE_SPACE=$(printf '\342\200\207')   # U+2007
+FM_TEST_NARROW_NBSP=$(printf '\342\200\257')    # U+202F
+FM_TEST_ZWNBSP=$(printf '\357\273\277')         # U+FEFF
+
+test_idle_claude_composer_with_nbsp_is_empty() {
+  local out
+  # The exact row captured from an idle claude pane: `❯` + U+00A0.
+  out=$(classify 0 "❯$FM_TEST_NBSP")
+  [ "$out" = empty ] \
+    || fail "an idle claude composer ('❯' + NBSP) must read empty, got '$out'"
+  out=$(classify 1 "❯$FM_TEST_NBSP")
+  [ "$out" = empty ] \
+    || fail "a bordered idle claude composer ('❯' + NBSP) must read empty, got '$out'"
+  pass "fm_composer_classify_content: an idle claude composer ('❯' + U+00A0) reads empty, bordered or bare"
+}
+
+test_other_unicode_blanks_after_a_glyph_are_empty() {
+  local blank out
+  for blank in "$FM_TEST_FIGURE_SPACE" "$FM_TEST_NARROW_NBSP" "$FM_TEST_ZWNBSP"; do
+    out=$(classify 0 "❯$blank")
+    [ "$out" = empty ] \
+      || fail "an agent glyph followed only by a Unicode blank must read empty, got '$out'"
+  done
+  pass "fm_composer_classify_content: U+2007/U+202F/U+FEFF after an agent glyph read empty"
+}
+
+test_real_text_after_a_unicode_blank_is_pending() {
+  local out
+  # The load-bearing disconfirming case: folding the blank must not swallow the
+  # text behind it, or the injector would type over unsubmitted human input.
+  out=$(classify 0 "❯${FM_TEST_NBSP}rm -rf /")
+  [ "$out" = pending ] \
+    || fail "real typed text after an NBSP must still read pending, got '$out'"
+  out=$(classify 1 "❯${FM_TEST_NBSP}deploy staging now")
+  [ "$out" = pending ] \
+    || fail "bordered real text after an NBSP must still read pending, got '$out'"
+  pass "fm_composer_classify_content: real typed text after a Unicode blank still reads pending"
+}
+
+test_unicode_blank_without_a_glyph_is_not_injectable() {
+  local blank out
+  # <plain_content> is deliberately left un-normalized, so a blank-only row that
+  # carries no prompt glyph stays the unstructured row it is. Normalising it too
+  # would turn this into `empty` and widen the injectable surface.
+  for blank in "$FM_TEST_NBSP" "$FM_TEST_FIGURE_SPACE" "$FM_TEST_NARROW_NBSP" "$FM_TEST_ZWNBSP"; do
+    out=$(classify 0 "$blank")
+    [ "$out" = unknown ] \
+      || fail "a Unicode-blank-only row with no prompt glyph must not become injectable, got '$out'"
+  done
+  pass "fm_composer_classify_content: a Unicode-blank-only row with no prompt glyph reads unknown, never empty"
+}
+
+test_dead_shell_glyphs_survive_blank_normalization() {
+  local g out
+  # The original safety rule must be unaffected by the fold, including when the
+  # dead shell's prompt is followed by a Unicode blank.
+  for g in '>' '$' '%' '#'; do
+    out=$(classify 0 "$g")
+    [ "$out" = unknown ] || fail "bare shell glyph '$g' must still read unknown, got '$out'"
+    out=$(classify 0 "$g$FM_TEST_NBSP")
+    [ "$out" = unknown ] \
+      || fail "bare shell glyph '$g' plus an NBSP must still read unknown, got '$out'"
+  done
+  pass "fm_composer_classify_content: bare shell prompt glyphs stay unknown with or without a trailing Unicode blank"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
 test_bare_shell_prompt_with_command_is_not_empty
@@ -134,3 +219,8 @@ test_empty_content_is_empty
 test_idle_placeholder_is_empty
 test_idle_placeholder_case_mode_is_explicit
 test_real_text_is_pending
+test_idle_claude_composer_with_nbsp_is_empty
+test_other_unicode_blanks_after_a_glyph_are_empty
+test_real_text_after_a_unicode_blank_is_pending
+test_unicode_blank_without_a_glyph_is_not_injectable
+test_dead_shell_glyphs_survive_blank_normalization

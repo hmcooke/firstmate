@@ -343,7 +343,8 @@ ok - forced teardown retains a nested secondmate home and its grandchild's Herdr
 
 Real captures verified these active distinctions:
 
-- Claude and Codex use bare `❯` and `›` agent composers.
+- Claude and Codex use `❯` and `›` agent composers; an idle Claude row renders `❯` followed by U+00A0 NO-BREAK SPACE rather than an ASCII space and still reads empty.
+- A Unicode-blank-only row with no agent glyph stays unknown rather than injectable; `bin/fm-composer-lib.sh` owns the blank-folding contract.
 - Pi uses content between complete separator rows and requires exact native Pi identity.
 - Dim or faint suggestion text is ghost content, while normally styled text is pending input.
 - Grok dark truecolor placeholders are ghost content, while bright truecolor typed input remains pending.
