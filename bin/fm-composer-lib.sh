@@ -180,9 +180,37 @@ fm_composer_idle_matches() {
   esac
 }
 
+# fm_composer_normalize_blanks: fold the Unicode blank characters a harness may
+# render inside an otherwise-empty composer into ASCII spaces, then re-trim.
+# Claude Code draws its idle prompt prefix as `❯` + U+00A0 NO-BREAK SPACE, not
+# `❯` + ASCII space. Every caller trims with [![:space:]], which under the
+# fleet's C/POSIX locale covers ASCII whitespace only, so the NBSP survived the
+# trim and the glyph comparisons below - which expect a bare glyph, or a glyph
+# followed by an ASCII space - all missed. A genuinely empty claude composer
+# therefore classified as `pending`, and the away-mode escalation injector
+# (bin/fm-supervise-daemon.sh), which defers on anything that is not
+# affirmatively `empty`, deferred every escalation permanently.
+# The escapes are octal, not $'\uXXXX': \u is bash 4.2+, and on the bash 3.2
+# that macOS still ships it would expand literally and silently fold nothing.
+fm_composer_normalize_blanks() {  # <content>
+  local s=$1
+  s=${s//$'\302\240'/ }        # U+00A0 NO-BREAK SPACE (claude's prompt separator)
+  s=${s//$'\342\200\207'/ }    # U+2007 FIGURE SPACE
+  s=${s//$'\342\200\257'/ }    # U+202F NARROW NO-BREAK SPACE
+  s=${s//$'\357\273\277'/ }    # U+FEFF ZERO WIDTH NO-BREAK SPACE
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
 fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [plain_content]
   local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content
   plain_content=${5:-$content}
+  # <content> only. <plain_content> stays raw so the unbordered-empty branch
+  # below still sees a blank-only row with no prompt glyph as the unstructured
+  # row it is and returns `unknown`; normalizing it too would turn that row into
+  # a safe-to-inject `empty` and widen the injectable surface.
+  content=$(fm_composer_normalize_blanks "$content")
   if [ "$bordered" != 1 ] && [ -z "$content" ] && [ -n "$plain_content" ]; then
     case "$plain_content" in
       '❯'|'›') printf 'empty'; return 0 ;;
