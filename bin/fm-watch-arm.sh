@@ -28,6 +28,10 @@
 #   watcher: started pid=<N> (beacon fresh)              - it launched one and confirmed it
 #   watcher: attached pid=<N> (beacon <age>s)            - a live+fresh successor holds the lock;
 #                                                          this arm attaches and follows it
+#   watcher: attached cycle ended after delivering its wake to the owning arm
+#                                                        - the followed cycle closed on a wake the
+#                                                          OWNING arm surfaced, proven by that
+#                                                          arm's own lifecycle record
 #   watcher: FAILED - no live watcher with a fresh beacon  - could not confirm one
 #   watcher: FAILED - cycle ended without an actionable reason
 #                                                        - a clean cycle ended with no wake and no
@@ -37,10 +41,10 @@
 # dead lock per the singleton self-eviction/steal path and is confirmed) or this
 # returns the FAILED line. On started it waits the child and propagates the wake
 # reason; on attached it stays live across identity-matched successors. An
-# attached cycle that ends without a healthy successor is a typed nonzero failure,
-# never a clean empty completion. On FAILED it exits non-zero so the failure is
-# loud. A live cycle already present means re-arm attaches - do not start a second
-# watcher.
+# attached cycle that ends with neither a healthy successor nor recorded proof
+# that it delivered a wake is a typed nonzero failure, never a clean empty
+# completion. On FAILED it exits non-zero so the failure is loud. A live cycle
+# already present means re-arm attaches - do not start a second watcher.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -261,9 +265,42 @@ fail_unexplained_cycle() {
   return 1
 }
 
+# An ATTACHED arm cannot see the wake reason of the watcher it follows: the
+# watcher prints that reason to the OWNING arm's output file. A healthy cycle
+# therefore closes exactly like a dead one from here - the lock is released and
+# no successor appears, because the next cycle is armed only after the wake has
+# been handled, long past the confirmation window. The owner's own lifecycle
+# record is the missing evidence: an actionable close for THIS watcher pid, at
+# or after this attachment began, proves the cycle ended by delivering its wake.
+# Bounding on ended_at stops a recycled pid's older record standing in for this
+# cycle, so a genuinely dead or wedged watcher is still an unexplained close.
+cycle_closed_actionably() {  # <watcher-pid>
+  local pid=$1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$cycle_started_at" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  [ -f "$CYCLE_LOG" ] || return 1
+  awk -F '\t' -v pid="watcher_pid=$pid" -v since="$cycle_started_at" '
+    {
+      matched = 0; actionable = 0; ended = -1
+      for (i = 1; i <= NF; i += 1) {
+        if ($i == pid) matched = 1
+        else if ($i ~ /^reason=actionable-/) actionable = 1
+        else if ($i ~ /^ended_at=/) ended = substr($i, 10) + 0
+      }
+      if (matched && actionable && ended >= since) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$CYCLE_LOG" 2>/dev/null
+}
+
 # Stay alive across identity-matched healthy holders. If one cycle ends, attach
-# to a verified successor. With no successor, fail loudly instead of returning a
-# clean empty completion that an adapter could mistake for a no-op.
+# to a verified successor. With no successor and no recorded proof that the
+# cycle delivered its wake, fail loudly instead of returning a clean empty
+# completion that an adapter could mistake for a no-op.
 attach_and_wait() {
   local attached_pid=$1
   while :; do
@@ -283,6 +320,11 @@ attach_and_wait() {
       cycle_begin "$attached_pid" attached
       report_attached
       continue
+    fi
+    if cycle_closed_actionably "$attached_pid"; then
+      cycle_log_append unknown unknown attached-cycle-delivered "delivered:$attached_pid"
+      echo "watcher: attached cycle ended after delivering its wake to the owning arm"
+      return 0
     fi
     cycle_log_append unknown unknown attached-cycle-ended none
     fail_unexplained_cycle
