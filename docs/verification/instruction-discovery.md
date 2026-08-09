@@ -27,7 +27,12 @@ The operator's own user-level configuration and normal authentication keep worki
 
 The `local` source is kept deliberately, and dropping it would be a supervision regression rather than extra safety.
 `local` is exactly one file, `<worktree>/.claude/settings.local.json`, and for a claude spawn `bin/fm-spawn.sh` writes that file itself, before launch, with firstmate's semantic busy-state hooks and the turn-end notification touch.
-An untrusted repo therefore cannot supply it, while `--setting-sources user` alone would leave firstmate unable to see the worker's busy state or turn ends.
+`--setting-sources user` alone would leave firstmate unable to see the worker's busy state or turn ends.
+
+Because that retained source is the one project-directory input still loaded, the write must be the repo's to lose rather than the repo's to control.
+An untrusted clone can ship `.claude`, or the settings file itself, as a symlink, which would send the write outside the worktree or leave the worker running with no supervision hooks while its metadata advertises a protected posture.
+`fm-spawn` therefore drops a symlink at either path before writing, so the file claude reads is always a real file firstmate owns at the real path inside the worktree.
+`tests/fm-spawn-no-project-instructions.test.sh` covers both hostile shapes and asserts nothing is written outside the worktree.
 
 Print-mode A/B, run in the fixture directory:
 

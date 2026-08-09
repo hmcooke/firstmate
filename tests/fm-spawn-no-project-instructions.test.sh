@@ -172,6 +172,45 @@ test_lockdown_keeps_firstmate_own_supervision_hooks() {
   pass "the lockdown keeps firstmate's own per-task hooks while dropping the repo's settings"
 }
 
+# Keeping the `local` settings source is only safe because firstmate owns that exact
+# file. An untrusted clone can ship `.claude`, or the settings file itself, as a
+# symlink - which would send the write outside the worktree, or leave the worker with
+# no supervision hooks while its metadata advertises a protected posture. Both shapes
+# must end with a real file at the real path and nothing written outside the worktree.
+test_hostile_settings_symlinks_cannot_divert_the_write() {
+  local label shape rec id out status outside n=0
+  while IFS='|' read -r label shape; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    id="nopi-symlink-z1$n"
+    rec=$(make_case "symlink$n" claude "$id")
+    read_case_record "$rec"
+    outside="$CASE_DIR/outside-target"
+    : > "$outside"
+    case "$shape" in
+      dir) ln -s "$CASE_DIR/outside-dir" "$WT_DIR/.claude" ; mkdir -p "$CASE_DIR/outside-dir" ;;
+      file) mkdir -p "$WT_DIR/.claude"; ln -s "$outside" "$WT_DIR/.claude/settings.local.json" ;;
+    esac
+
+    out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      "$id" "$PROJ_DIR" --no-project-instructions)
+    status=$?
+    expect_code 0 "$status" "$label: spawn should still succeed"
+
+    [ ! -L "$WT_DIR/.claude" ] || fail "$label: .claude is still a symlink"
+    [ ! -L "$WT_DIR/.claude/settings.local.json" ] || fail "$label: settings file is still a symlink"
+    assert_present "$WT_DIR/.claude/settings.local.json" "$label: no real settings file was written"
+    assert_grep 'UserPromptSubmit' "$WT_DIR/.claude/settings.local.json" \
+      "$label: firstmate's supervision hooks did not land in the real file"
+    [ ! -s "$outside" ] || fail "$label: the write escaped the worktree to $outside"
+    [ ! -e "$CASE_DIR/outside-dir/settings.local.json" ] || fail "$label: the write escaped into the symlinked directory"
+  done <<'ROWS'
+.claude symlinked out of the worktree|dir
+settings.local.json symlinked elsewhere|file
+ROWS
+  pass "a repo-supplied symlink cannot divert or suppress firstmate's own settings write"
+}
+
 # The flag composes with the other launch axes rather than displacing them.
 test_flag_composes_with_model_and_effort() {
   local rec id out status launch
@@ -278,6 +317,7 @@ test_batch_forwards_the_flag() {
 test_supported_harness_carries_flags_and_records_meta
 test_default_spawn_is_unchanged
 test_lockdown_keeps_firstmate_own_supervision_hooks
+test_hostile_settings_symlinks_cannot_divert_the_write
 test_flag_composes_with_model_and_effort
 test_unsupported_routes_refuse_before_spawning
 test_raw_launch_command_refuses

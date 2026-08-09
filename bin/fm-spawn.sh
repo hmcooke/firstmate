@@ -537,11 +537,13 @@ project_instruction_disable_flags_for_harness() {
       # .mcp.json together, while the operator's own user-level configuration
       # (including the no-mistakes skill) and normal auth keep working.
       # `local` is deliberately KEPT: it is exactly one file,
-      # <worktree>/.claude/settings.local.json, and the claude branch below overwrites
-      # it with firstmate's own semantic busy-state and turn-end hooks before launch,
-      # so the repo cannot supply it and supervision keeps working. Dropping `local`
-      # would blind firstmate to this worker's busy state and turn ends. Verified on
-      # both the print and the interactive launch path fm-spawn actually uses.
+      # <worktree>/.claude/settings.local.json, and the claude branch below writes it
+      # with firstmate's own semantic busy-state and turn-end hooks before launch,
+      # dropping a repo-supplied symlink at that path first so the write cannot be
+      # diverted or suppressed. The repo therefore cannot supply it and supervision
+      # keeps working. Dropping `local` would blind firstmate to this worker's busy
+      # state and turn ends. Verified on both the print and the interactive launch
+      # path fm-spawn actually uses.
       printf -- '--setting-sources user,local '
       ;;
     *)
@@ -1509,7 +1511,16 @@ if [ "$KIND" != secondmate ]; then
       # turn-ended NOTIFICATION touch for the watcher. Every hook command
       # tolerates a refused event (|| true) so a stale-gen writer can never
       # break Claude's own lifecycle.
+      # The worktree is a clone whose contents are NOT trusted, and this file is the
+      # one project-directory input still loaded under --no-project-instructions (the
+      # claude `local` settings source). A repository can ship `.claude`, or the
+      # settings file itself, as a symlink: that would send this write outside the
+      # worktree, or leave the worker running with no supervision hooks while its
+      # metadata says otherwise. Drop an untrusted symlink at either path first, so
+      # the write always lands on a real file at the exact path claude reads.
+      [ ! -L "$WT/.claude" ] || rm -f "$WT/.claude"
       mkdir -p "$WT/.claude"
+      rm -f "$WT/.claude/settings.local.json"
       busy_cmd_prefix="$(shell_quote "$FM_ROOT/bin/fm-busy-event.sh") apply $(shell_quote "$STATE_REAL") $(shell_quote "$ID")"
       busy_suffix="--gen $(shell_quote "$BUSY_GEN") --source claude-hook"
       j_submit=$(json_escape "$busy_cmd_prefix busy $busy_suffix --event user-prompt-submit 2>/dev/null || true")
