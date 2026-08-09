@@ -147,17 +147,24 @@ make_fake_ps_claude() {
 }
 
 make_fake_ps_harness() {
-  local fakebin=$1 harness=$2
-  cat > "$fakebin/ps" <<'SH'
-#!/usr/bin/env bash
-set -u
+  local fakebin=$1 harness=$2 real_ps
+  real_ps=$(command -v ps || printf '/bin/ps\n')
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -u\n'
+    printf 'REAL_PS=%s\n' "$real_ps"
+    cat <<'SH'
 harness=${FM_FAKE_HARNESS:-claude}
 case "$*" in
+  # Only harness-name lookups are faked. A service owner's start-time binding
+  # is a real property of a real process, so that query goes to the real ps.
+  *"lstart="*) exec "$REAL_PS" "$@" ;;
   *"comm="*) printf '/usr/local/bin/%s\n' "$harness"; exit 0 ;;
   *"args="*) printf '%s\n' "$harness"; exit 0 ;;
 esac
 exit 1
 SH
+  } > "$fakebin/ps"
   chmod +x "$fakebin/ps"
   printf '%s\n' "$harness" > "$fakebin/.harness-name"
 }
@@ -656,6 +663,37 @@ EOF
   assert_contains "$out" "NEXT STEP" "closing reminder missing on the read-only path"
 
   pass "a lock refusal prints a loud read-only banner, skips every mutating step, and still completes the digest"
+}
+
+test_lock_refusal_names_service_owner() {
+  local rec root home fakebin service out status=0
+  rec=$(new_world lock-refusal-service)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  append_wake "$home/state" signal task-a "done: must remain queued" || fail "seed wake failed"
+
+  # A service process holds this home for its own lifetime. A harness session
+  # opening in another shell must refuse into read-only and say who holds it.
+  sleep 300 >/dev/null 2>&1 &
+  service=$!
+  FM_HOME="$home" "$ROOT/bin/fm-lock.sh" service-acquire crowsnest-backend "$service" >/dev/null \
+    || fail "service owner could not take the fixture home's lock"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
+  kill "$service" 2>/dev/null || true
+  wait "$service" 2>/dev/null || true
+
+  expect_code 0 "$status" "fm-session-start.sh must exit 0 when a service owner holds the lock"
+  assert_contains "$out" "READ-ONLY SESSION" "a service-owned home did not produce the read-only banner"
+  assert_contains "$out" "a live service owner holds the lock (crowsnest-backend, pid $service)" \
+    "the read-only banner did not name the service owner holding the lock"
+  assert_contains "$out" "skipped (read-only session)" "wake-queue section did not report itself skipped"
+  [ -s "$home/state/.wake-queue" ] || fail "a service-owned home let another session drain the wake queue"
+  [ "$(cat "$home/state/.lock")" = "$service" ] || fail "session start displaced a live service owner"
+  pass "a live service owner refuses another session into read-only and is named in the banner"
 }
 
 test_lock_write_failure_read_only_path() {
@@ -1393,6 +1431,7 @@ EOF
 
 test_context_digest_absent_empty_present
 test_lock_refusal_read_only_path
+test_lock_refusal_names_service_owner
 test_lock_write_failure_read_only_path
 test_session_lock_concurrent_single_winner
 test_output_ordering_diagnostics_lead
