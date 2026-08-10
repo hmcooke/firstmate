@@ -154,19 +154,20 @@ This preserves launch success instead of passing a known-bad value.
 
 ### Project instruction discovery
 
-`bin/fm-spawn.sh --no-project-instructions` launches a worker so the worktree it stands in supplies no live configuration.
-Use it when a worker will stand in a clone whose contents are not trusted, because that repo's instruction files, skills, agents, hooks, and MCP definitions would otherwise be prompt injection by construction.
-It is per-spawn and additive: every spawn without it keeps full discovery unchanged.
+Use `bin/fm-spawn.sh --no-project-instructions` when a worker will stand in a clone whose contents are not trusted.
+It prevents that clone's instruction files, skills, agents, hooks, and MCP definitions from becoming live configuration while preserving the worker's brief, the operator's user-level configuration, and firstmate's supervision hooks.
+It is per-spawn and additive, so every spawn without it keeps full discovery unchanged.
 
-| Harness | Mechanism | Status |
-|---|---|---|
-| claude | `--setting-sources user,local` | Verified 2026-08-09 on Claude Code 2.1.220 on both the print and interactive launch paths; dropping the `project` source drops the worktree's `CLAUDE.md`, `.claude/skills`, `.claude/agents`, `.claude/settings.json` hooks, and `.mcp.json`; the operator's user-level configuration and auth are untouched, so a user-level skill such as `no-mistakes` stays available; `local` is kept because it is only `<worktree>/.claude/settings.local.json`, which `fm-spawn` writes with firstmate's own busy-state and turn-end hooks before launch; on locked-down spawns only, `fm-spawn` first drops a repo-supplied symlink at either path so the write cannot be diverted or suppressed, while default spawns preserve either symlink because full project discovery remains enabled. |
-| codex | none | Refused. Verified 2026-08-09 on codex-cli 0.147.0: `-c project_doc_max_bytes=0` does stop the `AGENTS.md` auto-load, but project skills under `.codex/skills` and `.agents/skills` still reach the prompt and codex's only disable matches one exact `SKILL.md` path, so an unknown hostile skill file cannot be blocked ahead of time. |
-| opencode, pi, pi-signed, grok, kimi | none established | Refused as unverified, meaning untested rather than proven incapable. |
+| Harness | Status |
+|---|---|
+| claude | Supported by the only empirically verified disable mechanism. |
+| codex | Refused because verification found that its project instruction file can be suppressed but arbitrary project skills cannot be disabled generically. |
+| opencode, pi, pi-signed, grok, kimi | Refused as unverified, meaning untested rather than proven incapable. |
 
-The refusal is structural, not advisory: a harness outside the allowlist, a raw launch command, or `--secondmate` stops the spawn before any worker endpoint exists, so a worker is never launched believing it is protected.
+The refusal is structural, not advisory: a harness outside the allowlist, a raw launch command, or `--secondmate` stops the spawn before any worktree, worker endpoint, global harness hook, or task metadata is created.
 A protected spawn records `project_instructions=off` in the task's metadata; an absent line means instructions load normally.
-Evidence, the fixture method, and what a new harness must prove before joining the allowlist live in [`docs/verification/instruction-discovery.md`](../../../docs/verification/instruction-discovery.md).
+`bin/fm-spawn.sh` owns the exact launch mechanism and fail-closed validation.
+The empirical evidence, fixture method, and requirements for extending the allowlist live in [`docs/verification/instruction-discovery.md`](../../../docs/verification/instruction-discovery.md).
 The guarantee is structural only: discovery is off, but a worker can still read untrusted files as data with its ordinary tools, so brief it accordingly.
 
 ## no-mistakes skill invocation
