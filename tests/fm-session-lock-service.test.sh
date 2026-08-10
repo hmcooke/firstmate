@@ -340,9 +340,9 @@ test_release_is_owner_bound_and_idempotent() {
 }
 
 test_nonwriting_modes_leave_state_untouched() {
-  local absent readonly fakebin out status=0
+  local absent readonly_state fakebin out status=0
   absent="$TMP_ROOT/nonwriting-absent"
-  readonly=$(new_home nonwriting-readonly)
+  readonly_state=$(new_home nonwriting-readonly)
   fakebin=$(fm_fakebin "$TMP_ROOT/nonwriting-tools")
   mkdir -p "$absent"
   cat > "$fakebin/mktemp" <<'SH'
@@ -366,16 +366,16 @@ SH
   assert_contains "$out" "lock: free" "free-lock release did not report an absent lock as free"
   assert_absent "$absent/state" "free-lock service-release created an absent state directory"
 
-  chmod 0555 "$readonly/state"
+  chmod 0555 "$readonly_state/state"
   status=0
-  out=$(PATH="$fakebin:$PATH" run_lock "$readonly" service-verify crowsnest-backend $$) || status=$?
+  out=$(PATH="$fakebin:$PATH" run_lock "$readonly_state" service-verify crowsnest-backend $$) || status=$?
   expect_code 1 "$status" "service-verify against a read-only empty state directory"
   status=0
-  out=$(PATH="$fakebin:$PATH" run_lock "$readonly" service-release crowsnest-backend $$) || status=$?
+  out=$(PATH="$fakebin:$PATH" run_lock "$readonly_state" service-release crowsnest-backend $$) || status=$?
   expect_code 0 "$status" "free-lock service-release against a read-only state directory"
-  [ -z "$(ls -A "$readonly/state")" ] \
+  [ -z "$(ls -A "$readonly_state/state")" ] \
     || fail "non-writing service modes left files in the read-only state directory"
-  chmod 0755 "$readonly/state"
+  chmod 0755 "$readonly_state/state"
 
   pass "service owner: status, verification, and free release do not prepare state"
 }
