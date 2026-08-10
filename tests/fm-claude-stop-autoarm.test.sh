@@ -219,6 +219,29 @@ test_inert_when_lock_held_by_other_harness() {
   pass "auto-arm: inert without arm, rewake, or lock replacement when another live harness owns the home"
 }
 
+test_inert_when_lock_held_by_live_service_owner() {
+  local dir service out status owner_after
+  dir=$(make_primary_dir "$TMP_ROOT/service-lock")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  # A service owner holds the home: a live non-harness pid the hook must read
+  # as a legitimate owner through its declared record, not as a stale lock.
+  sleep 60 >/dev/null 2>&1 &
+  service=$!
+  FM_HOME="$dir" bash "$dir/bin/fm-lock.sh" service-acquire crowsnest-backend "$service" >/dev/null \
+    || fail "service owner could not take the fixture home's lock"
+  out=$(printf '%s\n' '{"session_id":"s"}' | FM_HOME="$dir" "$FAKE_CLAUDE" -c '"$FM_HOME/bin/fm-claude-stop-autoarm.sh"' 2>&1); status=$?
+  owner_after=$(cat "$dir/state/.lock")
+  kill "$service" 2>/dev/null || true
+  wait "$service" 2>/dev/null || true
+
+  expect_code 0 "$status" "hook must stay inert when a live service owner holds the session lock"
+  [ "$owner_after" = "$service" ] || fail "hook replaced a live service owner: expected $service, got $owner_after"
+  [ ! -e "$dir/state/arm-ran" ] || fail "hook armed while a service owner owned the lock"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "hook wrote an epoch while a service owner owned the lock"
+  pass "auto-arm: inert without arm, rewake, or lock replacement when a live service owner owns the home"
+}
+
 test_inert_when_afk() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/afk")
@@ -420,6 +443,7 @@ test_inert_in_child_worktree
 test_inert_without_session_lock
 test_reclaims_stale_session_lock_before_arming
 test_inert_when_lock_held_by_other_harness
+test_inert_when_lock_held_by_live_service_owner
 test_inert_when_afk
 test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain
