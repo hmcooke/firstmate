@@ -538,12 +538,13 @@ project_instruction_disable_flags_for_harness() {
       # (including the no-mistakes skill) and normal auth keep working.
       # `local` is deliberately KEPT: it is exactly one file,
       # <worktree>/.claude/settings.local.json, and the claude branch below writes it
-      # with firstmate's own semantic busy-state and turn-end hooks before launch,
-      # dropping a repo-supplied symlink at that path first so the write cannot be
-      # diverted or suppressed. The repo therefore cannot supply it and supervision
-      # keeps working. Dropping `local` would blind firstmate to this worker's busy
-      # state and turn ends. Verified on both the print and the interactive launch
-      # path fm-spawn actually uses.
+      # with firstmate's own semantic busy-state and turn-end hooks before launch. On
+      # a locked-down spawn only, that write drops a repo-supplied symlink at either
+      # path first so it cannot be diverted or suppressed. Default spawns preserve
+      # either symlink because the repo's discovery surfaces remain enabled. Dropping
+      # `local` would blind firstmate to this worker's busy state and turn ends.
+      # Verified on both the print and the interactive launch path fm-spawn actually
+      # uses.
       printf -- '--setting-sources user,local '
       ;;
     *)
@@ -1511,16 +1512,19 @@ if [ "$KIND" != secondmate ]; then
       # turn-ended NOTIFICATION touch for the watcher. Every hook command
       # tolerates a refused event (|| true) so a stale-gen writer can never
       # break Claude's own lifecycle.
-      # The worktree is a clone whose contents are NOT trusted, and this file is the
-      # one project-directory input still loaded under --no-project-instructions (the
-      # claude `local` settings source). A repository can ship `.claude`, or the
-      # settings file itself, as a symlink: that would send this write outside the
-      # worktree, or leave the worker running with no supervision hooks while its
-      # metadata says otherwise. Drop an untrusted symlink at either path first, so
-      # the write always lands on a real file at the exact path claude reads.
-      [ ! -L "$WT/.claude" ] || rm -f "$WT/.claude"
+      # Under --no-project-instructions the repo's discovery surfaces are already
+      # disabled, so replacing a repo-supplied symlink at either path costs it nothing
+      # it is still allowed to use and makes the retained `local` settings write safe.
+      # A default spawn preserves either symlink because it may be a legitimate part
+      # of project discovery; its pre-existing write-through hazard remains a separate
+      # follow-up rather than changing default behavior here.
+      if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
+        [ ! -L "$WT/.claude" ] || rm -f "$WT/.claude"
+      fi
       mkdir -p "$WT/.claude"
-      rm -f "$WT/.claude/settings.local.json"
+      if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
+        rm -f "$WT/.claude/settings.local.json"
+      fi
       busy_cmd_prefix="$(shell_quote "$FM_ROOT/bin/fm-busy-event.sh") apply $(shell_quote "$STATE_REAL") $(shell_quote "$ID")"
       busy_suffix="--gen $(shell_quote "$BUSY_GEN") --source claude-hook"
       j_submit=$(json_escape "$busy_cmd_prefix busy $busy_suffix --event user-prompt-submit 2>/dev/null || true")

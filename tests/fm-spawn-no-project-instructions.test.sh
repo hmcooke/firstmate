@@ -137,6 +137,56 @@ test_default_spawn_is_unchanged() {
   pass "default spawns keep the unchanged launch command and meta"
 }
 
+# A default claude spawn must preserve the repo's discovery surfaces exactly as it
+# did before the lockdown flag existed, even when either settings path is a symlink.
+test_default_spawn_preserves_repo_settings_symlinks() {
+  local label shape rec id out status outside expected_link dirty n=0
+  while IFS='|' read -r label shape; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    id="nopi-default-symlink-z2$n"
+    rec=$(make_case "default-symlink$n" claude "$id")
+    read_case_record "$rec"
+    outside="$CASE_DIR/outside-target"
+    : > "$outside"
+    case "$shape" in
+      dir)
+        mkdir -p "$CASE_DIR/outside-dir"
+        ln -s "$CASE_DIR/outside-dir" "$WT_DIR/.claude"
+        expected_link="$CASE_DIR/outside-dir"
+        ;;
+      file)
+        mkdir -p "$WT_DIR/.claude"
+        ln -s "$outside" "$WT_DIR/.claude/settings.local.json"
+        expected_link="$outside"
+        ;;
+    esac
+    git -C "$WT_DIR" add -f .claude
+    git -C "$WT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+      commit -qm "symlink fixture" || fail "$label: could not commit the symlink fixture"
+
+    out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      "$id" "$PROJ_DIR")
+    status=$?
+    expect_code 0 "$status" "$label: default spawn should still succeed"
+
+    case "$shape" in
+      dir) [ -L "$WT_DIR/.claude" ] || fail "$label: default spawn replaced .claude" ;;
+      file) [ -L "$WT_DIR/.claude/settings.local.json" ] || fail "$label: default spawn replaced settings.local.json" ;;
+    esac
+    case "$shape" in
+      dir) [ "$(readlink "$WT_DIR/.claude")" = "$expected_link" ] || fail "$label: default spawn retargeted .claude" ;;
+      file) [ "$(readlink "$WT_DIR/.claude/settings.local.json")" = "$expected_link" ] || fail "$label: default spawn retargeted settings.local.json" ;;
+    esac
+    dirty=$(git -C "$WT_DIR" status --porcelain)
+    [ -z "$dirty" ] || fail "$label: default spawn dirtied the worktree: $dirty"
+  done <<'ROWS'
+.claude symlink remains part of project discovery|dir
+settings.local.json symlink remains part of project discovery|file
+ROWS
+  pass "default claude spawns preserve repo-supplied settings symlinks"
+}
+
 # Firstmate's own per-task claude hooks (semantic busy state and the turn-end touch)
 # live in the worktree's .claude/settings.local.json, which fm-spawn writes itself. The
 # lockdown must not disable them or firstmate goes blind to this worker: it drops the
@@ -316,6 +366,7 @@ test_batch_forwards_the_flag() {
 
 test_supported_harness_carries_flags_and_records_meta
 test_default_spawn_is_unchanged
+test_default_spawn_preserves_repo_settings_symlinks
 test_lockdown_keeps_firstmate_own_supervision_hooks
 test_hostile_settings_symlinks_cannot_divert_the_write
 test_flag_composes_with_model_and_effort
