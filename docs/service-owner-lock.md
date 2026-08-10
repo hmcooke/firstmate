@@ -28,24 +28,14 @@ Verification is read-only and changes nothing, so a health check may call it as 
 ## What the lock looks like on disk
 
 `state/.lock` keeps its exact shape - one line holding the owning pid - so every reader that only wants that pid is unaffected by this mode.
-The declaration lives beside it in `state/.lock.owner`:
-
-```
-kind=service
-pid=<pid recorded in state/.lock>
-name=<declared owner identity>
-start=<start-time token of that pid>
-```
-
-Both files are internal to [`bin/fm-session-lock-lib.sh`](../bin/fm-session-lock-lib.sh), which owns the rules that read them; a service should call the script rather than write either file itself.
-The reader accepts only these four keys, each exactly once, with no other content.
-The record is published before the lock names its pid, so an interrupted acquisition leaves a record no reader honors rather than a lock nobody can attribute.
+The declaration and process-incarnation binding live beside it in `state/.lock.owner`.
+Both files are internal to [`bin/fm-session-lock-lib.sh`](../bin/fm-session-lock-lib.sh), which owns the exact record format and validation rules; a service should call the script rather than write either file itself.
 
 ## What the mode guarantees
 
 Ownership is a declaration bound to one live process incarnation.
 The record counts only while it names the pid `state/.lock` records and that pid still carries the recorded start time, so a process that merely looks like the service cannot claim ownership and a recycled pid cannot inherit it.
-There is no process-name matching anywhere in this path.
+Service ownership is never granted by matching a process name.
 
 A live service owner is never displaced.
 A harness session opening in the same home refuses into read-only and names the service owner in its own error, an ordinary firstmate session then reports the loud read-only banner and skips every mutating step, and the Claude Stop auto-arm stays inert instead of reclaiming the lock.
@@ -57,7 +47,7 @@ A malformed record or one that names a different lock pid returns to the ordinar
 ## Limits
 
 The lock is cooperative and local, the same as it has always been: it coordinates processes on one host that agree to consult it, and it is not an access control on the home's files.
-`start` comes from `ps -o lstart=` under `LC_ALL=C` and `TZ=UTC`, so its text is independent of the caller's locale and timezone.
+The process-incarnation token comes from `ps -o lstart=` under `LC_ALL=C` and `TZ=UTC`, so its text is independent of the caller's locale and timezone.
 A host whose `ps` cannot report a process start time refuses service acquisition with a named error rather than falling back to trusting a bare pid.
 If the canonical start token later cannot be read for a still-live recorded pid, the owner's identity is unverifiable and takeover is refused until it can be resolved.
 That token has one-second granularity, which is the residual limit of the pid binding.

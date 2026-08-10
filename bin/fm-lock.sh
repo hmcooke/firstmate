@@ -239,9 +239,9 @@ fi
 assert_no_live_other_owner
 
 if [ "$MODE" = service-acquire ]; then
-  # The record is published before the lock names its pid, so a crash in
-  # between leaves a record no reader honors rather than a lock nobody can
-  # prove belongs to a service.
+  # Publish the record before updating the lock pid. Readers require an exact
+  # pid match, so this record cannot attribute a lock naming another pid to the
+  # service if acquisition stops before lock publication.
   tmp=$(mktemp "$STATE/.lock.owner.XXXXXX" 2>/dev/null) || {
     echo "error: cannot write the service-owner record; operate read-only until resolved" >&2
     exit 1
