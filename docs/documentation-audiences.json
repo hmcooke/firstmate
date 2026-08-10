@@ -312,6 +312,10 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "docs/verification/instruction-discovery.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/verification/process-event-sources.md",
       "audience": "maintainer-verification"
     },

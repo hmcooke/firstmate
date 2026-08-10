@@ -152,6 +152,24 @@ A discovery surface you could not reach establishes nothing; report that as unce
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
 
+### Project instruction discovery
+
+Use `bin/fm-spawn.sh --no-project-instructions` when a worker will stand in a clone whose contents are not trusted.
+It prevents that clone's instruction files, skills, agents, hooks, and MCP definitions from becoming live configuration while preserving the worker's brief, the operator's user-level configuration, and firstmate's supervision hooks.
+It is per-spawn and additive, so every spawn without it keeps full discovery unchanged.
+
+| Harness | Status |
+|---|---|
+| claude | Supported by the only empirically verified disable mechanism. |
+| codex | Refused because verification found that its project instruction file can be suppressed but arbitrary project skills cannot be disabled generically. |
+| opencode, pi, pi-signed, grok, kimi | Refused as unverified, meaning untested rather than proven incapable. |
+
+The refusal is structural, not advisory: a harness outside the allowlist, a raw launch command, or `--secondmate` stops the spawn before any worktree, worker endpoint, global harness hook, or task metadata is created.
+A protected spawn records `project_instructions=off` in the task's metadata; an absent line means instructions load normally.
+`bin/fm-spawn.sh` owns the exact launch mechanism and fail-closed validation.
+The empirical evidence, fixture method, and requirements for extending the allowlist live in [`docs/verification/instruction-discovery.md`](../../../docs/verification/instruction-discovery.md).
+The guarantee is structural only: discovery is off, but a worker can still read untrusted files as data with its ordinary tools, so brief it accordingly.
+
 ## no-mistakes skill invocation
 
 Send the validation skill using the target harness's skill invocation form.
