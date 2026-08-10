@@ -285,6 +285,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/service-owner-lock.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/sessionstart-nudge.md",
       "audience": "operator-current"
     },
