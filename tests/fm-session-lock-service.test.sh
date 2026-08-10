@@ -7,7 +7,7 @@
 # the real script against real processes: a plain `sleep` stands in for the
 # service, and a bash symlink named "claude" stands in for an interactive
 # harness session, so the ancestry walk and the start-time identity binding both
-# run against the host's real ps rather than a fake.
+# normally run against the host's real ps.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -56,6 +56,22 @@ run_lock_as_harness() {
   shift
   # shellcheck disable=SC2016 # single quotes are deliberate: the harness child expands these itself
   FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" "$@"' "$LOCK_SH" "$@" 2>&1
+}
+
+make_lstart_unreadable_ps() {
+  local fakebin=$1 real_ps
+  real_ps=$(command -v ps)
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'REAL_PS=%q\n' "$real_ps"
+    cat <<'SH'
+for arg in "$@"; do
+  [ "$arg" = lstart= ] && exit 1
+done
+exec "$REAL_PS" "$@"
+SH
+  } > "$fakebin/ps"
+  chmod +x "$fakebin/ps"
 }
 
 test_lifecycle_acquire_verify_release() {
@@ -122,6 +138,14 @@ test_live_service_owner_is_never_displaced() {
     "the refusal did not keep the ordinary read-only wording"
   [ "$(cat "$home/state/.lock")" = "$svc" ] || fail "a harness session overwrote a live service owner's lock"
 
+  status=0
+  out=$(run_lock "$home" service-acquire other-service "$svc") || status=$?
+  expect_code 1 "$status" "a different owner name on the same pid must not replace the holding owner"
+  assert_contains "$out" "a live service owner holds the lock (crowsnest-backend, pid $svc)" \
+    "the same-pid refusal did not preserve the recorded service identity"
+  assert_contains "$(cat "$home/state/.lock.owner")" "name=crowsnest-backend" \
+    "a same-pid different-name acquire rewrote the owner record"
+
   # A second service owner is refused on the same terms.
   status=0
   out=$(run_lock "$home" service-acquire other-service $$) || status=$?
@@ -130,6 +154,57 @@ test_live_service_owner_is_never_displaced() {
 
   stop_service "$svc"
   pass "service owner: a live service owner is never displaced by a harness or another service"
+}
+
+test_start_token_is_canonical_across_timezones() {
+  local home svc out status=0
+  home=$(new_home canonical-timezone)
+  start_service; svc=$SERVICE_PID
+
+  out=$(TZ=Asia/Tokyo FM_HOME="$home" "$LOCK_SH" service-acquire crowsnest-backend "$svc" 2>&1) \
+    || status=$?
+  expect_code 0 "$status" "service-acquire under a non-UTC timezone"
+
+  out=$(TZ=UTC FM_HOME="$home" "$LOCK_SH" status 2>&1)
+  assert_contains "$out" "lock: held by live service owner crowsnest-backend (pid $svc)" \
+    "status under a different timezone did not recognize the same process incarnation"
+
+  status=0
+  out=$(export TZ=Europe/London; run_lock_as_harness "$home") || status=$?
+  expect_code 1 "$status" "a timezone change must not make a live service lock reclaimable"
+  [ "$(cat "$home/state/.lock")" = "$svc" ] \
+    || fail "a timezone change allowed a harness to displace the service owner"
+
+  stop_service "$svc"
+  pass "service owner: start-time identity is canonical across caller timezones"
+}
+
+test_unreadable_live_identity_refuses_takeover() {
+  local home svc out status=0 fakebin
+  home=$(new_home unreadable-identity)
+  fakebin=$(fm_fakebin "$TMP_ROOT/unreadable-identity-tools")
+  make_lstart_unreadable_ps "$fakebin"
+  start_service; svc=$SERVICE_PID
+  run_lock "$home" service-acquire crowsnest-backend "$svc" >/dev/null
+
+  out=$(PATH="$fakebin:$PATH" run_lock "$home" status)
+  assert_contains "$out" \
+    "lock: recorded service owner crowsnest-backend (pid $svc) identity could not be verified" \
+    "status claimed certainty when the live owner's start token was unreadable"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" run_lock_as_harness "$home") || status=$?
+  expect_code 1 "$status" "an unreadable live service identity must refuse takeover"
+  assert_contains "$out" \
+    "recorded service owner crowsnest-backend (pid $svc) identity could not be verified" \
+    "the takeover refusal did not describe the identity uncertainty"
+  assert_contains "$out" "operate read-only until resolved" \
+    "the identity uncertainty refusal omitted the read-only instruction"
+  [ "$(cat "$home/state/.lock")" = "$svc" ] \
+    || fail "an unreadable identity allowed a harness to displace the live service pid"
+
+  stop_service "$svc"
+  pass "service owner: unreadable identity preserves a live recorded owner's lock"
 }
 
 test_dead_service_owner_is_reclaimable() {
@@ -182,7 +257,7 @@ test_record_must_name_the_lock_pid() {
   start_service; svc=$SERVICE_PID
   # A record naming a live process that the lock does not name is not a claim on
   # this lock: the lock still reads by the ordinary harness rules.
-  printf 'kind=service\npid=%s\nname=forged\nstart=%s\n' "$svc" "$(ps -o lstart= -p "$svc")" \
+  printf 'kind=service\npid=%s\nname=forged\nstart=%s\n' "$svc" "$(LC_ALL=C TZ=UTC ps -o lstart= -p "$svc")" \
     > "$home/state/.lock.owner"
   printf '4242\n' > "$home/state/.lock"
 
@@ -193,6 +268,32 @@ test_record_must_name_the_lock_pid() {
 
   stop_service "$svc"
   pass "service owner: a record is honored only for the pid the lock itself records"
+}
+
+test_duplicate_record_field_is_rejected() {
+  local home svc out status=0
+  home=$(new_home duplicate-record)
+  start_service; svc=$SERVICE_PID
+  run_lock "$home" service-acquire crowsnest-backend "$svc" >/dev/null
+  printf 'name=other-service\n' >> "$home/state/.lock.owner"
+
+  out=$(run_lock "$home" status)
+  assert_contains "$out" "lock: stale (pid $svc dead or not a harness)" \
+    "a duplicate-field record did not fall back to ordinary harness ownership rules"
+  assert_not_contains "$out" "service owner crowsnest-backend" \
+    "a duplicate-field record still granted the declared service identity"
+
+  status=0
+  out=$(run_lock "$home" service-verify crowsnest-backend "$svc") || status=$?
+  expect_code 1 "$status" "service-verify must reject a duplicate-field owner record"
+
+  status=0
+  out=$(run_lock_as_harness "$home") || status=$?
+  expect_code 0 "$status" "a malformed service record must return the lock to harness rules"
+  assert_absent "$home/state/.lock.owner" "harness reclaim left the malformed owner record behind"
+
+  stop_service "$svc"
+  pass "service owner: duplicate record fields grant no ownership"
 }
 
 test_live_harness_owner_refuses_service_acquire() {
@@ -236,6 +337,47 @@ test_release_is_owner_bound_and_idempotent() {
 
   stop_service "$svc"
   pass "service owner: release is bound to the recorded owner and is a no-op on a free lock"
+}
+
+test_nonwriting_modes_leave_state_untouched() {
+  local absent readonly fakebin out status=0
+  absent="$TMP_ROOT/nonwriting-absent"
+  readonly=$(new_home nonwriting-readonly)
+  fakebin=$(fm_fakebin "$TMP_ROOT/nonwriting-tools")
+  mkdir -p "$absent"
+  cat > "$fakebin/mktemp" <<'SH'
+#!/usr/bin/env bash
+exit 97
+SH
+  chmod +x "$fakebin/mktemp"
+
+  out=$(PATH="$fakebin:$PATH" run_lock "$absent" status)
+  assert_contains "$out" "lock: free" "status did not report an absent state directory as free"
+  assert_absent "$absent/state" "status created an absent state directory"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" run_lock "$absent" service-verify crowsnest-backend $$) || status=$?
+  expect_code 1 "$status" "service-verify against an absent state directory"
+  assert_absent "$absent/state" "service-verify created an absent state directory"
+
+  status=0
+  out=$(PATH="$fakebin:$PATH" run_lock "$absent" service-release crowsnest-backend $$) || status=$?
+  expect_code 0 "$status" "free-lock service-release against an absent state directory"
+  assert_contains "$out" "lock: free" "free-lock release did not report an absent lock as free"
+  assert_absent "$absent/state" "free-lock service-release created an absent state directory"
+
+  chmod 0555 "$readonly/state"
+  status=0
+  out=$(PATH="$fakebin:$PATH" run_lock "$readonly" service-verify crowsnest-backend $$) || status=$?
+  expect_code 1 "$status" "service-verify against a read-only empty state directory"
+  status=0
+  out=$(PATH="$fakebin:$PATH" run_lock "$readonly" service-release crowsnest-backend $$) || status=$?
+  expect_code 0 "$status" "free-lock service-release against a read-only state directory"
+  [ -z "$(ls -A "$readonly/state")" ] \
+    || fail "non-writing service modes left files in the read-only state directory"
+  chmod 0755 "$readonly/state"
+
+  pass "service owner: status, verification, and free release do not prepare state"
 }
 
 test_reacquire_by_same_owner_refreshes() {
@@ -284,10 +426,14 @@ test_malformed_requests_refuse() {
 test_lifecycle_acquire_verify_release
 test_pid_defaults_to_calling_process
 test_live_service_owner_is_never_displaced
+test_start_token_is_canonical_across_timezones
+test_unreadable_live_identity_refuses_takeover
 test_dead_service_owner_is_reclaimable
 test_recycled_pid_never_inherits_ownership
 test_record_must_name_the_lock_pid
+test_duplicate_record_field_is_rejected
 test_live_harness_owner_refuses_service_acquire
 test_release_is_owner_bound_and_idempotent
+test_nonwriting_modes_leave_state_untouched
 test_reacquire_by_same_owner_refreshes
 test_malformed_requests_refuse

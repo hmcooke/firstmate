@@ -62,11 +62,6 @@ case "$MODE" in
     ;;
 esac
 
-mkdir -p "$STATE" 2>/dev/null || {
-  echo "error: cannot create session-lock state directory $STATE; operate read-only until resolved" >&2
-  exit 1
-}
-
 # Owner identity (FM_HARNESS_RE, the ancestry walk, holder liveness, and the
 # service-owner record contract) is owned by the shared session-lock lib so the
 # Claude Stop auto-arm applies the exact same identity contract.
@@ -82,10 +77,12 @@ if [ "$MODE" = status ]; then
   }
   if fm_service_lock_owner_live "$STATE"; then
     echo "lock: held by live service owner $FM_SERVICE_OWNER_NAME (pid $FM_SERVICE_OWNER_PID)"
+  elif [ "$FM_SERVICE_OWNER_STATE" = unverifiable ]; then
+    echo "lock: recorded service owner $FM_SERVICE_OWNER_NAME (pid $FM_SERVICE_OWNER_PID) identity could not be verified"
+  elif [ "$FM_SERVICE_OWNER_STATE" = stale ]; then
+    echo "lock: stale (service owner $FM_SERVICE_OWNER_NAME pid $old dead or replaced)"
   elif fm_harness_pid_alive "$old"; then
     echo "lock: held by live harness pid $old"
-  elif declared=$(fm_service_owner_declared_name "$STATE"); then
-    echo "lock: stale (service owner $declared pid $old dead or replaced)"
   else
     echo "lock: stale (pid $old dead or not a harness)"
   fi
@@ -121,9 +118,24 @@ if [ "$MODE" = service-verify ]; then
     echo "lock: held by live service owner $NAME (pid $PID)"
     exit 0
   fi
+  if [ "$FM_SERVICE_OWNER_STATE" = unverifiable ] \
+    && [ "$FM_SERVICE_OWNER_NAME" = "$NAME" ] && [ "$FM_SERVICE_OWNER_PID" = "$PID" ]; then
+    echo "error: recorded service owner $NAME (pid $PID) identity could not be verified" >&2
+    exit 1
+  fi
   echo "error: service owner $NAME (pid $PID) does not hold the session lock" >&2
   exit 1
 fi
+
+if [ "$MODE" = service-release ] && [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ]; then
+  echo "lock: free"
+  exit 0
+fi
+
+mkdir -p "$STATE" 2>/dev/null || {
+  echo "error: cannot create session-lock state directory $STATE; operate read-only until resolved" >&2
+  exit 1
+}
 
 if [ "$MODE" = acquire ]; then
   me=$(fm_harness_ancestry_pid) || { echo "error: cannot locate harness process in ancestry" >&2; exit 1; }
@@ -179,23 +191,35 @@ assert_no_live_other_owner() {
     echo "error: session lock is unreadable; operate read-only until resolved" >&2
     exit 1
   }
-  [ "$OLD" = "$me" ] && return 0
-  if fm_service_lock_owner_live "$STATE"; then
-    echo "error: a live service owner holds the lock ($FM_SERVICE_OWNER_NAME, pid $FM_SERVICE_OWNER_PID); operate read-only until resolved" >&2
-    exit 1
+  if [ "$OLD" = "$me" ]; then
+    if [ "$MODE" = acquire ] || [ "$MODE" = service-release ]; then
+      return 0
+    fi
+    if fm_service_lock_owner_live "$STATE" \
+      && [ "$FM_SERVICE_OWNER_NAME" = "$NAME" ] \
+      && [ "$FM_SERVICE_OWNER_PID" = "$PID" ] \
+      && [ "$FM_SERVICE_OWNER_START" = "$START" ]; then
+      return 0
+    fi
   fi
-  if fm_harness_pid_alive "$OLD"; then
-    echo "error: another live firstmate session holds the lock (pid $OLD); operate read-only until resolved" >&2
+  if fm_session_lock_owner_live "$STATE"; then
+    case "$FM_SERVICE_OWNER_STATE" in
+      live)
+        echo "error: a live service owner holds the lock ($FM_SERVICE_OWNER_NAME, pid $FM_SERVICE_OWNER_PID); operate read-only until resolved" >&2
+        ;;
+      unverifiable)
+        echo "error: recorded service owner $FM_SERVICE_OWNER_NAME (pid $FM_SERVICE_OWNER_PID) identity could not be verified; operate read-only until resolved" >&2
+        ;;
+      *)
+        echo "error: another live firstmate session holds the lock (pid $OLD); operate read-only until resolved" >&2
+        ;;
+    esac
     exit 1
   fi
   return 0
 }
 
 if [ "$MODE" = service-release ]; then
-  if [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ]; then
-    echo "lock: free"
-    exit 0
-  fi
   assert_no_live_other_owner
   declared=$(fm_service_owner_declared_name "$STATE") || declared=''
   if [ "$OLD" != "$PID" ] || [ "$declared" != "$NAME" ]; then

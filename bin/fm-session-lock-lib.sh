@@ -116,10 +116,10 @@ fm_session_lock_owned_by_self() {
 # The record is honored ONLY while it names the pid state/.lock records AND
 # that pid still carries the recorded start-time token. Ownership is therefore
 # a declaration bound to one live process incarnation: it is never inferred
-# from a process name, and a recycled pid never inherits it. Every malformed,
-# mismatched, dead, or replaced record simply fails, which returns the lock to
-# the harness rules above - a dead service owner is reclaimable on exactly the
-# same terms as a dead harness owner.
+# from a process name, and a recycled pid never inherits it. A malformed or
+# lock-mismatched record returns to the harness rules above. A dead or replaced
+# recorded service owner is proven stale and reclaimable, while an unreadable
+# start token for a live recorded pid refuses reclamation.
 
 # Path of the service-owner record beside state dir $1's session lock.
 fm_service_owner_record() {
@@ -151,65 +151,116 @@ fm_process_start_token() {
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  token=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  token=$(LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null) || return 1
   token=$(printf '%s\n' "$token" | head -n 1 | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//')
   [ -n "$token" ] || return 1
   printf '%s\n' "$token"
 }
 
-# Print field $2 of service-owner record file $1.
-fm_service_owner_field() {
-  local file=$1 key=$2
-  sed -n "s/^$key=//p" "$file" 2>/dev/null | head -n 1
+# Read service-owner record file $1 only when it contains each allowed field
+# exactly once and no other content.
+fm_service_owner_record_read() {
+  local file=$1 line kind='' pid='' name='' start=''
+  local seen_kind=0 seen_pid=0 seen_name=0 seen_start=0
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      kind=*)
+        [ "$seen_kind" -eq 0 ] || return 1
+        kind=${line#kind=}
+        seen_kind=1
+        ;;
+      pid=*)
+        [ "$seen_pid" -eq 0 ] || return 1
+        pid=${line#pid=}
+        seen_pid=1
+        ;;
+      name=*)
+        [ "$seen_name" -eq 0 ] || return 1
+        name=${line#name=}
+        seen_name=1
+        ;;
+      start=*)
+        [ "$seen_start" -eq 0 ] || return 1
+        start=${line#start=}
+        seen_start=1
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$file" || return 1
+  [ "$seen_kind" -eq 1 ] && [ "$seen_pid" -eq 1 ] \
+    && [ "$seen_name" -eq 1 ] && [ "$seen_start" -eq 1 ] || return 1
+  FM_SERVICE_OWNER_RECORD_KIND=$kind
+  FM_SERVICE_OWNER_RECORD_PID=$pid
+  FM_SERVICE_OWNER_RECORD_NAME=$name
+  FM_SERVICE_OWNER_RECORD_START=$start
+}
+
+# Read the valid service-owner record bound to state dir $1's current lock.
+fm_service_owner_record_for_lock() {
+  local state=$1 record lock_pid
+  FM_SERVICE_OWNER_NAME=''
+  FM_SERVICE_OWNER_PID=''
+  FM_SERVICE_OWNER_START=''
+  record=$(fm_service_owner_record "$state")
+  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
+  case "$lock_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fm_service_owner_record_read "$record" || return 1
+  [ "$FM_SERVICE_OWNER_RECORD_KIND" = service ] || return 1
+  [ "$FM_SERVICE_OWNER_RECORD_PID" = "$lock_pid" ] || return 1
+  fm_service_owner_name_valid "$FM_SERVICE_OWNER_RECORD_NAME" || return 1
+  [ -n "$FM_SERVICE_OWNER_RECORD_START" ] || return 1
+  FM_SERVICE_OWNER_NAME=$FM_SERVICE_OWNER_RECORD_NAME
+  FM_SERVICE_OWNER_PID=$FM_SERVICE_OWNER_RECORD_PID
+  FM_SERVICE_OWNER_START=$FM_SERVICE_OWNER_RECORD_START
 }
 
 # Print the service-owner name declared for the pid currently in state dir $1's
 # lock, live or not. Fails when no well-formed record names that pid.
 fm_service_owner_declared_name() {
-  local state=$1 record lock_pid name
-  record=$(fm_service_owner_record "$state")
-  [ -f "$record" ] && [ ! -L "$record" ] || return 1
-  lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
-  case "$lock_pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$(fm_service_owner_field "$record" kind)" = service ] || return 1
-  [ "$(fm_service_owner_field "$record" pid)" = "$lock_pid" ] || return 1
-  name=$(fm_service_owner_field "$record" name)
-  fm_service_owner_name_valid "$name" || return 1
-  printf '%s\n' "$name"
+  fm_service_owner_record_for_lock "$1" || return 1
+  printf '%s\n' "$FM_SERVICE_OWNER_NAME"
 }
 
 # True when state dir $1's lock is held by a live declared service owner. On
-# success FM_SERVICE_OWNER_NAME and FM_SERVICE_OWNER_PID name it for the
-# caller's message; both are cleared first so a failed check never leaves a
-# previous owner's identity behind.
-# shellcheck disable=SC2034 # both globals are this function's output, read by bin/fm-lock.sh
+# success FM_SERVICE_OWNER_NAME, FM_SERVICE_OWNER_PID, and
+# FM_SERVICE_OWNER_START identify it for the caller. FM_SERVICE_OWNER_STATE is
+# live, stale, unverifiable, or none after every check.
 fm_service_lock_owner_live() {
-  local state=$1 name pid start token
-  FM_SERVICE_OWNER_NAME=''
-  FM_SERVICE_OWNER_PID=''
-  name=$(fm_service_owner_declared_name "$state") || return 1
-  pid=$(cat "$state/.lock" 2>/dev/null) || return 1
-  start=$(fm_service_owner_field "$(fm_service_owner_record "$state")" start)
-  [ -n "$start" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  token=$(fm_process_start_token "$pid") || return 1
-  [ "$token" = "$start" ] || return 1
-  FM_SERVICE_OWNER_NAME=$name
-  FM_SERVICE_OWNER_PID=$pid
+  local state=$1 token
+  FM_SERVICE_OWNER_STATE=none
+  fm_service_owner_record_for_lock "$state" || return 1
+  if ! kill -0 "$FM_SERVICE_OWNER_PID" 2>/dev/null; then
+    FM_SERVICE_OWNER_STATE=stale
+    return 1
+  fi
+  token=$(fm_process_start_token "$FM_SERVICE_OWNER_PID") || {
+    FM_SERVICE_OWNER_STATE=unverifiable
+    return 1
+  }
+  if [ "$token" != "$FM_SERVICE_OWNER_START" ]; then
+    FM_SERVICE_OWNER_STATE=stale
+    return 1
+  fi
+  FM_SERVICE_OWNER_STATE=live
   return 0
 }
 
-# True when the process recorded in state dir $1's lock is still a live owner of
-# either kind. This is the ONE predicate that answers "may this lock be
-# reclaimed?", so acquisition and the Claude Stop auto-arm displace a live
-# service owner no more readily than a live harness owner. The service check
-# runs first because a record bound to that exact pid is the more specific
-# claim.
+# True when the process recorded in state dir $1's lock is a live owner of
+# either kind or a live service pid whose identity cannot be verified. This is
+# the ONE predicate that answers "must reclamation be refused?", so acquisition
+# and the Claude Stop auto-arm displace a live service owner no more readily
+# than a live harness owner. The service check runs first because a record bound
+# to that exact pid is the more specific claim.
 fm_session_lock_owner_live() {
   local state=$1 lock_pid
   fm_service_lock_owner_live "$state" && return 0
+  case "$FM_SERVICE_OWNER_STATE" in
+    unverifiable) return 0 ;;
+    stale) return 1 ;;
+  esac
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
   case "$lock_pid" in
     ''|*[!0-9]*) return 1 ;;
