@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--no-project-instructions]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--no-project-instructions]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -127,6 +127,25 @@
 #   secondmate receives the primary's read-only shared captain-preference file
 #   (fm-config-inherit-lib.sh). A successful launch clears pending inherited
 #   config reread generations because the new agent reads the converged files.
+#   --no-project-instructions launches the worker so the harness does NOT load the
+#   worktree's own instruction surfaces as live configuration: no project CLAUDE.md
+#   or AGENTS.md auto-load, no project skill/agent/hook/MCP discovery. Use it when the
+#   worker stands in a clone whose contents are not trusted, where those files would
+#   otherwise be prompt injection by construction. The worker still receives its brief
+#   normally (the brief rides the launch prompt, not a discovered file) and keeps the
+#   operator's own user-level configuration, so a user-level skill such as no-mistakes
+#   stays available. Firstmate's own per-task supervision hooks keep working too, so a
+#   locked-down worker is still watched normally. Default behavior is unchanged:
+#   without the flag every spawn keeps full discovery. The flag is per-spawn and FAILS
+#   CLOSED - a harness with no empirically verified disable mechanism, a raw launch
+#   command, or --secondmate is refused before any worker endpoint exists, never
+#   launched unprotected. The supported harnesses are the allowlist in this script's
+#   project_instruction_disable_flags_for_harness(); the empirical evidence and
+#   per-harness findings live in the harness-adapters skill and
+#   docs/verification/instruction-discovery.md. Recorded in meta as
+#   project_instructions=off; an absent line means instructions load normally.
+#   The guarantee is structural: discovery is off, but a worker can still READ
+#   untrusted files as data with its ordinary tools, so brief it accordingly.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
@@ -141,7 +160,7 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo/--no-project-instructions
 #   applies to every pair. A ship batch therefore carries one delivery contract, and each
 #   pair still checks it against its own brief; a batch spanning modes is two invocations.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
@@ -161,6 +180,9 @@
 #     __OPINPUT__   absolute path to the canonical operational-input encoder
 #     __WORKTREE__  absolute path to the task worktree
 #     __CURSORBIN__ resolved, cursor-verified executable for a cursor launch
+#     __NOPROJFLAG__ the harness's project-instruction-disable flags under
+#                  --no-project-instructions, empty otherwise; a template without this
+#                  placeholder cannot serve that flag and refuses it
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -283,6 +305,7 @@ MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
+NO_PROJECT_INSTRUCTIONS=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -321,6 +344,7 @@ for a in "$@"; do
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
+    --no-project-instructions) NO_PROJECT_INSTRUCTIONS=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -868,6 +892,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   # spanning several modes is two invocations rather than a silent mixed dispatch.
   [ "$MODE_SET" -eq 0 ] || shared_args+=(--mode "$MODE")
   [ "$YOLO_SET" -eq 0 ] || shared_args+=(--yolo "$YOLO")
+  [ "$NO_PROJECT_INSTRUCTIONS" -eq 0 ] || shared_args+=(--no-project-instructions)
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -1111,7 +1136,7 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __NOPROJFLAG____MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
@@ -1180,9 +1205,49 @@ launch_template() {
   esac
 }
 
+# The verified per-harness mechanism for --no-project-instructions: the launch flags
+# that stop the harness treating the worktree it stands in as live configuration.
+# This is an ALLOWLIST and returns non-zero for every harness whose mechanism has not
+# been proved empirically, so the caller refuses the spawn instead of launching a
+# worker that silently inherits an untrusted repo's instructions.
+# Each entry's evidence lives in docs/verification/instruction-discovery.md.
+project_instruction_disable_flags_for_harness() {
+  local harness=$1
+  case "$harness" in
+    claude)
+      # Claude Code 2.1.220: settings sources are the single gate for everything the
+      # project directory supplies. Dropping the `project` source drops the worktree's
+      # CLAUDE.md, .claude/skills, .claude/agents, .claude/settings.json hooks, and
+      # .mcp.json together, while the operator's own user-level configuration
+      # (including the no-mistakes skill) and normal auth keep working.
+      # `local` is deliberately KEPT: it is exactly one file,
+      # <worktree>/.claude/settings.local.json, and the claude branch below writes it
+      # with firstmate's own semantic busy-state and turn-end hooks before launch. On
+      # a locked-down spawn only, that write drops a repo-supplied symlink at either
+      # path first so it cannot be diverted or suppressed. Default spawns preserve
+      # either symlink because the repo's discovery surfaces remain enabled. Dropping
+      # `local` would blind firstmate to this worker's busy state and turn ends.
+      # Verified on both the print and the interactive launch path fm-spawn actually
+      # uses.
+      printf -- '--setting-sources user,local '
+      ;;
+    *)
+      # No verified mechanism. codex 0.147.0 is deliberately here: `-c
+      # project_doc_max_bytes=0` does suppress the AGENTS.md auto-load, but project
+      # skills under .codex/skills and .agents/skills are still discovered and their
+      # attacker-controlled descriptions still reach the prompt, and codex's only
+      # disable (skills.config) matches one exact SKILL.md path, so an unknown
+      # hostile skill file cannot be blocked ahead of time.
+      return 1
+      ;;
+  esac
+}
+
+RAW_LAUNCH=0
 case "$ARG3" in
   *' '*)  # raw launch command (unverified-adapter escape hatch)
     LAUNCH=$ARG3
+    RAW_LAUNCH=1
     HARNESS=""
     for word in $LAUNCH; do
       case "$word" in [A-Za-z_]*=*) continue ;; *) HARNESS=$(basename "$word"); break ;; esac
@@ -1225,6 +1290,45 @@ esac
 if [ "$KIND" = secondmate ] && [ "$HARNESS" = muse ]; then
   echo "error: muse is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
   exit 1
+fi
+
+# --no-project-instructions resolves and validates HERE, before this spawn creates a
+# worktree, endpoint, or global harness hook, so every refusal below leaves no worker
+# behind. It also runs before the per-harness executable resolution below, so an
+# unsupported harness always refuses with the reason that actually applies rather than
+# with whichever binary happens to be missing on this machine.
+# It fails closed on all three ways the guarantee could be silently lost: a
+# harness with no verified mechanism, a raw launch command firstmate did not build, and
+# a secondmate (whose home's own AGENTS.md is the instructions it must load, so the
+# flag would break it rather than protect it).
+NOPROJFLAG=
+if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
+  if [ "$KIND" = secondmate ]; then
+    echo "error: --no-project-instructions does not apply to --secondmate; a secondmate must load its own home's instructions" >&2
+    exit 1
+  fi
+  if [ "$RAW_LAUNCH" -eq 1 ]; then
+    echo "error: --no-project-instructions cannot be applied to a raw launch command; firstmate cannot verify that an unverified adapter's command disables project instruction discovery" >&2
+    exit 1
+  fi
+  NOPROJFLAG=$(project_instruction_disable_flags_for_harness "$HARNESS") || {
+    echo "error: harness '$HARNESS' has no verified way to disable project instruction discovery, so --no-project-instructions refuses this spawn rather than launching a worker that inherits the worktree's own instructions; select a harness that supports it (see docs/verification/instruction-discovery.md)" >&2
+    exit 1
+  }
+  # An allowlisted harness that resolves to no flags, or a template with nowhere to put
+  # them, would launch unprotected while this spawn reported success. Both are caught
+  # here rather than after the worker exists.
+  [ -n "$NOPROJFLAG" ] || {
+    echo "error: harness '$HARNESS' resolved an empty project-instruction-disable flag set; refusing rather than launching unprotected" >&2
+    exit 1
+  }
+  case "$LAUNCH" in
+    *__NOPROJFLAG__*) ;;
+    *)
+      echo "error: the launch template for harness '$HARNESS' has no __NOPROJFLAG__ placeholder, so --no-project-instructions could not be applied" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 case "$HARNESS" in
@@ -2348,7 +2452,19 @@ if [ "$KIND" != secondmate ]; then
       # the turn-ended NOTIFICATION touch for the watcher. Every
       # hook command tolerates a refused event (|| true) so a stale-gen writer
       # can never break Claude's own lifecycle.
+      # Under --no-project-instructions the repo's discovery surfaces are already
+      # disabled, so replacing a repo-supplied symlink at either path costs it nothing
+      # it is still allowed to use and makes the retained `local` settings write safe.
+      # A default spawn preserves either symlink because it may be a legitimate part
+      # of project discovery; its pre-existing write-through hazard remains a separate
+      # follow-up rather than changing default behavior here.
+      if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
+        [ ! -L "$WT/.claude" ] || rm -f "$WT/.claude"
+      fi
       mkdir -p "$WT/.claude"
+      if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
+        rm -f "$WT/.claude/settings.local.json"
+      fi
       busy_cmd_prefix="$(shell_quote "$FM_ROOT/bin/fm-busy-event.sh") apply $(shell_quote "$STATE_REAL") $(shell_quote "$ID")"
       busy_suffix="--gen $(shell_quote "$BUSY_GEN") --source claude-hook"
       j_submit=$(json_escape "$busy_cmd_prefix busy $busy_suffix --event user-prompt-submit 2>/dev/null || true")
@@ -2650,6 +2766,9 @@ preserve_relaunch_meta() {
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  # Written only when discovery is off, so an ordinary spawn's meta is unchanged;
+  # an absent project_instructions= line means the worker loads them normally.
+  [ "$NO_PROJECT_INSTRUCTIONS" -eq 0 ] || echo "project_instructions=off"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
@@ -2716,6 +2835,7 @@ MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
+LAUNCH=${LAUNCH//__NOPROJFLAG__/$NOPROJFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}

@@ -337,6 +337,10 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "docs/verification/instruction-discovery.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/verification/muse.md",
       "audience": "maintainer-verification"
     },
