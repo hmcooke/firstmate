@@ -273,6 +273,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/launch-prefix.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/orca-backend.md",
       "audience": "operator-current"
     },

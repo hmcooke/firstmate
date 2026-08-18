@@ -285,6 +285,35 @@ test_no_harness_leaks_the_splice_point() {
   pass "no harness leaks the splice point into an unwrapped launch"
 }
 
+# Placement is the whole correctness argument: the wrapper has to sit AFTER a
+# template's own environment assignments and immediately BEFORE its command word. Put
+# it earlier and the wrapper would try to execute an assignment; put it later and it
+# would wrap an argument instead of the agent. Every harness whose launch can be
+# composed without a vendor binary is checked, since each template's leading shape
+# differs.
+test_every_composable_harness_splices_at_the_command_word() {
+  local label harness expect rec id out status launch n=0
+  while IFS='|' read -r label harness expect; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    id="lp-place-c$n"
+    rec=$(make_case "place$n" "$harness" "$id")
+    read_case_record "$rec"
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      "$id" "$PROJ_DIR" --launch-prefix fmwrap)
+    status=$?
+    expect_code 0 "$status" "$label: a wrapped spawn should succeed"$'\n'"$out"
+    launch=$(cat "$LAUNCH_LOG")
+    assert_contains "$launch" "$expect" "$label: the wrapper is not at the command word"
+  done <<'ROWS'
+claude keeps its ghost-text env assignment outside the wrapper|claude|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false 'fmwrap' claude
+codex has no leading assignment to preserve|codex|CURSOR_INVOKED_AS 'fmwrap' codex
+opencode keeps its permission config outside the wrapper|opencode|'{"permission":{"*":"allow"}}' 'fmwrap' opencode
+grok has no leading assignment to preserve|grok|CURSOR_INVOKED_AS 'fmwrap' grok
+ROWS
+  pass "every composable harness splices the wrapper at its own command word"
+}
+
 # --- 3. composition with the other per-spawn guarantees ----------------------
 
 # The intended consumer is a headless service running research scouts: it holds the
@@ -539,6 +568,7 @@ test_prefix_word_keeps_its_spaces
 test_wrapped_launch_really_parents_the_agent
 test_default_spawn_is_unchanged
 test_no_harness_leaks_the_splice_point
+test_every_composable_harness_splices_at_the_command_word
 test_scout_composes_with_lockdown_and_a_service_owned_home
 test_batch_forwards_the_prefix
 test_unusable_prefixes_refuse_before_spawning
