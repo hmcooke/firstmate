@@ -165,7 +165,7 @@ For Cursor, select the intended reasoning class through a model id the account's
 
 Use `bin/fm-spawn.sh --no-project-instructions` when a worker will stand in a clone whose contents are not trusted.
 It prevents that clone's instruction files, skills, agents, hooks, and MCP definitions from becoming live configuration while preserving the worker's brief, the operator's user-level configuration, and firstmate's supervision hooks.
-It is per-spawn and additive, so every spawn without it keeps full discovery unchanged.
+For a fresh spawn it is additive, so omitting it keeps full discovery unchanged.
 
 | Harness | Status |
 |---|---|
@@ -175,6 +175,7 @@ It is per-spawn and additive, so every spawn without it keeps full discovery unc
 
 The refusal is structural, not advisory: a harness outside the allowlist, a raw launch command, or `--secondmate` stops the spawn before any worktree, worker endpoint, global harness hook, or task metadata is created.
 A protected spawn records `project_instructions=off` in the task's metadata; an absent line means instructions load normally.
+Recovering that worker keeps the posture: a relaunch re-applies it from the record, and refuses rather than returning a worker with the clone's instructions live, including when the relaunch moves the task to a harness with no verified mechanism.
 `bin/fm-spawn.sh` owns the exact launch mechanism and fail-closed validation.
 The empirical evidence, fixture method, and requirements for extending the allowlist live in [`docs/verification/instruction-discovery.md`](../../../docs/verification/instruction-discovery.md).
 The guarantee is structural only: discovery is off, but a worker can still read untrusted files as data with its ordinary tools, so brief it accordingly.

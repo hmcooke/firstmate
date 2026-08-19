@@ -2,10 +2,12 @@
 # Behavior tests for fm-spawn.sh --no-project-instructions.
 #
 # The flag exists so a worker standing in an untrusted clone does not inherit that
-# repo's instruction surfaces as live configuration. Two guarantees are load-bearing
-# and both are asserted here through fm-spawn's own interface: a supported harness
+# repo's instruction surfaces as live configuration. Three guarantees are load-bearing
+# and all are asserted here through fm-spawn's own interface: a supported harness
 # really carries the disable flags into the launch command and records the posture in
-# meta, and every unsupported route REFUSES before the spawn creates anything.
+# meta; every unsupported route REFUSES before the spawn creates anything; and a
+# relaunch re-applies the recorded posture rather than returning an unprotected worker
+# into the same untrusted clone.
 #
 # A fake tmux captures the literal command sent with `tmux send-keys -l`, so the
 # launch assertions pin what firstmate would run without starting a real harness.
@@ -26,10 +28,21 @@ make_fakebin() {
 set -u
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_command}"*)
+    if [ -n "${FM_FAKE_COMMAND_FILE:-}" ] && [ -f "$FM_FAKE_COMMAND_FILE" ]; then
+      cat "$FM_FAKE_COMMAND_FILE"; printf '\n'
+    else
+      printf 'zsh\n'
+    fi
+    exit 0 ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  list-windows)
+    if [ -n "${FM_FAKE_WINDOWS_FILE:-}" ] && [ -f "$FM_FAKE_WINDOWS_FILE" ]; then
+      cat "$FM_FAKE_WINDOWS_FILE"
+    fi
+    exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
   send-keys)
     if [ -n "${FM_FAKE_LAUNCH_LOG:-}" ]; then
@@ -90,6 +103,8 @@ run_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     CLAUDE_CONFIG_DIR='' \
+    FM_FAKE_COMMAND_FILE="${FM_FAKE_COMMAND_FILE:-}" \
+    FM_FAKE_WINDOWS_FILE="${FM_FAKE_WINDOWS_FILE:-}" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -381,6 +396,155 @@ test_batch_forwards_the_flag() {
   pass "batch dispatch forwards --no-project-instructions to every pair"
 }
 
+# --- relaunch ----------------------------------------------------------------
+#
+# A relaunch replaces the worker in an existing task's endpoint, so it must re-apply the
+# recorded posture. Handing back a worker with full discovery, in the same untrusted
+# clone, while the record still reads project_instructions=off is the worst shape: it
+# looks protected and is not.
+
+# A task record as fm-spawn writes one, plus whatever posture line the case is about.
+# The harness is explicit because a relaunch takes it from the record, not from config.
+relaunch_case() {  # <name> <harness> <id> [extra-meta-line...]
+  local name=$1 harness=$2 id=$3 rec line
+  shift 3
+  rec=$(make_case "$name" "$harness" "$id")
+  read_case_record "$rec"
+  printf 'zsh' > "$CASE_DIR/pane-command"
+  printf '%s\n' "fm-$id" > "$CASE_DIR/windows"
+  {
+    echo "window=firstmate:fm-$id"
+    echo "endpoint_task_id=$id"
+    echo "worktree=$WT_DIR"
+    echo "project=$PROJ_DIR"
+    echo "harness=$harness"
+    echo "kind=ship"
+    echo "mode=no-mistakes"
+    echo "yolo=off"
+    echo "tasktmp=$CASE_DIR/tasktmp"
+    echo "model=default"
+    echo "effort=default"
+    for line in "$@"; do printf '%s\n' "$line"; done
+  } > "$HOME_DIR/state/$id.meta"
+  mkdir -p "$CASE_DIR/tasktmp"
+}
+
+run_relaunch() {
+  FM_FAKE_COMMAND_FILE="$CASE_DIR/pane-command" FM_FAKE_WINDOWS_FILE="$CASE_DIR/windows" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$@"
+}
+
+# The replacement worker must carry the same disable flags the original did. One row per
+# harness the allowlist supports, so extending it here fails until the relaunch path
+# carries that harness's own form too.
+test_relaunch_reapplies_the_recorded_lockdown() {
+  local label harness expect id out status launch n=0
+  while IFS='|' read -r label harness expect; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    id="nopi-relaunch-r1$n"
+    relaunch_case "relaunch-locked$n" "$harness" "$id" 'project_instructions=off'
+
+    out=$(run_relaunch "$id" --relaunch)
+    status=$?
+    expect_code 0 "$status" "$label: a relaunch of a protected task should succeed"$'\n'"$out"
+
+    launch=$(cat "$LAUNCH_LOG")
+    assert_contains "$launch" "$expect" "$label: the relaunch dropped the disable flags"
+    [ "$(grep -c '^project_instructions=off$' "$HOME_DIR/state/$id.meta")" = 1 ] \
+      || fail "$label: the relaunch did not leave exactly one recorded posture line"$'\n'"$(cat "$HOME_DIR/state/$id.meta")"
+  done <<'ROWS'
+claude re-applies its verified settings-source form|claude|--setting-sources user,local
+ROWS
+  pass "a relaunch re-applies the discovery-disable flags recorded for the task"
+}
+
+# Additivity on the relaunch path too: a task with no recorded posture relaunches exactly
+# as it did before this axis existed.
+test_relaunch_without_a_recorded_posture_is_unchanged() {
+  local id out status launch expected
+  id=nopi-relaunch-r2
+  relaunch_case relaunch-plain claude "$id"
+
+  out=$(run_relaunch "$id" --relaunch)
+  status=$?
+  expect_code 0 "$status" "a relaunch of an ordinary task should succeed"$'\n'"$out"
+
+  launch=$(cat "$LAUNCH_LOG")
+  expected="unset TRACEPARENT; env -u CURSOR_AGENT -u CURSOR_INVOKED_AS CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$HOME_DIR/data/$id/brief.md')\""
+  [ "$launch" = "$expected" ] || fail "an ordinary relaunch changed"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  assert_no_grep 'project_instructions' "$HOME_DIR/state/$id.meta" \
+    "an ordinary relaunch invented a posture line"
+  pass "a relaunch with no recorded posture keeps the unchanged launch command"
+}
+
+test_relaunch_refuses_an_explicit_flag() {
+  local id out status
+  id=nopi-relaunch-r3
+  relaunch_case relaunch-explicit claude "$id" 'project_instructions=off'
+
+  out=$(run_relaunch "$id" --relaunch --no-project-instructions)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a relaunch should refuse an explicit --no-project-instructions"$'\n'"$out"
+  assert_contains "$out" "reuses the task's recorded project-instruction posture" \
+    "the refusal did not name the recorded posture"
+  [ ! -s "$LAUNCH_LOG" ] || fail "a refused relaunch still typed a launch command"
+  pass "a relaunch refuses an explicit flag like every other recorded axis"
+}
+
+# A record firstmate cannot read as a posture must refuse. Treating an unreadable or
+# ambiguous record as "discovery on" would silently downgrade the guarantee on exactly the
+# path that exists to recover a protected worker.
+test_relaunch_refuses_a_corrupt_recorded_posture() {
+  local label recorded expect id out status before n=0
+  local -a lines
+  # Each row carries the posture line(s) the record holds, ';'-separated.
+  while IFS='|' read -r label recorded expect; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    id="nopi-relaunch-r4$n"
+    IFS=';' read -r -a lines <<EOF
+$recorded
+EOF
+    relaunch_case "relaunch-corrupt$n" claude "$id" "${lines[@]}"
+    before=$(cat "$HOME_DIR/state/$id.meta")
+
+    out=$(run_relaunch "$id" --relaunch)
+    status=$?
+    [ "$status" -ne 0 ] || fail "$label: a corrupt recorded posture should refuse the relaunch"$'\n'"$out"
+    assert_contains "$out" "$expect" "$label: the refusal did not name the unusable record"
+    [ ! -s "$LAUNCH_LOG" ] || fail "$label: a refused relaunch still typed a launch command"
+    [ "$(cat "$HOME_DIR/state/$id.meta")" = "$before" ] \
+      || fail "$label: a refused relaunch rewrote the corrupt task record"
+  done <<'ROWS'
+an unknown value is not a posture firstmate wrote|project_instructions=on|off is the only recorded value
+an empty value cannot clear protection silently|project_instructions=|off is the only recorded value
+a truncated value is not a posture firstmate wrote|project_instructions=of|off is the only recorded value
+a bare key cannot clear protection silently|project_instructions|contains an unframed project_instructions metadata line
+a duplicate empty line cannot clear protection|project_instructions=off;project_instructions=|must be exactly one project_instructions= line
+even identical duplicates are ambiguous|project_instructions=off;project_instructions=off|must be exactly one project_instructions= line
+ROWS
+  pass "a recorded posture firstmate cannot read refuses rather than relaunching unprotected"
+}
+
+# A relaunch may move a task onto another harness. If that harness has no verified way to
+# disable discovery, the protected task must refuse rather than land there unprotected.
+test_relaunch_refuses_a_harness_without_a_disable_form() {
+  local id out status
+  id=nopi-relaunch-r5
+  relaunch_case relaunch-harness-swap claude "$id" 'project_instructions=off'
+
+  out=$(run_relaunch "$id" --relaunch --harness codex)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a protected task should refuse a relaunch onto codex"$'\n'"$out"
+  assert_contains "$out" "has no verified way to disable project instruction discovery" \
+    "the refusal did not name the missing mechanism"
+  [ ! -s "$LAUNCH_LOG" ] || fail "a refused harness swap still typed a launch command"
+  assert_grep 'harness=claude' "$HOME_DIR/state/$id.meta" \
+    "a refused harness swap rewrote the task record"
+  pass "a relaunch onto a harness with no disable form refuses rather than dropping protection"
+}
+
 test_supported_harness_carries_flags_and_records_meta
 test_default_spawn_is_unchanged
 test_default_spawn_preserves_repo_settings_symlinks
@@ -391,3 +555,8 @@ test_unsupported_routes_refuse_before_spawning
 test_raw_launch_command_refuses
 test_secondmate_refuses
 test_batch_forwards_the_flag
+test_relaunch_reapplies_the_recorded_lockdown
+test_relaunch_without_a_recorded_posture_is_unchanged
+test_relaunch_refuses_an_explicit_flag
+test_relaunch_refuses_a_corrupt_recorded_posture
+test_relaunch_refuses_a_harness_without_a_disable_form
