@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--no-project-instructions]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--no-project-instructions]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--no-project-instructions] [--launch-prefix <word>]...
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--no-project-instructions] [--launch-prefix <word>]...
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -146,6 +146,28 @@
 #   project_instructions=off; an absent line means instructions load normally.
 #   The guarantee is structural: discovery is off, but a worker can still READ
 #   untrusted files as data with its ordinary tools, so brief it accordingly.
+#   --launch-prefix <word> interposes a caller-supplied wrapper command around the
+#   composed harness launch, so the agent runs as a CHILD of that wrapper rather than
+#   directly under the pane shell. The composed line becomes
+#   `<leading env> <wrapper words...> <harness command...>`, which is the one seam a
+#   caller that must confine, trace, or measure the agent process uses;
+#   docs/launch-prefix.md owns that contract and its intended consumers. The engine
+#   never interprets what the wrapper does. Each occurrence contributes exactly ONE
+#   argv word, in order, so the engine never re-parses caller quoting and a word may
+#   contain spaces (use --launch-prefix=<word> for a word starting with --). The
+#   words are shell-quoted into the launch line, so no word can inject shell syntax.
+#   It applies to crewmate and scout spawns and FAILS CLOSED - an empty word, a word
+#   carrying a newline or carriage return (the pane transport would submit early), a
+#   leading word that is an environment assignment or starts with -, a leading word
+#   that resolves to no executable, --secondmate, a raw launch command, or a launch
+#   template with nowhere to splice is refused before any worker endpoint exists, and
+#   the prefix is never silently dropped. Recorded in meta as one nonempty canonical
+#   shell-quoted launch_prefix= line; an absent line means an unwrapped launch.
+#   --relaunch re-applies that recorded prefix so a replacement agent cannot come back
+#   unwrapped, refuses a malformed or duplicate record, and refuses an explicit
+#   --launch-prefix like every other axis it takes from the record.
+#   A wrapper removed from the machine between spawn and relaunch fails in the pane
+#   rather than launching an unwrapped agent.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
@@ -160,8 +182,9 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo/--no-project-instructions
-#   applies to every pair. A ship batch therefore carries one delivery contract, and each
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo,
+#   --no-project-instructions, and --launch-prefix flags apply to every pair. A ship
+#   batch therefore carries one delivery contract, and each
 #   pair still checks it against its own brief; a batch spanning modes is two invocations.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
 #   and scout batches. The loop lives here, in bash, so callers never hand-write a
@@ -183,6 +206,14 @@
 #     __NOPROJFLAG__ the harness's project-instruction-disable flags under
 #                  --no-project-instructions, empty otherwise; a template without this
 #                  placeholder cannot serve that flag and refuses it
+#     __LAUNCHPREFIX__ the --launch-prefix wrapper words, empty otherwise. Every
+#                  template carries it immediately before its own harness command word
+#                  and AFTER that template's leading environment assignments, which is
+#                  the only position where the wrapper both inherits the composed
+#                  environment and is the process that starts the agent. Placing it in
+#                  the templates rather than deriving it makes a template with nowhere
+#                  to splice a refusal, exactly like __NOPROJFLAG__. A raw launch
+#                  command has no template and so cannot carry a prefix.
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -306,6 +337,11 @@ YOLO_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
 NO_PROJECT_INSTRUCTIONS=0
+LAUNCH_PREFIX_WORDS=()
+LAUNCH_PREFIX_SET=0
+LAUNCH_PREFIX_ADOPTED=0
+LAUNCH_PREFIX_LITERAL=
+LAUNCH_PREFIX_SPLICE=
 POS=()
 want_value=
 for a in "$@"; do
@@ -321,6 +357,7 @@ for a in "$@"; do
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
       traceparent) TRACEPARENT_ARG=$a; TRACEPARENT_SET=1 ;;
+      launch-prefix) LAUNCH_PREFIX_WORDS+=("$a"); LAUNCH_PREFIX_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -345,6 +382,12 @@ for a in "$@"; do
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
     --no-project-instructions) NO_PROJECT_INSTRUCTIONS=1 ;;
+    # Repeatable, one argv word per occurrence. The value is taken verbatim, so a
+    # wrapper flag like -f needs no escaping; the shared `--*` guard above still
+    # catches a forgotten value, and --launch-prefix=<word> carries a word that
+    # legitimately starts with --.
+    --launch-prefix) want_value=launch-prefix ;;
+    --launch-prefix=*) LAUNCH_PREFIX_WORDS+=("${a#--launch-prefix=}"); LAUNCH_PREFIX_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -383,6 +426,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded kind; --scout/--secondmate cannot override it" >&2; exit 1; }
   [ "$MODE_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded delivery mode; --mode cannot override it" >&2; exit 1; }
   [ "$YOLO_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded yolo posture; --yolo cannot override it" >&2; exit 1; }
+  [ "$LAUNCH_PREFIX_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded launch prefix; --launch-prefix cannot override it" >&2; exit 1; }
 else
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
@@ -419,6 +463,43 @@ else
     }
   fi
 fi
+
+if [ "$LAUNCH_PREFIX_SET" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  echo "error: --launch-prefix applies to crewmate and scout spawns only; a secondmate is a firstmate instance that spawns its own workers, so wrap those launches in that home instead" >&2
+  exit 1
+fi
+
+launch_prefix_literal_is_canonical() {
+  local rest=$1 word='' char encoded_quote="'\\''"
+  [ -n "$rest" ] || return 1
+  case "$rest" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  while [ -n "$rest" ]; do
+    [ "${rest:0:1}" = "'" ] || return 1
+    rest=${rest:1}
+    word=
+    while :; do
+      [ -n "$rest" ] || return 1
+      if [ "${rest:0:${#encoded_quote}}" = "$encoded_quote" ]; then
+        word="$word'"
+        rest=${rest:${#encoded_quote}}
+      elif [ "${rest:0:1}" = "'" ]; then
+        rest=${rest:1}
+        break
+      else
+        char=${rest:0:1}
+        word=$word$char
+        rest=${rest:1}
+      fi
+    done
+    [ -n "$word" ] || return 1
+    [ -n "$rest" ] || return 0
+    [ "${rest:0:2}" = " '" ] || return 1
+    rest=${rest:1}
+  done
+  return 1
+}
 
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
@@ -893,6 +974,11 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ "$MODE_SET" -eq 0 ] || shared_args+=(--mode "$MODE")
   [ "$YOLO_SET" -eq 0 ] || shared_args+=(--yolo "$YOLO")
   [ "$NO_PROJECT_INSTRUCTIONS" -eq 0 ] || shared_args+=(--no-project-instructions)
+  # One word per flag on the way out too, so a wrapper word containing spaces
+  # survives the re-exec exactly as the caller supplied it.
+  for prefix_word in "${LAUNCH_PREFIX_WORDS[@]+"${LAUNCH_PREFIX_WORDS[@]}"}"; do
+    shared_args+=(--launch-prefix="$prefix_word")
+  done
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -1033,6 +1119,55 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   }
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
+  # A wrapped task stays wrapped. The record holds the exact text this script
+  # spliced last time, so the replacement agent is parented by the same wrapper
+  # even when the relaunch switches harness. Losing it silently would hand back
+  # an unconfined agent on the very path that exists to recover a confined one.
+  launch_prefix_record_count=0
+  launch_prefix_record_has_unframed_line=0
+  LAUNCH_PREFIX_LITERAL=
+  while IFS= read -r launch_prefix_record_line || [ -n "$launch_prefix_record_line" ]; do
+    case "$launch_prefix_record_line" in
+      *=*)
+        launch_prefix_record_key=${launch_prefix_record_line%%=*}
+        case "$launch_prefix_record_key" in
+          ''|*[!A-Za-z0-9_]*) launch_prefix_record_has_unframed_line=1 ;;
+        esac
+        ;;
+      *) launch_prefix_record_has_unframed_line=1 ;;
+    esac
+    case "$launch_prefix_record_line" in
+      launch_prefix=*)
+        launch_prefix_record_count=$((launch_prefix_record_count + 1))
+        LAUNCH_PREFIX_LITERAL=${launch_prefix_record_line#launch_prefix=}
+        ;;
+    esac
+  done < "$RELAUNCH_META"
+  case "$launch_prefix_record_count" in
+    0) ;;
+    1)
+      [ "$launch_prefix_record_has_unframed_line" -eq 0 ] || {
+        echo "error: task $ID's recorded launch prefix contains an unframed metadata continuation and cannot be reconstructed without truncation; refusing rather than relaunching with a partial wrapper" >&2
+        exit 1
+      }
+      case "$LAUNCH_PREFIX_LITERAL" in
+        *$'\n'*|*$'\r'*)
+          echo "error: task $ID's recorded launch prefix contains a line break and cannot be typed as one launch line; refusing rather than relaunching unwrapped" >&2
+          exit 1
+          ;;
+      esac
+      launch_prefix_literal_is_canonical "$LAUNCH_PREFIX_LITERAL" || {
+        echo "error: task $ID's recorded launch prefix is not a nonempty canonical shell-quoted record; refusing rather than relaunching unwrapped" >&2
+        exit 1
+      }
+      LAUNCH_PREFIX_SET=1
+      LAUNCH_PREFIX_ADOPTED=1
+      ;;
+    *)
+      echo "error: task $ID's recorded launch prefix must be exactly one launch_prefix= line when present; found $launch_prefix_record_count lines, so refusing rather than relaunching unwrapped" >&2
+      exit 1
+      ;;
+  esac
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
@@ -1136,17 +1271,17 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __NOPROJFLAG____MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __LAUNCHPREFIX__claude --dangerously-skip-permissions __NOPROJFLAG____MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' '__LAUNCHPREFIX__codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' '__LAUNCHPREFIX__codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
-    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' __LAUNCHPREFIX__opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     pi|pi-signed)
-      printf '%s' '__PIBIN____PITUIMODE__'
+      printf '%s' '__LAUNCHPREFIX____PIBIN____PITUIMODE__'
       if [ "$kind" = secondmate ]; then
         printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
@@ -1160,7 +1295,7 @@ launch_template() {
     # --dangerously-skip-permissions. grok's turn-end signal does NOT ride the
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
-    grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    grok) printf '%s' '__LAUNCHPREFIX__grok --always-approve __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     # Cursor Agent CLI. --trust suppresses the workspace-trust prompt, which
     # --yolo does NOT cover and which would otherwise block every spawn, since
     # each task gets a fresh worktree path cursor has never seen. --yolo is the
@@ -1173,12 +1308,12 @@ launch_template() {
     # inherited CLAUDECODE cannot outrank cursor's own marker in a process that
     # only reads the environment. Cursor exposes no effort flag, so the shared
     # effort axis is deliberately omitted and stays in task metadata only.
-    cursor) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS -u CURSOR_INVOKED_AS __CURSORBIN__ --trust --yolo __MODELFLAG__--workspace __WORKTREE__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    cursor) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS -u CURSOR_INVOKED_AS __LAUNCHPREFIX____CURSORBIN__ --trust --yolo __MODELFLAG__--workspace __WORKTREE__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     # Kimi Code rejects a positional prompt, so it launches bare and receives
     # only an absolute brief pointer after the TUI readiness gate below.
     # Its turn-end signal is a globally configured Stop hook plus a guarded
     # per-task worktree token, so no launch placeholder belongs here.
-    kimi) printf '%s' '__KIMIBIN__ __MODELFLAG__--auto' ;;
+    kimi) printf '%s' '__LAUNCHPREFIX____KIMIBIN__ __MODELFLAG__--auto' ;;
     # muse (Muse Code): a positional prompt starts the supervised interactive
     # session. --yolo is the single flag that makes a crewmate pane viable: muse
     # ships approval prompts AND a filesystem/network sandbox ON by default
@@ -1200,7 +1335,7 @@ launch_template() {
     # session event log instead (bin/fm-busy-lib.sh), bound by the sidecar
     # written below. Nothing to place in the template for it.
     # codex, opencode, and kimi are also markerless and share this inherited-marker hazard; changing their verified launch boundaries belongs in follow-up work.
-    muse) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS XDG_CONFIG_HOME=__MUSECONFIG__ XDG_DATA_HOME=__MUSEDATA__ MUSE_EXPERIMENTAL_FOREIGN_PERSONAL_CONTEXT_KILL=on __MUSEBIN__ --yolo __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    muse) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS XDG_CONFIG_HOME=__MUSECONFIG__ XDG_DATA_HOME=__MUSEDATA__ MUSE_EXPERIMENTAL_FOREIGN_PERSONAL_CONTEXT_KILL=on __LAUNCHPREFIX____MUSEBIN__ --yolo __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     *) return 1 ;;
   esac
 }
@@ -1329,6 +1464,103 @@ if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
       exit 1
       ;;
   esac
+fi
+
+# --launch-prefix resolves HERE for the same reason --no-project-instructions does:
+# every refusal below happens before this spawn creates a worktree, endpoint, or global
+# harness hook, so a rejected wrapper leaves nothing behind. The caller owns what the
+# wrapper does; this script only guarantees that a requested wrapper is either applied
+# exactly or refused loudly. docs/launch-prefix.md owns the seam contract.
+if [ "$LAUNCH_PREFIX_SET" -eq 1 ]; then
+  if [ "$KIND" = secondmate ]; then
+    echo "error: --launch-prefix applies to crewmate and scout spawns only; a secondmate is a firstmate instance that spawns its own workers, so wrap those launches in that home instead" >&2
+    exit 1
+  fi
+  if [ "$RAW_LAUNCH" -eq 1 ]; then
+    echo "error: --launch-prefix cannot be applied to a raw launch command; firstmate did not compose it and so cannot tell where its command word begins, and inserting the wrapper anywhere else would change what the command means" >&2
+    exit 1
+  fi
+  # The splice point must exist in THIS launch. Checking the composed string rather
+  # than assuming the marker survived keeps a future template or harness path from
+  # silently dropping a requested wrapper.
+  case "$LAUNCH" in
+    *__LAUNCHPREFIX__*)
+      launch_prefix_template_tail=${LAUNCH#*__LAUNCHPREFIX__}
+      case "$launch_prefix_template_tail" in
+        *__LAUNCHPREFIX__*)
+          echo "error: the composed launch still carries an extra __LAUNCHPREFIX__ splice point; refusing to type it" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      echo "error: the launch for harness '$HARNESS' has no __LAUNCHPREFIX__ splice point, so --launch-prefix could not be applied" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$LAUNCH_PREFIX_ADOPTED" -eq 0 ]; then
+    launch_prefix_quoted=
+    launch_prefix_index=0
+    for prefix_word in "${LAUNCH_PREFIX_WORDS[@]}"; do
+      launch_prefix_index=$((launch_prefix_index + 1))
+      [ -n "$prefix_word" ] || {
+        echo "error: --launch-prefix word $launch_prefix_index is empty; every occurrence must supply one argv word" >&2
+        exit 1
+      }
+      case "$prefix_word" in
+        *$'\n'*|*$'\r'*)
+          echo "error: --launch-prefix word $launch_prefix_index contains a line break; the launch is typed into the worker's shell as a single line, so a break would run part of it early" >&2
+          exit 1
+          ;;
+      esac
+      if [ "$launch_prefix_index" -eq 1 ]; then
+        # The first word becomes the command word of the composed launch, so the two
+        # shapes that would silently mean something else are refused rather than
+        # spliced: an assignment (which would extend the environment instead of
+        # parenting the agent) and an option (which would be read by whatever ran
+        # before it).
+        case "$prefix_word" in
+          [A-Za-z_]*=*)
+            echo "error: --launch-prefix must start with a command, not the environment assignment '$prefix_word'; a wrapper has to be the process that starts the agent" >&2
+            exit 1
+            ;;
+          -*)
+            echo "error: --launch-prefix must start with a command, not the option '$prefix_word'; pass the wrapper first and its flags as further --launch-prefix words" >&2
+            exit 1
+            ;;
+        esac
+        case "$prefix_word" in
+          /*)
+            { [ -f "$prefix_word" ] && [ -x "$prefix_word" ]; } || {
+              echo "error: --launch-prefix command '$prefix_word' is not an executable file; refusing rather than typing a launch that would fail in the worker's shell" >&2
+              exit 1
+            }
+            ;;
+          */*)
+            # The launch is typed in the worker's own worktree, not here, so a
+            # relative path would name a different file there - or nothing.
+            echo "error: --launch-prefix command '$prefix_word' is a relative path; the launch runs in the worker's worktree, so give an absolute path or a PATH command name" >&2
+            exit 1
+            ;;
+          *)
+            type -P -- "$prefix_word" >/dev/null 2>&1 || {
+              echo "error: --launch-prefix command '$prefix_word' was not found on PATH; give an absolute path or install it, rather than typing a launch that would fail in the worker's shell" >&2
+              exit 1
+            }
+            ;;
+        esac
+      fi
+      if [ -n "$launch_prefix_quoted" ]; then
+        launch_prefix_quoted="$launch_prefix_quoted $(shell_quote "$prefix_word")"
+      else
+        launch_prefix_quoted=$(shell_quote "$prefix_word")
+      fi
+    done
+    LAUNCH_PREFIX_LITERAL=$launch_prefix_quoted
+  fi
+  # Every word is single-quoted, so the wrapper can never contribute shell syntax to
+  # the composed line - it contributes argv words and nothing else.
+  LAUNCH_PREFIX_SPLICE="$LAUNCH_PREFIX_LITERAL "
 fi
 
 case "$HARNESS" in
@@ -1542,16 +1774,12 @@ case "$LAUNCH" in
       fi
       exit 1
     fi
-    LAUNCH=${LAUNCH//__MUSEBIN__/$(shell_quote "$MUSE_BIN")}
-    LAUNCH=${LAUNCH//__MUSECONFIG__/$(shell_quote "$MUSE_CONFIG_HOME")}
-    LAUNCH=${LAUNCH//__MUSEDATA__/$(shell_quote "$MUSE_DATA_HOME")}
     ;;
 esac
 
 case "$LAUNCH" in
   *__KIMIBIN__*)
     KIMI_BIN=$(resolve_kimi_binary) || exit 1
-    LAUNCH=${LAUNCH//__KIMIBIN__/$(shell_quote "$KIMI_BIN")}
     if [ "$KIND" != secondmate ]; then
       "$FM_ROOT/bin/fm-kimi-turnend-hook.sh" install || {
         echo "error: refusing Kimi spawn because the global turn-end hook could not be installed safely" >&2
@@ -2748,7 +2976,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort launch_prefix busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2769,6 +2997,10 @@ preserve_relaunch_meta() {
   # Written only when discovery is off, so an ordinary spawn's meta is unchanged;
   # an absent project_instructions= line means the worker loads them normally.
   [ "$NO_PROJECT_INSTRUCTIONS" -eq 0 ] || echo "project_instructions=off"
+  # The exact text spliced into the launch, so a relaunch re-applies the wrapper
+  # rather than re-deriving it. Written only for a wrapped launch, so an ordinary
+  # spawn's meta is unchanged; an absent launch_prefix= line means an unwrapped one.
+  [ -z "$LAUNCH_PREFIX_LITERAL" ] || echo "launch_prefix=$LAUNCH_PREFIX_LITERAL"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
@@ -2833,20 +3065,52 @@ sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
-LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
-LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
-LAUNCH=${LAUNCH//__NOPROJFLAG__/$NOPROJFLAG}
-LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
-LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
-LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
-LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
-LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
-LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
-case "$HARNESS" in
-  pi|pi-signed) LAUNCH=${LAUNCH//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
-  cursor) LAUNCH=${LAUNCH//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
-esac
-LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
+render_launch_template_segment() {
+  local rendered=$1
+  rendered=${rendered//__MODELFLAG__/$MODELFLAG}
+  rendered=${rendered//__EFFORTFLAG__/$EFFORTFLAG}
+  rendered=${rendered//__NOPROJFLAG__/$NOPROJFLAG}
+  rendered=${rendered//__BRIEF__/$sq_brief}
+  rendered=${rendered//__TURNEND__/$sq_turnend}
+  rendered=${rendered//__PIEXT__/$sq_piext}
+  rendered=${rendered//__PITURNEND__/$sq_piturnend}
+  rendered=${rendered//__PIWATCH__/$sq_piwatch}
+  rendered=${rendered//__OPINPUT__/$sq_opinput}
+  rendered=${rendered//__WORKTREE__/$sq_worktree}
+  case "$HARNESS" in
+    pi|pi-signed) rendered=${rendered//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
+    cursor) rendered=${rendered//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
+    kimi) rendered=${rendered//__KIMIBIN__/"$(shell_quote "$KIMI_BIN")"} ;;
+    muse)
+      rendered=${rendered//__MUSEBIN__/"$(shell_quote "$MUSE_BIN")"}
+      rendered=${rendered//__MUSECONFIG__/"$(shell_quote "$MUSE_CONFIG_HOME")"}
+      rendered=${rendered//__MUSEDATA__/"$(shell_quote "$MUSE_DATA_HOME")"}
+      ;;
+  esac
+  printf '%s' "$rendered"
+}
+if [ "$RAW_LAUNCH" -eq 0 ]; then
+  case "$LAUNCH" in
+    *__LAUNCHPREFIX__*)
+      launch_prefix_template_head=${LAUNCH%%__LAUNCHPREFIX__*}
+      launch_prefix_template_tail=${LAUNCH#*__LAUNCHPREFIX__}
+      case "$launch_prefix_template_tail" in
+        *__LAUNCHPREFIX__*)
+          echo "error: the composed launch still carries an extra __LAUNCHPREFIX__ splice point; refusing to type it" >&2
+          exit 1
+          ;;
+      esac
+      LAUNCH="$(render_launch_template_segment "$launch_prefix_template_head")$LAUNCH_PREFIX_SPLICE$(render_launch_template_segment "$launch_prefix_template_tail")"
+      ;;
+    *)
+      [ "$LAUNCH_PREFIX_SET" -eq 0 ] || {
+        echo "error: the composed launch for task $ID lost its __LAUNCHPREFIX__ splice point; refusing to start an unwrapped agent" >&2
+        exit 1
+      }
+      LAUNCH=$(render_launch_template_segment "$LAUNCH")
+      ;;
+  esac
+fi
 case "$HARNESS" in
   claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS $LAUNCH"
@@ -2883,6 +3147,16 @@ if [ "$KIND" = secondmate ]; then
 fi
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
   LAUNCH="unset TRACEPARENT; $LAUNCH"
+fi
+if [ -n "$LAUNCH_PREFIX_LITERAL" ]; then
+  case "$LAUNCH" in
+    *"$LAUNCH_PREFIX_LITERAL"*) ;;
+    *)
+      echo "error: the composed launch for task $ID lost its launch prefix; refusing to start an unwrapped agent" >&2
+      exit 1
+      ;;
+  esac
+  echo "launch prefix in effect for $ID: $LAUNCH_PREFIX_LITERAL" >&2
 fi
 
 spawn_record_traceparent() {

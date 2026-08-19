@@ -54,8 +54,10 @@ run_lock() {
 run_lock_as_harness() {
   local home=$1
   shift
+  # The trailing no-op keeps the harness process alive as a real ancestor instead
+  # of allowing Bash to replace it with the lock script as its final command.
   # shellcheck disable=SC2016 # single quotes are deliberate: the harness child expands these itself
-  FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" "$@"' "$LOCK_SH" "$@" 2>&1
+  FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" "$@"; status=$?; :; exit "$status"' "$LOCK_SH" "$@" 2>&1
 }
 
 make_lstart_unreadable_ps() {
