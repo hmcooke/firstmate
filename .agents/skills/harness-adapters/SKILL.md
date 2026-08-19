@@ -165,7 +165,7 @@ For Cursor, select the intended reasoning class through a model id the account's
 
 Use `bin/fm-spawn.sh --no-project-instructions` when a worker will stand in a clone whose contents are not trusted.
 It prevents that clone's instruction files, skills, agents, hooks, and MCP definitions from becoming live configuration while preserving the worker's brief, the operator's user-level configuration, and firstmate's supervision hooks.
-It is per-spawn and additive, so every spawn without it keeps full discovery unchanged.
+For a fresh spawn it is additive, so omitting it keeps full discovery unchanged.
 
 | Harness | Status |
 |---|---|

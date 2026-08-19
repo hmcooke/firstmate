@@ -135,8 +135,8 @@
 #   normally (the brief rides the launch prompt, not a discovered file) and keeps the
 #   operator's own user-level configuration, so a user-level skill such as no-mistakes
 #   stays available. Firstmate's own per-task supervision hooks keep working too, so a
-#   locked-down worker is still watched normally. Default behavior is unchanged:
-#   without the flag every spawn keeps full discovery. The flag is per-spawn and FAILS
+#   locked-down worker is still watched normally. Default fresh-spawn behavior is
+#   unchanged: without the flag every fresh spawn keeps full discovery. The flag FAILS
 #   CLOSED - a harness with no empirically verified disable mechanism, a raw launch
 #   command, or --secondmate is refused before any worker endpoint exists, never
 #   launched unprotected. The supported harnesses are the allowlist in this script's
