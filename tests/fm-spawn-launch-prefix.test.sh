@@ -203,6 +203,23 @@ test_prefix_word_keeps_its_spaces() {
   pass "each --launch-prefix occurrence contributes exactly one argv word"
 }
 
+test_prefix_word_preserves_the_splice_literal() {
+  local rec id out status launch
+  id=lp-literal-a3
+  rec=$(make_case literal-prefix claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --launch-prefix fmwrap --launch-prefix __LAUNCHPREFIX__)
+  status=$?
+  expect_code 0 "$status" "a wrapper argument matching the splice literal should succeed"$'\n'"$out"
+
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "'fmwrap' '__LAUNCHPREFIX__' claude" \
+    "a caller-owned wrapper argument was mistaken for the template splice point"
+  pass "a wrapper argument matching the splice literal stays unchanged"
+}
+
 # The seam's actual promise is about processes, not text: run the composed line and
 # prove the harness executed inside the wrapper, with its argv intact.
 test_wrapped_launch_really_parents_the_agent() {
@@ -261,6 +278,23 @@ test_default_spawn_is_unchanged() {
   assert_no_grep '__LAUNCHPREFIX__' "$HOME_DIR/state/$id.meta" \
     "the splice point leaked into task metadata"
   pass "a spawn with no prefix keeps the unchanged launch command and meta"
+}
+
+test_raw_launch_preserves_the_splice_literal_without_a_prefix() {
+  local rec id out status launch expected
+  id=lp-raw-literal-b2
+  rec=$(make_case raw-literal claude "$id")
+  read_case_record "$rec"
+  expected='custom-agent --tag=__LAUNCHPREFIX__'
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" "$expected")
+  status=$?
+  expect_code 0 "$status" "a raw no-prefix launch should pass through unchanged"$'\n'"$out"
+
+  launch=$(cat "$LAUNCH_LOG")
+  [ "$launch" = "$expected" ] || fail "the raw launch was rewritten"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  pass "a raw no-prefix launch keeps a literal splice token unchanged"
 }
 
 # The splice point must never survive into a typed command, on any harness, wrapped or
@@ -444,6 +478,28 @@ test_secondmate_refuses() {
   pass "--secondmate refuses a launch prefix instead of confining the supervisor"
 }
 
+test_registered_remote_secondmate_refuses() {
+  local rec id out status
+  id=lp-remote-secondmate-d9
+  rec=$(make_case remote-secondmate claude "$id")
+  read_case_record "$rec"
+  printf '%s\n' "- $id - remote launch fixture (host: remote-mac; root: $CASE_DIR/remote-root; home: $CASE_DIR/remote-home; scope: remote launch testing; projects: none; added 2026-08-19)" \
+    > "$HOME_DIR/data/secondmates.md"
+  fm_fake_exit0 "$FAKEBIN_DIR" ssh
+
+  out=$(FM_SSH_BIN="$FAKEBIN_DIR/ssh" run_spawn \
+    "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" --secondmate --launch-prefix fmwrap)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a registered remote secondmate should refuse --launch-prefix"$'\n'"$out"
+  assert_contains "$out" "crewmate and scout spawns only" \
+    "the remote route bypassed the launch-prefix refusal"
+  assert_not_contains "$out" "spawned $id" "a refused remote secondmate reported success"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "a refused remote secondmate wrote task metadata"
+  pass "a registered remote secondmate refuses before remote routing"
+}
+
 # A raw launch command is the unverified-adapter escape hatch: firstmate did not
 # compose it, so it cannot know where the wrapper would have to go.
 test_raw_launch_command_refuses() {
@@ -549,7 +605,7 @@ test_relaunch_refuses_an_explicit_prefix() {
 test_relaunch_refuses_a_corrupt_recorded_prefix() {
   local id out status
   id=lp-relaunch-e4
-  relaunch_case relaunch-corrupt "$id" "launch_prefix='fmwrap'"
+  relaunch_case relaunch-corrupt "$id"
   # A record whose value carries a bare carriage return: still one meta line, but not
   # one shell line.
   printf "launch_prefix='fmwrap'\r' '-f'\n" >> "$HOME_DIR/state/$id.meta"
@@ -563,18 +619,52 @@ test_relaunch_refuses_a_corrupt_recorded_prefix() {
   pass "a recorded prefix that cannot be typed refuses rather than relaunching unwrapped"
 }
 
+test_relaunch_refuses_a_duplicate_empty_record() {
+  local id out status
+  id=lp-relaunch-e5
+  relaunch_case relaunch-duplicate "$id" "launch_prefix='fmwrap'"
+  printf 'launch_prefix=\n' >> "$HOME_DIR/state/$id.meta"
+
+  out=$(run_relaunch "$id" --relaunch)
+  status=$?
+  [ "$status" -ne 0 ] || fail "duplicate recorded prefixes should refuse the relaunch"$'\n'"$out"
+  assert_contains "$out" "must be exactly one launch_prefix= line" \
+    "the refusal did not name the duplicate record"
+  [ ! -s "$LAUNCH_LOG" ] || fail "a duplicate empty record still launched an agent"
+  pass "a duplicate empty prefix record cannot clear wrapping on relaunch"
+}
+
+test_relaunch_refuses_a_noncanonical_record() {
+  local id out status
+  id=lp-relaunch-e6
+  relaunch_case relaunch-noncanonical "$id" 'launch_prefix=true;'
+
+  out=$(run_relaunch "$id" --relaunch)
+  status=$?
+  [ "$status" -ne 0 ] || fail "an unquoted recorded prefix should refuse the relaunch"$'\n'"$out"
+  assert_contains "$out" "not a nonempty canonical shell-quoted record" \
+    "the refusal did not name the noncanonical record"
+  [ ! -s "$LAUNCH_LOG" ] || fail "a noncanonical record still launched an agent"
+  pass "a noncanonical prefix record cannot inject a separate relaunch command"
+}
+
 test_prefix_wraps_the_composed_launch
 test_prefix_word_keeps_its_spaces
+test_prefix_word_preserves_the_splice_literal
 test_wrapped_launch_really_parents_the_agent
 test_default_spawn_is_unchanged
+test_raw_launch_preserves_the_splice_literal_without_a_prefix
 test_no_harness_leaks_the_splice_point
 test_every_composable_harness_splices_at_the_command_word
 test_scout_composes_with_lockdown_and_a_service_owned_home
 test_batch_forwards_the_prefix
 test_unusable_prefixes_refuse_before_spawning
 test_secondmate_refuses
+test_registered_remote_secondmate_refuses
 test_raw_launch_command_refuses
 test_relaunch_reapplies_the_recorded_prefix
 test_relaunch_without_a_recorded_prefix_is_unchanged
 test_relaunch_refuses_an_explicit_prefix
 test_relaunch_refuses_a_corrupt_recorded_prefix
+test_relaunch_refuses_a_duplicate_empty_record
+test_relaunch_refuses_a_noncanonical_record

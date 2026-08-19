@@ -161,10 +161,11 @@
 #   leading word that is an environment assignment or starts with -, a leading word
 #   that resolves to no executable, --secondmate, a raw launch command, or a launch
 #   template with nowhere to splice is refused before any worker endpoint exists, and
-#   the prefix is never silently dropped. Recorded in meta as the exact spliced text
-#   in launch_prefix=; an absent line means an unwrapped launch. --relaunch re-applies
-#   that recorded prefix so a replacement agent cannot come back unwrapped, and
-#   refuses an explicit --launch-prefix like every other axis it takes from the record.
+#   the prefix is never silently dropped. Recorded in meta as one nonempty canonical
+#   shell-quoted launch_prefix= line; an absent line means an unwrapped launch.
+#   --relaunch re-applies that recorded prefix so a replacement agent cannot come back
+#   unwrapped, refuses a malformed or duplicate record, and refuses an explicit
+#   --launch-prefix like every other axis it takes from the record.
 #   A wrapper removed from the machine between spawn and relaunch fails in the pane
 #   rather than launching an unwrapped agent.
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
@@ -461,6 +462,43 @@ else
     }
   fi
 fi
+
+if [ "$LAUNCH_PREFIX_SET" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  echo "error: --launch-prefix applies to crewmate and scout spawns only; a secondmate is a firstmate instance that spawns its own workers, so wrap those launches in that home instead" >&2
+  exit 1
+fi
+
+launch_prefix_literal_is_canonical() {
+  local rest=$1 word= char encoded_quote="'\\''"
+  [ -n "$rest" ] || return 1
+  case "$rest" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  while [ -n "$rest" ]; do
+    [ "${rest:0:1}" = "'" ] || return 1
+    rest=${rest:1}
+    word=
+    while :; do
+      [ -n "$rest" ] || return 1
+      if [ "${rest:0:${#encoded_quote}}" = "$encoded_quote" ]; then
+        word="$word'"
+        rest=${rest:${#encoded_quote}}
+      elif [ "${rest:0:1}" = "'" ]; then
+        rest=${rest:1}
+        break
+      else
+        char=${rest:0:1}
+        word=$word$char
+        rest=${rest:1}
+      fi
+    done
+    [ -n "$word" ] || return 1
+    [ -n "$rest" ] || return 0
+    [ "${rest:0:2}" = " '" ] || return 1
+    rest=${rest:1}
+  done
+  return 1
+}
 
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
@@ -1084,11 +1122,37 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # spliced last time, so the replacement agent is parented by the same wrapper
   # even when the relaunch switches harness. Losing it silently would hand back
   # an unconfined agent on the very path that exists to recover a confined one.
-  LAUNCH_PREFIX_LITERAL=$(fm_meta_get "$RELAUNCH_META" launch_prefix)
-  if [ -n "$LAUNCH_PREFIX_LITERAL" ]; then
-    LAUNCH_PREFIX_SET=1
-    LAUNCH_PREFIX_ADOPTED=1
-  fi
+  launch_prefix_record_count=0
+  LAUNCH_PREFIX_LITERAL=
+  while IFS= read -r launch_prefix_record_line || [ -n "$launch_prefix_record_line" ]; do
+    case "$launch_prefix_record_line" in
+      launch_prefix=*)
+        launch_prefix_record_count=$((launch_prefix_record_count + 1))
+        LAUNCH_PREFIX_LITERAL=${launch_prefix_record_line#launch_prefix=}
+        ;;
+    esac
+  done < "$RELAUNCH_META"
+  case "$launch_prefix_record_count" in
+    0) ;;
+    1)
+      case "$LAUNCH_PREFIX_LITERAL" in
+        *$'\n'*|*$'\r'*)
+          echo "error: task $ID's recorded launch prefix contains a line break and cannot be typed as one launch line; refusing rather than relaunching unwrapped" >&2
+          exit 1
+          ;;
+      esac
+      launch_prefix_literal_is_canonical "$LAUNCH_PREFIX_LITERAL" || {
+        echo "error: task $ID's recorded launch prefix is not a nonempty canonical shell-quoted record; refusing rather than relaunching unwrapped" >&2
+        exit 1
+      }
+      LAUNCH_PREFIX_SET=1
+      LAUNCH_PREFIX_ADOPTED=1
+      ;;
+    *)
+      echo "error: task $ID's recorded launch prefix must be exactly one launch_prefix= line when present; found $launch_prefix_record_count lines, so refusing rather than relaunching unwrapped" >&2
+      exit 1
+      ;;
+  esac
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
@@ -1405,23 +1469,21 @@ if [ "$LAUNCH_PREFIX_SET" -eq 1 ]; then
   # than assuming the marker survived keeps a future template or harness path from
   # silently dropping a requested wrapper.
   case "$LAUNCH" in
-    *__LAUNCHPREFIX__*) ;;
+    *__LAUNCHPREFIX__*)
+      launch_prefix_template_tail=${LAUNCH#*__LAUNCHPREFIX__}
+      case "$launch_prefix_template_tail" in
+        *__LAUNCHPREFIX__*)
+          echo "error: the composed launch still carries an extra __LAUNCHPREFIX__ splice point; refusing to type it" >&2
+          exit 1
+          ;;
+      esac
+      ;;
     *)
       echo "error: the launch for harness '$HARNESS' has no __LAUNCHPREFIX__ splice point, so --launch-prefix could not be applied" >&2
       exit 1
       ;;
   esac
-  if [ "$LAUNCH_PREFIX_ADOPTED" -eq 1 ]; then
-    # Adopted from the task's own record, which this script wrote from validated words.
-    # Re-check only what a corrupted or hand-edited record could still break: the pane
-    # transport types one line, so an embedded newline would submit it early.
-    case "$LAUNCH_PREFIX_LITERAL" in
-      *$'\n'*|*$'\r'*)
-        echo "error: task $ID's recorded launch prefix contains a line break and cannot be typed as one launch line; refusing rather than relaunching unwrapped" >&2
-        exit 1
-        ;;
-    esac
-  else
+  if [ "$LAUNCH_PREFIX_ADOPTED" -eq 0 ]; then
     launch_prefix_quoted=
     launch_prefix_index=0
     for prefix_word in "${LAUNCH_PREFIX_WORDS[@]}"; do
@@ -1697,16 +1759,12 @@ case "$LAUNCH" in
       fi
       exit 1
     fi
-    LAUNCH=${LAUNCH//__MUSEBIN__/$(shell_quote "$MUSE_BIN")}
-    LAUNCH=${LAUNCH//__MUSECONFIG__/$(shell_quote "$MUSE_CONFIG_HOME")}
-    LAUNCH=${LAUNCH//__MUSEDATA__/$(shell_quote "$MUSE_DATA_HOME")}
     ;;
 esac
 
 case "$LAUNCH" in
   *__KIMIBIN__*)
     KIMI_BIN=$(resolve_kimi_binary) || exit 1
-    LAUNCH=${LAUNCH//__KIMIBIN__/$(shell_quote "$KIMI_BIN")}
     if [ "$KIND" != secondmate ]; then
       "$FM_ROOT/bin/fm-kimi-turnend-hook.sh" install || {
         echo "error: refusing Kimi spawn because the global turn-end hook could not be installed safely" >&2
@@ -2992,24 +3050,54 @@ sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
-LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
-LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
-LAUNCH=${LAUNCH//__NOPROJFLAG__/$NOPROJFLAG}
-LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
-LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
-LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
-LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
-LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
-LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
-case "$HARNESS" in
-  pi|pi-signed) LAUNCH=${LAUNCH//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
-  cursor) LAUNCH=${LAUNCH//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
-esac
-LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
-# Deliberately the LAST placeholder substituted: the caller's wrapper words are opaque
-# to this script, so nothing it injects may itself be rewritten by a later placeholder
-# pass. Empty on an unwrapped spawn, which is what leaves that launch byte-identical.
-LAUNCH=${LAUNCH//__LAUNCHPREFIX__/$LAUNCH_PREFIX_SPLICE}
+render_launch_template_segment() {
+  local rendered=$1
+  rendered=${rendered//__MODELFLAG__/$MODELFLAG}
+  rendered=${rendered//__EFFORTFLAG__/$EFFORTFLAG}
+  rendered=${rendered//__NOPROJFLAG__/$NOPROJFLAG}
+  rendered=${rendered//__BRIEF__/$sq_brief}
+  rendered=${rendered//__TURNEND__/$sq_turnend}
+  rendered=${rendered//__PIEXT__/$sq_piext}
+  rendered=${rendered//__PITURNEND__/$sq_piturnend}
+  rendered=${rendered//__PIWATCH__/$sq_piwatch}
+  rendered=${rendered//__OPINPUT__/$sq_opinput}
+  rendered=${rendered//__WORKTREE__/$sq_worktree}
+  case "$HARNESS" in
+    pi|pi-signed) rendered=${rendered//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;
+    cursor) rendered=${rendered//__CURSORBIN__/"$(shell_quote "$CURSOR_BIN")"} ;;
+    kimi) rendered=${rendered//__KIMIBIN__/"$(shell_quote "$KIMI_BIN")"} ;;
+    muse)
+      rendered=${rendered//__MUSEBIN__/"$(shell_quote "$MUSE_BIN")"}
+      rendered=${rendered//__MUSECONFIG__/"$(shell_quote "$MUSE_CONFIG_HOME")"}
+      rendered=${rendered//__MUSEDATA__/"$(shell_quote "$MUSE_DATA_HOME")"}
+      ;;
+  esac
+  printf '%s' "$rendered"
+}
+if [ "$RAW_LAUNCH" -eq 1 ]; then
+  LAUNCH=$(render_launch_template_segment "$LAUNCH")
+else
+  case "$LAUNCH" in
+    *__LAUNCHPREFIX__*)
+      launch_prefix_template_head=${LAUNCH%%__LAUNCHPREFIX__*}
+      launch_prefix_template_tail=${LAUNCH#*__LAUNCHPREFIX__}
+      case "$launch_prefix_template_tail" in
+        *__LAUNCHPREFIX__*)
+          echo "error: the composed launch still carries an extra __LAUNCHPREFIX__ splice point; refusing to type it" >&2
+          exit 1
+          ;;
+      esac
+      LAUNCH="$(render_launch_template_segment "$launch_prefix_template_head")$LAUNCH_PREFIX_SPLICE$(render_launch_template_segment "$launch_prefix_template_tail")"
+      ;;
+    *)
+      [ "$LAUNCH_PREFIX_SET" -eq 0 ] || {
+        echo "error: the composed launch for task $ID lost its __LAUNCHPREFIX__ splice point; refusing to start an unwrapped agent" >&2
+        exit 1
+      }
+      LAUNCH=$(render_launch_template_segment "$LAUNCH")
+      ;;
+  esac
+fi
 case "$HARNESS" in
   claude|codex|opencode|pi|pi-signed|grok|kimi|muse)
     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS $LAUNCH"
@@ -3047,15 +3135,6 @@ fi
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
   LAUNCH="unset TRACEPARENT; $LAUNCH"
 fi
-# A surviving splice point would be typed into the worker's shell as a literal word,
-# and a requested wrapper would not be there. Neither is recoverable once the line is
-# sent, so both are caught while refusing still costs nothing.
-case "$LAUNCH" in
-  *__LAUNCHPREFIX__*)
-    echo "error: the composed launch still carries its __LAUNCHPREFIX__ splice point; refusing to type it" >&2
-    exit 1
-    ;;
-esac
 if [ -n "$LAUNCH_PREFIX_LITERAL" ]; then
   case "$LAUNCH" in
     *"$LAUNCH_PREFIX_LITERAL"*) ;;

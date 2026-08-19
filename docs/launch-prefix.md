@@ -30,13 +30,14 @@ An ambient variable is inherited by every child process, so it would apply invis
 Confinement has to be an auditable property of one exact launch, which is what a per-spawn flag makes it.
 
 Every word is shell-quoted into the launch line, so a wrapper contributes argv words and never shell syntax.
-The exact spliced text is recorded in the task's durable record as `launch_prefix=`; an absent line means an unwrapped launch.
+The exact spliced text is recorded in the task's durable record as exactly one nonempty canonical shell-quoted `launch_prefix=` line; an absent line means an unwrapped launch.
 [`bin/fm-spawn.sh`](../bin/fm-spawn.sh)'s header and `--help` own the flag's exact mechanics.
 
 ## What the seam guarantees
 
 The wrapper is applied exactly, or the spawn refuses before it creates a worktree, an endpoint, or task metadata.
 It is never silently dropped, and it is never partially applied.
+Without the flag, a raw launch command remains caller-owned opaque text, including text that happens to equal the template splice token.
 
 Refusal covers every shape that could not be honored exactly:
 
@@ -49,7 +50,8 @@ Refusal covers every shape that could not be honored exactly:
 - A launch template with no splice point, which is what makes a new template unable to carry a wrapper a refusal rather than a silent omission.
 
 A relaunch ([`bin/fm-control.sh`](../bin/fm-control.sh) `relaunch`) re-applies the recorded prefix rather than re-deriving it, so a replacement agent cannot come back unwrapped - the failure that would matter most, since that path exists to recover a confined worker.
-Like every other axis a relaunch takes from the task's own record, an explicit `--launch-prefix` is refused alongside it, and a record that could not be typed as one launch line refuses the relaunch instead of running it unwrapped.
+Like every other axis a relaunch takes from the task's own record, an explicit `--launch-prefix` is refused alongside it.
+A wrapped relaunch requires exactly one nonempty canonical shell-quoted `launch_prefix=` line, so an empty, duplicate, noncanonical, or multiline record refuses the relaunch instead of running it unwrapped.
 A wrapper removed from the machine between spawn and relaunch fails in the pane, which supervision reads as a worker that never started; it never yields an unwrapped agent.
 
 ## What the caller still owns
