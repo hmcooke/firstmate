@@ -1182,15 +1182,23 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # resolution block below re-derives the harness's own flags from it, so a relaunch onto
   # a harness with no verified mechanism refuses there rather than landing unprotected.
   project_instructions_record_count=0
+  project_instructions_record_has_unframed_line=0
   project_instructions_record_value=
   while IFS= read -r project_instructions_record_line || [ -n "$project_instructions_record_line" ]; do
     case "$project_instructions_record_line" in
+      project_instructions)
+        project_instructions_record_has_unframed_line=1
+        ;;
       project_instructions=*)
         project_instructions_record_count=$((project_instructions_record_count + 1))
         project_instructions_record_value=${project_instructions_record_line#project_instructions=}
         ;;
     esac
   done < "$RELAUNCH_META"
+  [ "$project_instructions_record_has_unframed_line" -eq 0 ] || {
+    echo "error: task $ID's recorded project-instruction posture contains an unframed project_instructions metadata line and cannot be reconstructed; refusing rather than relaunching with the clone's instructions live" >&2
+    exit 1
+  }
   case "$project_instructions_record_count" in
     0) ;;
     1)

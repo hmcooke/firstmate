@@ -496,7 +496,7 @@ test_relaunch_refuses_an_explicit_flag() {
 # ambiguous record as "discovery on" would silently downgrade the guarantee on exactly the
 # path that exists to recover a protected worker.
 test_relaunch_refuses_a_corrupt_recorded_posture() {
-  local label recorded expect id out status n=0
+  local label recorded expect id out status before n=0
   local -a lines
   # Each row carries the posture line(s) the record holds, ';'-separated.
   while IFS='|' read -r label recorded expect; do
@@ -507,16 +507,20 @@ test_relaunch_refuses_a_corrupt_recorded_posture() {
 $recorded
 EOF
     relaunch_case "relaunch-corrupt$n" claude "$id" "${lines[@]}"
+    before=$(cat "$HOME_DIR/state/$id.meta")
 
     out=$(run_relaunch "$id" --relaunch)
     status=$?
     [ "$status" -ne 0 ] || fail "$label: a corrupt recorded posture should refuse the relaunch"$'\n'"$out"
     assert_contains "$out" "$expect" "$label: the refusal did not name the unusable record"
     [ ! -s "$LAUNCH_LOG" ] || fail "$label: a refused relaunch still typed a launch command"
+    [ "$(cat "$HOME_DIR/state/$id.meta")" = "$before" ] \
+      || fail "$label: a refused relaunch rewrote the corrupt task record"
   done <<'ROWS'
 an unknown value is not a posture firstmate wrote|project_instructions=on|off is the only recorded value
 an empty value cannot clear protection silently|project_instructions=|off is the only recorded value
 a truncated value is not a posture firstmate wrote|project_instructions=of|off is the only recorded value
+a bare key cannot clear protection silently|project_instructions|contains an unframed project_instructions metadata line
 a duplicate empty line cannot clear protection|project_instructions=off;project_instructions=|must be exactly one project_instructions= line
 even identical duplicates are ambiguous|project_instructions=off;project_instructions=off|must be exactly one project_instructions= line
 ROWS
