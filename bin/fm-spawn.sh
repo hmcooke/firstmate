@@ -144,6 +144,11 @@
 #   per-harness findings live in the harness-adapters skill and
 #   docs/verification/instruction-discovery.md. Recorded in meta as
 #   project_instructions=off; an absent line means instructions load normally.
+#   --relaunch re-applies that recorded posture so a replacement worker cannot come back
+#   with the clone's instructions live, refuses a record it cannot read as a posture
+#   (`off` is the only value written), and refuses an explicit --no-project-instructions
+#   like every other axis it takes from the record. A relaunch that also switches to a
+#   harness with no verified mechanism refuses rather than landing the task unprotected.
 #   The guarantee is structural: discovery is off, but a worker can still READ
 #   untrusted files as data with its ordinary tools, so brief it accordingly.
 #   --launch-prefix <word> interposes a caller-supplied wrapper command around the
@@ -427,6 +432,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$MODE_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded delivery mode; --mode cannot override it" >&2; exit 1; }
   [ "$YOLO_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded yolo posture; --yolo cannot override it" >&2; exit 1; }
   [ "$LAUNCH_PREFIX_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded launch prefix; --launch-prefix cannot override it" >&2; exit 1; }
+  [ "$NO_PROJECT_INSTRUCTIONS" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded project-instruction posture; --no-project-instructions cannot override it" >&2; exit 1; }
 else
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
@@ -1165,6 +1171,40 @@ if [ "$RELAUNCH" -eq 1 ]; then
       ;;
     *)
       echo "error: task $ID's recorded launch prefix must be exactly one launch_prefix= line when present; found $launch_prefix_record_count lines, so refusing rather than relaunching unwrapped" >&2
+      exit 1
+      ;;
+  esac
+  # A protected task stays protected. The record is the only thing that still knows this
+  # worker stands in a clone whose instruction surfaces must not become live
+  # configuration, and the replacement lands in that same clone - so losing the posture
+  # here would hand back full discovery on the very path that exists to recover a
+  # protected worker, while the record went on advertising it as protected. The
+  # resolution block below re-derives the harness's own flags from it, so a relaunch onto
+  # a harness with no verified mechanism refuses there rather than landing unprotected.
+  project_instructions_record_count=0
+  project_instructions_record_value=
+  while IFS= read -r project_instructions_record_line || [ -n "$project_instructions_record_line" ]; do
+    case "$project_instructions_record_line" in
+      project_instructions=*)
+        project_instructions_record_count=$((project_instructions_record_count + 1))
+        project_instructions_record_value=${project_instructions_record_line#project_instructions=}
+        ;;
+    esac
+  done < "$RELAUNCH_META"
+  case "$project_instructions_record_count" in
+    0) ;;
+    1)
+      # `off` is the only value this script ever writes, so any other one is a record it
+      # cannot read as a posture. Reading an unknown value as "discovery on" would turn a
+      # corrupt or truncated record into a silent downgrade, so it refuses instead.
+      [ "$project_instructions_record_value" = off ] || {
+        echo "error: task $ID's recorded project-instruction posture reads '$project_instructions_record_value'; off is the only recorded value, so refusing rather than relaunching with the clone's instructions live" >&2
+        exit 1
+      }
+      NO_PROJECT_INSTRUCTIONS=1
+      ;;
+    *)
+      echo "error: task $ID's recorded project-instruction posture must be exactly one project_instructions= line when present; found $project_instructions_record_count lines, so refusing rather than relaunching with the clone's instructions live" >&2
       exit 1
       ;;
   esac
@@ -2976,7 +3016,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort launch_prefix busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort project_instructions launch_prefix busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -3147,6 +3187,19 @@ if [ "$KIND" = secondmate ]; then
 fi
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
   LAUNCH="unset TRACEPARENT; $LAUNCH"
+fi
+# The composed line is what the worker actually runs, so the posture is asserted against
+# it rather than against the flags that were resolved for it. A launch that lost them
+# between resolution and typing would start a worker with the clone's instructions live
+# while its record advertised a protected one.
+if [ "$NO_PROJECT_INSTRUCTIONS" -eq 1 ]; then
+  case "$LAUNCH" in
+    *"$NOPROJFLAG"*) ;;
+    *)
+      echo "error: the composed launch for task $ID lost its project-instruction-disable flags; refusing to start a worker whose record advertises them" >&2
+      exit 1
+      ;;
+  esac
 fi
 if [ -n "$LAUNCH_PREFIX_LITERAL" ]; then
   case "$LAUNCH" in

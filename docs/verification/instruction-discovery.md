@@ -103,3 +103,5 @@ No mechanism has been established empirically for these adapters, so the flag re
 ## Regression coverage
 
 `tests/fm-spawn-no-project-instructions.test.sh` pins the behavior that depends on these findings: the verified claude flags reach the typed launch command, an ordinary spawn is unchanged, the posture is recorded in task metadata, and every unsupported route refuses before a worker endpoint or task metadata exists.
+It also pins the relaunch path, where a lost posture would be worst: the replacement worker carries the recorded harness's disable flags again, an unreadable or duplicated posture record refuses, an explicit flag is refused because the record owns that axis, a relaunch onto a harness with no verified mechanism refuses, and a task with no recorded posture relaunches unchanged.
+That table has one row per supported harness, so extending the allowlist above fails there until the new harness's own form survives a relaunch.
