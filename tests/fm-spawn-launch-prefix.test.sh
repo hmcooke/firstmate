@@ -71,6 +71,12 @@ case "$*" in
       printf 'zsh\n'
     fi
     exit 0 ;;
+  *"#{cursor_y}"*)
+    if [ "${FM_FAKE_KIMI_SCREEN:-0}" = 1 ]; then
+      printf '3\n'
+      exit 0
+    fi
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
@@ -89,6 +95,12 @@ case "${1:-}" in
         fi
         prev=$a
       done
+    fi
+    exit 0
+    ;;
+  capture-pane)
+    if [ "${FM_FAKE_KIMI_SCREEN:-0}" = 1 ]; then
+      printf '✨ Read the brief and follow it exactly.\ncontext: 1%% (2k/256k)\n╭────────────────────────────────╮\n│ >                              │\n╰────────────────────────────────╯\n'
     fi
     exit 0
     ;;
@@ -142,6 +154,7 @@ run_spawn() {
     CLAUDE_CONFIG_DIR='' \
     FM_FAKE_COMMAND_FILE="${FM_FAKE_COMMAND_FILE:-}" \
     FM_FAKE_WINDOWS_FILE="${FM_FAKE_WINDOWS_FILE:-}" \
+    FM_FAKE_KIMI_SCREEN="${FM_FAKE_KIMI_SCREEN:-0}" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -295,6 +308,29 @@ test_raw_launch_preserves_the_splice_literal_without_a_prefix() {
   launch=$(cat "$LAUNCH_LOG")
   [ "$launch" = "$expected" ] || fail "the raw launch was rewritten"$'\n'"expected: $expected"$'\n'"actual:   $launch"
   pass "a raw no-prefix launch keeps a literal splice token unchanged"
+}
+
+test_raw_known_harnesses_bypass_template_rendering() {
+  local harness rec id out status raw launch expected n=0
+  for harness in muse kimi; do
+    n=$((n + 1))
+    id="lp-raw-known-b2$n"
+    rec=$(make_case "raw-known$n" claude "$id")
+    read_case_record "$rec"
+    raw="$harness --custom"
+    expected="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS $raw"
+    mkdir -p "$HOME_DIR/.kimi-code/fm-turn-end.d"
+
+    out=$(HOME="$HOME_DIR" FM_FAKE_KIMI_SCREEN=1 run_ship_spawn \
+      "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      "$id" "$PROJ_DIR" --harness "$raw")
+    status=$?
+    expect_code 0 "$status" "$harness: a raw no-prefix launch should succeed"$'\n'"$out"
+
+    launch=$(sed -n '1p' "$LAUNCH_LOG")
+    [ "$launch" = "$expected" ] || fail "$harness: the raw launch was rewritten"$'\n'"expected: $expected"$'\n'"actual:   $launch"
+  done
+  pass "raw Muse and Kimi commands bypass template rendering"
 }
 
 # The splice point must never survive into a typed command, on any harness, wrapped or
@@ -669,6 +705,7 @@ test_prefix_word_preserves_the_splice_literal
 test_wrapped_launch_really_parents_the_agent
 test_default_spawn_is_unchanged
 test_raw_launch_preserves_the_splice_literal_without_a_prefix
+test_raw_known_harnesses_bypass_template_rendering
 test_no_harness_leaks_the_splice_point
 test_every_composable_harness_splices_at_the_command_word
 test_scout_composes_with_lockdown_and_a_service_owned_home

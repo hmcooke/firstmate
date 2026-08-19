@@ -3088,9 +3088,7 @@ render_launch_template_segment() {
   esac
   printf '%s' "$rendered"
 }
-if [ "$RAW_LAUNCH" -eq 1 ]; then
-  LAUNCH=$(render_launch_template_segment "$LAUNCH")
-else
+if [ "$RAW_LAUNCH" -eq 0 ]; then
   case "$LAUNCH" in
     *__LAUNCHPREFIX__*)
       launch_prefix_template_head=${LAUNCH%%__LAUNCHPREFIX__*}
