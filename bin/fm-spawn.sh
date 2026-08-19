@@ -470,7 +470,7 @@ if [ "$LAUNCH_PREFIX_SET" -eq 1 ] && [ "$KIND" = secondmate ]; then
 fi
 
 launch_prefix_literal_is_canonical() {
-  local rest=$1 word= char encoded_quote="'\\''"
+  local rest=$1 word='' char encoded_quote="'\\''"
   [ -n "$rest" ] || return 1
   case "$rest" in
     *$'\n'*|*$'\r'*) return 1 ;;
