@@ -1123,8 +1123,18 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # even when the relaunch switches harness. Losing it silently would hand back
   # an unconfined agent on the very path that exists to recover a confined one.
   launch_prefix_record_count=0
+  launch_prefix_record_has_unframed_line=0
   LAUNCH_PREFIX_LITERAL=
   while IFS= read -r launch_prefix_record_line || [ -n "$launch_prefix_record_line" ]; do
+    case "$launch_prefix_record_line" in
+      *=*)
+        launch_prefix_record_key=${launch_prefix_record_line%%=*}
+        case "$launch_prefix_record_key" in
+          ''|*[!A-Za-z0-9_]*) launch_prefix_record_has_unframed_line=1 ;;
+        esac
+        ;;
+      *) launch_prefix_record_has_unframed_line=1 ;;
+    esac
     case "$launch_prefix_record_line" in
       launch_prefix=*)
         launch_prefix_record_count=$((launch_prefix_record_count + 1))
@@ -1135,6 +1145,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
   case "$launch_prefix_record_count" in
     0) ;;
     1)
+      [ "$launch_prefix_record_has_unframed_line" -eq 0 ] || {
+        echo "error: task $ID's recorded launch prefix contains an unframed metadata continuation and cannot be reconstructed without truncation; refusing rather than relaunching with a partial wrapper" >&2
+        exit 1
+      }
       case "$LAUNCH_PREFIX_LITERAL" in
         *$'\n'*|*$'\r'*)
           echo "error: task $ID's recorded launch prefix contains a line break and cannot be typed as one launch line; refusing rather than relaunching unwrapped" >&2

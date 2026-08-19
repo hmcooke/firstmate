@@ -648,6 +648,21 @@ test_relaunch_refuses_a_noncanonical_record() {
   pass "a noncanonical prefix record cannot inject a separate relaunch command"
 }
 
+test_relaunch_refuses_an_lf_split_record() {
+  local id out status
+  id=lp-relaunch-e7
+  relaunch_case relaunch-lf-split "$id"
+  printf "launch_prefix='fmwrap'\n '-f' '/profile.sb'\n" >> "$HOME_DIR/state/$id.meta"
+
+  out=$(run_relaunch "$id" --relaunch)
+  status=$?
+  [ "$status" -ne 0 ] || fail "an LF-split recorded prefix should refuse the relaunch"$'\n'"$out"
+  assert_contains "$out" "cannot be reconstructed without truncation" \
+    "the refusal did not name the truncated multiline record"
+  [ ! -s "$LAUNCH_LOG" ] || fail "an LF-split record still launched a partial wrapper"
+  pass "an LF-split prefix record cannot truncate confinement arguments"
+}
+
 test_prefix_wraps_the_composed_launch
 test_prefix_word_keeps_its_spaces
 test_prefix_word_preserves_the_splice_literal
@@ -668,3 +683,4 @@ test_relaunch_refuses_an_explicit_prefix
 test_relaunch_refuses_a_corrupt_recorded_prefix
 test_relaunch_refuses_a_duplicate_empty_record
 test_relaunch_refuses_a_noncanonical_record
+test_relaunch_refuses_an_lf_split_record
