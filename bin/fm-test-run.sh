@@ -582,21 +582,27 @@ select_lane() {
 run_coverage_guard() {
   local tmp missing extra a b shard
   local -a saved_scripts=()
+  # Pin collation for the whole guard: every list below is compared as a sorted
+  # set, so the sorts and the comm/uniq passes that read them must agree on one
+  # order. Under a non-C ambient locale they do not, and comm rejects its own
+  # sorted input with "file 2 is not in sorted order" or reports bogus
+  # missing/extra entries. One pin here covers every step in this path.
+  local -x LC_ALL=C
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-coverage.XXXXXX")
 
-  all_repo_tests | LC_ALL=C sort -u >"$tmp/all"
-  list_proven_isolated | LC_ALL=C sort -u >"$tmp/proven"
-  list_portable_parallel_1 | LC_ALL=C sort -u >"$tmp/s1"
-  list_portable_parallel_2 | LC_ALL=C sort -u >"$tmp/s2"
+  all_repo_tests | sort -u >"$tmp/all"
+  list_proven_isolated | sort -u >"$tmp/proven"
+  list_portable_parallel_1 | sort -u >"$tmp/s1"
+  list_portable_parallel_2 | sort -u >"$tmp/s2"
 
-  cat "$tmp/s1" "$tmp/s2" | LC_ALL=C sort | uniq -d >"$tmp/shard_dups"
+  cat "$tmp/s1" "$tmp/s2" | sort | uniq -d >"$tmp/shard_dups"
   if [ -s "$tmp/shard_dups" ]; then
     log "coverage guard: portable parallel shards share scripts:"
     cat "$tmp/shard_dups" >&2
     rm -rf "$tmp"
     return 1
   fi
-  cat "$tmp/s1" "$tmp/s2" | LC_ALL=C sort -u >"$tmp/shards_union"
+  cat "$tmp/s1" "$tmp/s2" | sort -u >"$tmp/shards_union"
   missing=$(comm -23 "$tmp/proven" "$tmp/shards_union" || true)
   extra=$(comm -13 "$tmp/proven" "$tmp/shards_union" || true)
   if [ -n "$missing" ] || [ -n "$extra" ]; then
@@ -612,7 +618,7 @@ run_coverage_guard() {
   saved_scripts=("${SCRIPTS[@]+"${SCRIPTS[@]}"}")
   SCRIPTS=()
   select_lane portable-serial
-  printf '%s\n' "${SCRIPTS[@]+"${SCRIPTS[@]}"}" | LC_ALL=C sort -u >"$tmp/serial"
+  printf '%s\n' "${SCRIPTS[@]+"${SCRIPTS[@]}"}" | sort -u >"$tmp/serial"
   : >"$tmp/serial_shards_raw"
   shard=1
   while [ "$shard" -le "$PORTABLE_SERIAL_SHARDS" ]; do
@@ -629,19 +635,19 @@ run_coverage_guard() {
   done
   SCRIPTS=()
   select_family real-herdr-gated
-  printf '%s\n' "${SCRIPTS[@]+"${SCRIPTS[@]}"}" | LC_ALL=C sort -u >"$tmp/herdr"
+  printf '%s\n' "${SCRIPTS[@]+"${SCRIPTS[@]}"}" | sort -u >"$tmp/herdr"
   SCRIPTS=("${saved_scripts[@]+"${saved_scripts[@]}"}")
 
   # Every serial script runs in exactly one CI shard: no duplicate work across
   # runners, and no script silently left out of the required lane.
-  LC_ALL=C sort "$tmp/serial_shards_raw" | uniq -d >"$tmp/serial_shard_dups"
+  sort "$tmp/serial_shards_raw" | uniq -d >"$tmp/serial_shard_dups"
   if [ -s "$tmp/serial_shard_dups" ]; then
     log "coverage guard: portable serial shards share scripts:"
     cat "$tmp/serial_shard_dups" >&2
     rm -rf "$tmp"
     return 1
   fi
-  LC_ALL=C sort -u "$tmp/serial_shards_raw" >"$tmp/serial_shards"
+  sort -u "$tmp/serial_shards_raw" >"$tmp/serial_shards"
   missing=$(comm -23 "$tmp/serial" "$tmp/serial_shards" || true)
   extra=$(comm -13 "$tmp/serial" "$tmp/serial_shards" || true)
   if [ -n "$missing" ] || [ -n "$extra" ]; then
@@ -664,7 +670,7 @@ run_coverage_guard() {
     fi
   done
 
-  cat "$tmp/shards_union" "$tmp/serial" "$tmp/herdr" | LC_ALL=C sort >"$tmp/union_raw"
+  cat "$tmp/shards_union" "$tmp/serial" "$tmp/herdr" | sort >"$tmp/union_raw"
   uniq -d "$tmp/union_raw" >"$tmp/union_dups"
   if [ -s "$tmp/union_dups" ]; then
     log "coverage guard: duplicate scripts across lanes:"
@@ -672,7 +678,7 @@ run_coverage_guard() {
     rm -rf "$tmp"
     return 1
   fi
-  LC_ALL=C sort -u "$tmp/union_raw" >"$tmp/union"
+  sort -u "$tmp/union_raw" >"$tmp/union"
   missing=$(comm -23 "$tmp/all" "$tmp/union" || true)
   extra=$(comm -13 "$tmp/all" "$tmp/union" || true)
   if [ -n "$missing" ] || [ -n "$extra" ]; then
@@ -684,7 +690,7 @@ run_coverage_guard() {
   fi
 
   if [ -x "$ROOT/bin/fm-test-isolation-proof.sh" ]; then
-    "$ROOT/bin/fm-test-isolation-proof.sh" --list | LC_ALL=C sort -u >"$tmp/proof_list"
+    "$ROOT/bin/fm-test-isolation-proof.sh" --list | sort -u >"$tmp/proof_list"
     if ! cmp -s "$tmp/proven" "$tmp/proof_list"; then
       log "coverage guard: embedded proven-isolated set diverges from bin/fm-test-isolation-proof.sh --list"
       comm -3 "$tmp/proven" "$tmp/proof_list" >&2 || true
