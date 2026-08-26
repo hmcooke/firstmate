@@ -439,11 +439,8 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
   pass "fm-brief.sh: ship and scout scaffolds make omitted Herdr intent fail-visible"
 }
 
-# Pooled task worktrees share one git directory, so `refs/stash` is shared across
-# every lane of the same project and a sibling lane can consume an entry this lane
-# pushed (two such losses in one night on 12/08/2026). Both worker scaffolds must
-# carry the standing ban AND name the commit-based alternative, so the rule never
-# degrades into an unexplained "don't" a worker talks itself out of under pressure.
+# Pooled lanes share `refs/stash`, so both worker briefs must carry this safety rule.
+# Ships name task-branch WIP commits while detached-HEAD scouts name scratch commits.
 test_ship_and_scout_forbid_git_stash() {
   local home id brief kind
   home="$TMP_ROOT/no-stash-home"
