@@ -439,6 +439,35 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
   pass "fm-brief.sh: ship and scout scaffolds make omitted Herdr intent fail-visible"
 }
 
+# Pooled lanes share `refs/stash`, so both worker briefs must carry this safety rule.
+# Ships name task-branch WIP commits while detached-HEAD scouts name scratch commits.
+test_ship_and_scout_forbid_git_stash() {
+  local home id brief kind
+  home="$TMP_ROOT/no-stash-home"
+  mkdir -p "$home/data"
+  for kind in ship scout; do
+    id="brief-no-stash-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someproj --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someproj --mode no-mistakes >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind: brief was not scaffolded"
+    assert_grep "Never use \`git stash\` in this worktree" "$brief" \
+      "$kind brief omitted the standing git stash ban"
+    assert_grep "a sibling lane can consume your stash entry" "$brief" \
+      "$kind brief banned git stash without the shared-stash-ref reason"
+  done
+  assert_grep "WIP commit on your \`fm/brief-no-stash-ship\` branch" \
+    "$home/data/brief-no-stash-ship/brief.md" \
+    "ship brief did not park in-progress work on its own task branch"
+  assert_grep "ordinary scratch commit instead" \
+    "$home/data/brief-no-stash-scout/brief.md" \
+    "scout brief did not name its scratch-commit alternative"
+  pass "fm-brief.sh: ship and scout scaffolds forbid git stash and name the alternative"
+}
+
 test_secondmate_no_projects_charter() {
   local home brief status
   home="$TMP_ROOT/no-projects-home"
@@ -726,6 +755,7 @@ test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
+test_ship_and_scout_forbid_git_stash
 test_secondmate_no_projects_charter
 test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable

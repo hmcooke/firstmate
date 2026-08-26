@@ -335,6 +335,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Never use \`git stash\` in this worktree - pooled worktrees share one git directory, so a sibling lane can consume your stash entry.
+   Park in-progress work as an ordinary scratch commit instead.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -452,6 +454,8 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Never use \`git stash\` in this worktree - pooled worktrees share one git directory, so a sibling lane can consume your stash entry.
+   Park in-progress work as a WIP commit on your \`fm/$ID\` branch instead, and squash or tidy it before the branch ships.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

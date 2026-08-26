@@ -361,15 +361,20 @@ test_watcher_hook_and_idle_secondmate_exemption() {
 # A stalled authoritative state read consumes only the aggregate scan budget.
 # The durable scan position lets the next invocation reach the following child.
 test_stalled_state_read_is_bounded_and_scan_progresses() {
-  local started elapsed
+  local started elapsed FM_BOUNDED_B_VISITED
   make_world bounded
+  FM_BOUNDED_B_VISITED="$WORLD/b-visited"
+  export FM_BOUNDED_B_VISITED
   write_child "$MAIN" a 'working: state read will stall'
   cat > "$WORLD/fakebin/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
-if [ "$1" = a ]; then
+if [ "$1" = a ] && [ ! -e "${FM_BOUNDED_B_VISITED:?}" ]; then
   sleep 30
-else
+elif [ "$1" = b ]; then
+  : > "$FM_BOUNDED_B_VISITED"
   printf 'state: done · source: fake\n'
+else
+  printf 'state: unknown · source: fake\n'
 fi
 SH
   chmod +x "$WORLD/fakebin/fm-crew-state.sh"
@@ -380,7 +385,9 @@ SH
   [ "$elapsed" -le 3 ] || fail "stalled state read exceeded aggregate scan budget (${elapsed}s)"
 
   write_child "$MAIN" b 'done: green'
-  FM_INACTIVE_RECONCILE_BUDGET_SECS=1 run_reconcile "$MAIN" --startup
+  # Give the resumed fast path enough budget to be independent of runner load.
+  # The fixture still stalls if the durable cursor fails to put b first.
+  FM_INACTIVE_RECONCILE_BUDGET_SECS=5 run_reconcile "$MAIN" --startup
   grep -Fq 'child=b state=done' "$MAIN/state/.wake-queue" \
     || fail "next bounded scan did not resume with the following child"
   pass "stalled state reads are bounded without starving later children"
