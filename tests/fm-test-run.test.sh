@@ -386,6 +386,68 @@ test_portable_shard_union_and_coverage_guard() {
   pass "portable shard union, disjointness, and coverage guard hold"
 }
 
+# Probe the installed locales for one whose collation actually reorders the real
+# test inventory relative to C. That divergence is what the coverage guard's
+# sorted-set comparisons trip over, so a host without it cannot exercise the
+# regression and the caller must skip rather than pass vacuously.
+divergent_collation_locale() {
+  local inventory=$1 c_order cand
+  local -a cands=(en_US.UTF-8 en_US.utf8 en_GB.UTF-8 en_GB.utf8)
+  while IFS= read -r cand; do
+    [ -n "$cand" ] && cands+=("$cand")
+  done <<<"$(locale -a 2>/dev/null | grep -Ei 'utf-?8$' | head -n 40)"
+  c_order=$(LC_ALL=C sort "$inventory")
+  for cand in "${cands[@]}"; do
+    [ "$(LC_ALL="$cand" sort "$inventory" 2>/dev/null)" = "$c_order" ] && continue
+    printf '%s\n' "$cand"
+    return 0
+  done
+  return 1
+}
+
+test_coverage_guard_is_locale_independent() {
+  local tmp inventory loc c_out loc_out lang_out
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-locale.XXXXXX")
+  inventory="$tmp/inventory"
+  "$RUNNER" --list --all >"$inventory" \
+    || { rm -rf "$tmp"; fail "--list --all failed while sampling the inventory"; }
+  [ -s "$inventory" ] || { rm -rf "$tmp"; fail "--list --all printed nothing"; }
+
+  if ! loc=$(divergent_collation_locale "$inventory"); then
+    rm -rf "$tmp"
+    echo "skip: no installed locale reorders tests/*.test.sh relative to C (coverage guard locale regression)"
+    return 0
+  fi
+  # Load-bearing precondition, restated so a broken probe cannot make the rest
+  # of this test silently vacuous.
+  [ "$(LC_ALL="$loc" sort "$inventory")" != "$(LC_ALL=C sort "$inventory")" ] \
+    || { rm -rf "$tmp"; fail "locale $loc must order the inventory differently from C"; }
+  rm -rf "$tmp"
+
+  c_out=$(LC_ALL=C "$RUNNER" --check-coverage 2>&1) \
+    || fail "--check-coverage must pass under LC_ALL=C: $c_out"
+  # An exported LC_ALL the guard has to override.
+  loc_out=$(LC_ALL="$loc" "$RUNNER" --check-coverage 2>&1) \
+    || fail "--check-coverage must pass under LC_ALL=$loc: $loc_out"
+  # The shape the bug was reported in: LC_ALL unset, collation from LANG.
+  lang_out=$(unset LC_ALL; LANG="$loc" LC_COLLATE="$loc" "$RUNNER" --check-coverage 2>&1) \
+    || fail "--check-coverage must pass with LANG=$loc and LC_ALL unset: $lang_out"
+
+  assert_contains "$loc_out" "FM_TEST_COVERAGE ok" \
+    "coverage guard success marker under LC_ALL=$loc"
+  assert_contains "$lang_out" "FM_TEST_COVERAGE ok" \
+    "coverage guard success marker under LANG=$loc"
+  assert_not_contains "$loc_out" "not in sorted order" \
+    "coverage guard must not compare sorted sets in the ambient collation"
+  assert_not_contains "$lang_out" "not in sorted order" \
+    "coverage guard must not compare sorted sets in the ambient collation"
+  [ "$loc_out" = "$c_out" ] \
+    || fail "coverage guard verdict must not vary by locale: LC_ALL=$loc gave [$loc_out], LC_ALL=C gave [$c_out]"
+  [ "$lang_out" = "$c_out" ] \
+    || fail "coverage guard verdict must not vary by locale: LANG=$loc gave [$lang_out], LC_ALL=C gave [$c_out]"
+  pass "coverage guard is locale-independent (divergent collation verified under $loc)"
+}
+
 test_portable_serial_shards_partition_the_serial_lane() {
   local lanes count serial shard listed union dups shard_lane total cap
   lanes=$("$RUNNER" --list-lanes)
@@ -715,6 +777,7 @@ test_gate_skip_accounting
 test_fail_on_gate_skip_token
 test_exclude_family
 test_portable_shard_union_and_coverage_guard
+test_coverage_guard_is_locale_independent
 test_portable_serial_shards_partition_the_serial_lane
 test_portable_serial_shard_lane_refusals
 test_jobs_requires_proven_isolated
