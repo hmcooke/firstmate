@@ -305,6 +305,16 @@ done
 # fetched only for a letter whose issue has been touched since the last scan,
 # because the forge bumps updated_at when a comment lands. A quiet cycle makes
 # zero comment calls.
+#
+# The second-boundary rule: updated_at has one-second resolution, so a reply
+# that lands in the same second as the stamp the cursor recorded leaves
+# updated_at unchanged and would be hidden on every later cycle. The cursor is
+# therefore recorded for an issue ONLY when its updated_at is strictly older
+# than this cycle's own second; a stamp at the boundary is left unrecorded so
+# the next cycle refetches. Stamps are compared as instants, never as strings,
+# and "now" is one clock read per cycle so every issue agrees on it. An absent,
+# unreadable or malformed cursor means "fetch".
+NOW=$(date -u +%s)
 CURSOR="$ROOT/cursor"
 CURSOR_JSON="$WORK/cursor.json"
 if fmx_private_artifact_file_valid "$ROOT" "cursor" 600 \
@@ -332,7 +342,11 @@ for receipt in "$SENT"/*.receipt; do
   UPDATED=$(jq -r --argjson n "$SENT_NUMBER" \
     'map(select(.number == $n)) | first | .updated // ""' "$OPEN_JSON" 2>/dev/null)
   SEEN_AT=$(jq -r --arg n "$SENT_NUMBER" '.[$n] // ""' "$CURSOR_JSON" 2>/dev/null)
-  [ "$UPDATED" != "$SEEN_AT" ] || continue
+  UPDATED_EPOCH=$(lb_iso_epoch "$UPDATED" 2>/dev/null) || UPDATED_EPOCH=
+  SEEN_EPOCH=$(lb_iso_epoch "$SEEN_AT" 2>/dev/null) || SEEN_EPOCH=
+  if [ -n "$UPDATED_EPOCH" ] && [ -n "$SEEN_EPOCH" ] && [ "$UPDATED_EPOCH" -eq "$SEEN_EPOCH" ]; then
+    continue
+  fi
 
   COMMENTS="$WORK/comments.$SENT_NUMBER"
   lb_transport comments "$SENT_NUMBER" > "$COMMENTS" 2>/dev/null || continue
@@ -375,7 +389,9 @@ for receipt in "$SENT"/*.receipt; do
 
   # The cursor advances only after this letter's comments were fully scanned, so
   # an interrupted scan is simply redone next cycle. It is staged here and
-  # published with the other suppressing writes, after the announcement.
+  # published with the other suppressing writes, after the announcement. A
+  # stamp inside this cycle's own second is never recorded (see above).
+  [ -n "$UPDATED_EPOCH" ] && [ "$UPDATED_EPOCH" -lt "$NOW" ] || continue
   jq --arg n "$SENT_NUMBER" --arg u "$UPDATED" '.[$n] = $u' "$CURSOR_JSON" > "$CURSOR_JSON.new" 2>/dev/null \
     && mv -f "$CURSOR_JSON.new" "$CURSOR_JSON" 2>/dev/null || true
 done
@@ -397,8 +413,8 @@ PENDING_CURSOR=$CURSOR_JSON
 #   of the letter going silent, and resolves it with an ordinary class=notice
 #   letter, or by consuming a clean reply, or by whatever closes the issue.
 #
-# Either is re-surfaced once per FM_LETTERBOX_STALE_SECS window.
-NOW=$(date -u +%s)
+# Either is re-surfaced once per FM_LETTERBOX_STALE_SECS window, judged
+# against the same clock read the cursor used.
 for claim in "$CLAIMS"/*.json; do
   [ -e "$claim" ] || continue
   CID=$(basename "$claim" .json)

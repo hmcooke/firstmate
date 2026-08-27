@@ -237,6 +237,21 @@ inject_reply() {
     "$store/issues.json" > "$store/issues.json.new" && mv "$store/issues.json.new" "$store/issues.json"
 }
 
+# Pin an open issue's updated_at in the fake forge to an exact stamp.
+set_issue_updated_at() {
+  local store=$1 number=$2 at=$3
+  jq --argjson n "$number" --arg at "$at" \
+    'map(if .number == $n then .updated_at = $at else . end)' \
+    "$store/issues.json" > "$store/issues.json.new" && mv "$store/issues.json.new" "$store/issues.json"
+}
+
+# An ISO stamp N seconds in the past, BSD date first and GNU second.
+past_stamp() {
+  local ago=$1
+  date -u -r "$(( $(date -u +%s) - ago ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@$(( $(date -u +%s) - ago ))" +%Y-%m-%dT%H:%M:%SZ
+}
+
 fixture() {
   local name=$1 home store fakebin
   home=$(make_home "$name")
@@ -932,6 +947,7 @@ test_a_quiet_poll_costs_one_read_and_writes_nothing() {
   printf 'body\n' > "$home/body.txt"
   run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
     || fail "send must succeed"
+  set_issue_updated_at "$store" "$(head -n1 "$home"/state/letterbox/sent/*.receipt)" "$(past_stamp 120)"
   run_poll "$home" "$store" "$fakebin" >/dev/null
   : > "$store/calls.log"
   out=$(run_poll "$home" "$store" "$fakebin")
@@ -941,6 +957,66 @@ test_a_quiet_poll_costs_one_read_and_writes_nothing() {
   [ "$reads" = 1 ] || fail "a quiet cycle must cost exactly one read, not $reads (the cursor's job)"
   [ "$writes" = 0 ] || fail "the poll must never write to the channel"
   pass "a quiet poll cycle costs one read, makes no comment call, and never writes"
+}
+
+# GitHub's updated_at has one-second resolution, so a peer reply landing in the
+# same second as the value the cursor recorded leaves updated_at unchanged. The
+# cursor must never persist a value at the boundary of the poll's own second,
+# or that reply is hidden on every later cycle. The first poll is retried until
+# it demonstrably ran inside the same second as the stamp it observed.
+test_a_reply_in_the_cursors_own_second_is_still_fetched() {
+  local home store fakebin out id number stamp after tries=0 fetches
+  read -r home store fakebin <<< "$(fixture cursor-second | tr '\n' ' ')"
+  printf 'Question for the peer.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home")
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  while :; do
+    tries=$((tries + 1))
+    rm -f "$home/state/letterbox/cursor"
+    stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    set_issue_updated_at "$store" "$number" "$stamp"
+    out=$(run_poll "$home" "$store" "$fakebin")
+    after=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    [ "$after" != "$stamp" ] || break
+    [ "$tries" -lt 20 ] || fail "could not run a poll inside one clock second after $tries tries"
+  done
+  [ -z "$out" ] || fail "the first poll has nothing to announce (got: $out)"
+  # The peer's terminal reply lands within that same second.
+  inject_reply "$store" "$number" archie-20260827T100010Z-5c1e2d7a "$id" answered
+  set_issue_updated_at "$store" "$number" "$stamp"
+  : > "$store/calls.log"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id answered" \
+    "a reply landing in the cursor's own second must still wake the requester"
+  fetches=$(grep -c '/comments' "$store/calls.log" || true)
+  [ "$fetches" = 1 ] || fail "the reply's comments must be fetched once, not $fetches"
+  assert_present "$home/state/letterbox/inbox/archie-20260827T100010Z-5c1e2d7a.json" \
+    "the reply must be stashed"
+  out=$(run_lb "$home" "$store" "$fakebin" close "$id") || fail "close must succeed: $out"
+  jq -e --argjson n "$number" 'map(select(.number == $n)) | first | .state == "closed"' \
+    "$store/issues.json" >/dev/null || fail "the requester must close the letter"
+  pass "a terminal reply in the same second as the cursor's stamp is fetched, stashed and closable"
+}
+
+test_a_settled_sent_letter_makes_no_comment_fetch_on_a_quiet_poll() {
+  local home store fakebin out id number fetches
+  read -r home store fakebin <<< "$(fixture cursor-quiet | tr '\n' ' ')"
+  printf 'Question for the peer.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home")
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  assert_present "$home/state/letterbox/cursor" "a safely past updated_at must be recorded"
+  : > "$store/calls.log"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "a quiet cycle must be silent (got: $out)"
+  fetches=$(grep -c '/comments' "$store/calls.log" || true)
+  [ "$fetches" = 0 ] || fail "a quiet cycle must make zero comment fetches, not $fetches"
+  pass "the cursor still suppresses the comment fetch for an untouched sent letter"
 }
 
 test_the_poll_stays_silent_when_the_transport_read_fails() {
@@ -1216,6 +1292,8 @@ test_stale_letter_is_resurfaced_once_per_window
 test_a_linked_live_task_suppresses_the_stale_backstop
 test_a_replied_letter_is_not_resurfaced
 test_a_quiet_poll_costs_one_read_and_writes_nothing
+test_a_reply_in_the_cursors_own_second_is_still_fetched
+test_a_settled_sent_letter_makes_no_comment_fetch_on_a_quiet_poll
 test_the_poll_stays_silent_when_the_transport_read_fails
 test_status_reports_activation_and_what_is_owed
 test_status_on_an_unconfigured_home_says_inert

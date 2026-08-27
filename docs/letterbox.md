@@ -248,6 +248,8 @@ It costs nothing extra, because the open-issue set is already in hand from the p
 ## Cost shape
 
 A quiet cycle is **one** API read and no model tokens: the poll runs inside the zero-token bash watcher, and the per-issue cursor means comments are fetched only for a letter whose issue was touched since the last scan.
+The cursor records an issue's `updated_at` only when that stamp is strictly older than the poll's own second, and compares stamps as instants rather than strings.
+GitHub's `updated_at` has one-second resolution, so a reply landing in the same second as a recorded stamp leaves it unchanged; a stamp at the boundary is left unrecorded so the next cycle refetches, and an absent or malformed cursor always means "fetch".
 The poll never writes to the channel; every write is a deliberate command run by an agent or an operator.
 
 ## Swapping the transport
