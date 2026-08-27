@@ -168,12 +168,21 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 if fm_session_lock_owner_live "$STATE" \
   && ! fm_session_lock_owned_by_self "$STATE" \
   && fm_harness_ancestry_pids >/dev/null 2>&1; then
-  LOCK_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
-  if LOCK_OWNER=$(fm_service_owner_declared_name "$STATE" 2>/dev/null); then
-    LOCK_OWNER="service owner $LOCK_OWNER"
-  else
-    LOCK_OWNER="harness session"
-  fi
+  case "$FM_SERVICE_OWNER_STATE" in
+    live)
+      LOCK_OWNER="service owner $FM_SERVICE_OWNER_NAME"
+      LOCK_PID=$FM_SERVICE_OWNER_PID
+      ;;
+    unverifiable)
+      printf 'fm-turnend-guard: recorded service owner %s (pid %s) identity could not be verified for session lock %s; this session is read-only and has no supervision to hold, allowing the turn to end.\n' \
+        "$FM_SERVICE_OWNER_NAME" "$FM_SERVICE_OWNER_PID" "$FM_HOME" >&2
+      exit 0
+      ;;
+    *)
+      LOCK_OWNER="harness session"
+      LOCK_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
+      ;;
+  esac
   printf 'fm-turnend-guard: session lock for %s is held by another live %s (pid %s); this session is read-only and has no supervision to hold, allowing the turn to end.\n' \
     "$FM_HOME" "$LOCK_OWNER" "$LOCK_PID" >&2
   exit 0
