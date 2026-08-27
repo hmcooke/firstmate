@@ -116,9 +116,20 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
   cp "$ROOT/bin/fm-hook-host-lib.sh" "$dir/bin/fm-hook-host-lib.sh"
+  cp "$ROOT/bin/fm-session-lock-lib.sh" "$dir/bin/fm-session-lock-lib.sh"
+  cp "$ROOT/bin/fm-cursor-lib.sh" "$dir/bin/fm-cursor-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
+}
+
+# A fake harness SESSION process: a bash symlinked under a harness-matching name,
+# so the shared session-lock ancestry walk (bin/fm-session-lock-lib.sh) sees a
+# real, live harness process and terminates on it. Fixtures that need the guard
+# to have an identifiable session run it as this process's child.
+install_fake_harness_session() {
+  local dir=$1
+  ln -sf /bin/bash "$dir/fake-claude"
 }
 
 mark_codex_hook_root() {
@@ -1126,7 +1137,7 @@ install_integrated_autoarm() {
   cp "$ROOT/bin/fm-cursor-lib.sh" "$dir/bin/fm-cursor-lib.sh"
   cp "$ROOT/bin/fm-lock.sh" "$dir/bin/fm-lock.sh"
   chmod +x "$dir/bin/fm-claude-stop-autoarm.sh" "$dir/bin/fm-lock.sh"
-  ln -s /bin/bash "$dir/fake-claude"
+  install_fake_harness_session "$dir"
 }
 
 run_integrated_autoarm() {
@@ -1138,6 +1149,33 @@ run_integrated_autoarm() {
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
       ' 2>&1
+}
+
+# Claude fires BOTH Stop hooks inside the SAME session, so a concurrency
+# fixture must too: one fake harness session records the session lock once and
+# runs the auto-arm and the guard as its own children. Launching them as
+# siblings of the test shell instead would leave the guard a non-owner of the
+# home, which the guard now correctly stands down on, and this case would stop
+# exercising either reset path without failing.
+run_integrated_session_pair() {
+  local dir=$1 home
+  home=$(cd "$dir" && pwd)
+  # shellcheck disable=SC2016 # the fake harness expands FM_HOME inside its child shell.
+  FM_HOME="$home" "$dir/fake-claude" -c '
+      printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+      (
+        printf "%s" "{\"session_id\":\"sess-claude-mode\",\"stop_hook_active\":false}" \
+          | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/auto.out" 2>&1
+        printf "%s\n" "$?" > "$FM_HOME/auto.status"
+      ) &
+      (
+        printf "%s" "{\"stop_hook_active\":false,\"session_id\":\"sess-claude-mode\"}" \
+          | CLAUDECODE=1 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 \
+            "$FM_HOME/bin/fm-turnend-guard.sh" --claude > "$FM_HOME/guard.out" 2>&1
+        printf "%s\n" "$?" > "$FM_HOME/guard.status"
+      ) &
+      wait
+    '
 }
 
 write_integrated_failed_arm() {
@@ -1420,7 +1458,7 @@ test_hook_claude_mode_recovery_contention_is_not_ordinary_allow() {
 }
 
 test_hook_claude_mode_concurrent_recovery_resets_are_idempotent() {
-  local dir pid identity auto_pid guard_pid auto_status guard_status
+  local dir pid identity auto_status guard_status
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-concurrent-recovery")
   : > "$dir/state/task1.meta"
   install_integrated_autoarm "$dir"
@@ -1433,16 +1471,13 @@ test_hook_claude_mode_concurrent_recovery_resets_are_idempotent() {
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify concurrent recovery watcher"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
-  (run_integrated_autoarm "$dir" > "$dir/auto.out"; printf '%s\n' "$?" > "$dir/auto.status") &
-  auto_pid=$!
-  (FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" false > "$dir/guard.out"; printf '%s\n' "$?" > "$dir/guard.status") &
-  guard_pid=$!
-  wait "$auto_pid"
-  wait "$guard_pid"
+  run_integrated_session_pair "$dir"
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   auto_status=$(cat "$dir/auto.status")
   guard_status=$(cat "$dir/guard.status")
+  assert_not_contains "$(cat "$dir/guard.out")" "read-only" \
+    "both hooks share the lock-owning session, so neither may stand down as a read-only non-owner"
   case "$auto_status:$guard_status" in
     0:0|0:2|2:0) : ;;
     *) fail "concurrent reset callers returned unsafe statuses auto=$auto_status guard=$guard_status" ;;
@@ -1601,6 +1636,174 @@ test_hook_claude_mode_secondmate_reblocks_like_primary() {
   pass "fm-turnend-guard --claude: secondmate home re-blocks unclaimed and allows auto-arm-claimed stops"
 }
 
+# --- HOOK: session-lock ownership --------------------------------------------
+#
+# A session positively identified as not holding the home's session lock is
+# read-only (AGENTS.md section 3) and must not arm supervision, so the guard must
+# never force it to continue. Ownership comes from the shared session-lock API,
+# which walks the caller's process ancestry, so every case here runs the real
+# guard as the child of a fake harness session: the walk terminates on that
+# fixture harness and can never reach whatever launched this suite.
+
+# Run the guard from inside a fake harness session. With <own-lock> = 1 that
+# session records itself as the lock owner exactly as a real session does at
+# session start; with 0 it leaves state/.lock exactly as the test seeded it.
+run_hook_session() {  # <dir> <own-lock> [<guard-flag>]
+  local dir=$1 own=$2 flag=${3---claude} home
+  home=$(cd "$dir" && pwd)
+  # shellcheck disable=SC2016 # the fake harness expands FM_HOME inside its child shell.
+  FM_GUARD_FLAG="$flag" FM_OWN_LOCK="$own" FM_HOME="$home" "$dir/fake-claude" -c '
+      if [ "$FM_OWN_LOCK" = 1 ]; then printf "%s\n" "$$" > "$FM_HOME/state/.lock"; fi
+      printf "%s" "{\"stop_hook_active\":false,\"session_id\":\"sess-lock-owner\"}" \
+        | CLAUDECODE=1 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 \
+          "$FM_HOME/bin/fm-turnend-guard.sh" ${FM_GUARD_FLAG:+"$FM_GUARD_FLAG"} 2>&1
+    '
+}
+
+# True when a hook running as a child of this fixture's harness session - the
+# exact shape run_hook_session gives the guard - is recognized as the home's
+# session-lock owner. Asserting this keeps an ownership case from passing
+# vacuously on a fixture whose harness ancestry never resolved at all.
+session_owns_lock() {  # <dir> <own-lock>
+  local dir=$1 own=$2 home
+  home=$(cd "$dir" && pwd)
+  # shellcheck disable=SC2016 # the fake harness expands FM_HOME inside its child shell.
+  FM_OWN_LOCK="$own" FM_HOME="$home" "$dir/fake-claude" -c '
+      if [ "$FM_OWN_LOCK" = 1 ]; then printf "%s\n" "$$" > "$FM_HOME/state/.lock"; fi
+      bash -c '"'"'. "$1"; fm_session_lock_owned_by_self "$2"'"'"' \
+        _ "$FM_HOME/bin/fm-session-lock-lib.sh" "$FM_HOME/state"
+    '
+}
+
+# Print the pid of a live process the session-lock API accepts as a competing
+# harness session, or return 1 if the fixture did not actually produce one. The
+# caller reports that, because fail() inside a command substitution would only
+# leave this subshell and hand back an empty pid.
+start_competing_harness_session() {  # <dir>
+  local dir=$1 pid
+  # Detached from this helper's own stdout: the caller reads the pid through a
+  # command substitution, which would otherwise wait on the pipe this background
+  # process holds open and only return once the "live" competitor had exited.
+  "$dir/fake-claude" -c 'sleep 60; exit 0' >/dev/null 2>&1 &
+  pid=$!
+  if ! bash -c '. "$1"; fm_harness_pid_alive "$2"' _ "$dir/bin/fm-session-lock-lib.sh" "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "$pid"
+}
+
+test_hook_lock_owning_session_blocks_unchanged() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-lock-owned")
+  install_fake_harness_session "$dir"
+  : > "$dir/state/task1.meta"
+  session_owns_lock "$dir" 1 || fail "fixture session was not recognized as the home's session-lock owner"
+  out=$(run_hook_session "$dir" 1); status=$?
+  expect_code 2 "$status" "the session holding the home lock must still be blocked from ending blind"
+  assert_contains "$out" "TURN WOULD END BLIND" "the owning session's block must carry the blind-turn banner"
+  assert_contains "$out" "The Stop-owned auto-arm did not claim this home either" \
+    "the --claude ownership case must carry the Claude-only auto-arm banner"
+  assert_not_contains "$out" "read-only" "the owning session must never be treated as a read-only non-owner"
+  assert_present "$dir/state/.turnend-claude-blocks" "the owning session's block must consume the bounded block budget"
+  out=$(run_hook_session "$dir" 1 ''); status=$?
+  expect_code 2 "$status" "the default-mode session holding the home lock must still be blocked from ending blind"
+  assert_not_contains "$out" "The Stop-owned auto-arm did not claim this home either" \
+    "the default-mode ownership case must not carry the Claude-only auto-arm banner"
+  pass "fm-turnend-guard: the session holding the home lock keeps its unchanged blocking behavior"
+}
+
+test_hook_non_owner_session_allows_turn_end() {
+  local dir competitor out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-lock-other-harness")
+  install_fake_harness_session "$dir"
+  : > "$dir/state/task1.meta"
+  competitor=$(start_competing_harness_session "$dir") \
+    || fail "fixture did not produce a live competing harness session"
+  printf '%s\n' "$competitor" > "$dir/state/.lock"
+  out=$(run_hook_session "$dir" 0); status=$?
+  expect_code 0 "$status" "a session that does not hold the home lock is read-only and must be allowed to end its turn"
+  assert_contains "$out" "another live harness session (pid $competitor)" \
+    "the allow must record the live lock owner it stood down for"
+  assert_not_contains "$out" "TURN WOULD END BLIND" "a read-only non-owner must not be told its turn would end blind"
+  assert_absent "$dir/state/.turnend-claude-blocks" "an allowed non-owner stop must not create block-budget state"
+  out=$(run_hook_session "$dir" 0 ''); status=$?
+  kill "$competitor" 2>/dev/null || true
+  wait "$competitor" 2>/dev/null || true
+  expect_code 0 "$status" "the default cross-harness mode must stand down for a live lock owner too"
+  assert_not_contains "$out" "TURN WOULD END BLIND" "the default mode must not block a read-only non-owner"
+  pass "fm-turnend-guard: a live lock owner outside this session allows the turn to end in every mode"
+}
+
+test_hook_service_lock_owner_allows_turn_end() {
+  local dir service out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-lock-service")
+  install_fake_harness_session "$dir"
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  service=$!
+  FM_STATE_OVERRIDE="$dir/state" "$ROOT/bin/fm-lock.sh" service-acquire fork-engine "$service" >/dev/null || {
+    kill "$service" 2>/dev/null || true
+    wait "$service" 2>/dev/null || true
+    fail "could not record the fixture service owner"
+  }
+  out=$(run_hook_session "$dir" 0); status=$?
+  kill "$service" 2>/dev/null || true
+  wait "$service" 2>/dev/null || true
+  expect_code 0 "$status" "a harness session must be allowed to end its turn while a service owner holds the home lock"
+  assert_contains "$out" "another live service owner fork-engine (pid $service)" \
+    "the allow must name the declared service owner it stood down for"
+  assert_not_contains "$out" "TURN WOULD END BLIND" "a service-owned home must not block its read-only harness session"
+  assert_absent "$dir/state/.turnend-claude-blocks" "an allowed non-owner stop must not create block-budget state"
+  pass "fm-turnend-guard: a live declared service owner allows the read-only harness session's turn to end"
+}
+
+test_hook_uncertain_lock_keeps_blocking() {
+  local dir case_name dead out status
+  dead=$(nonexistent_pid)
+  for case_name in absent dead malformed; do
+    dir=$(make_primary_dir "$TMP_ROOT/hook-lock-$case_name")
+    install_fake_harness_session "$dir"
+    : > "$dir/state/task1.meta"
+    case "$case_name" in
+      absent) rm -f "$dir/state/.lock" ;;
+      dead) printf '%s\n' "$dead" > "$dir/state/.lock" ;;
+      malformed) printf 'not-a-pid\n' > "$dir/state/.lock" ;;
+    esac
+    out=$(run_hook_session "$dir" 0); status=$?
+    expect_code 2 "$status" "a session lock in the $case_name state must not widen the fail-open"
+    assert_contains "$out" "TURN WOULD END BLIND" "a session lock in the $case_name state must keep the unchanged block banner"
+    assert_not_contains "$out" "read-only" "a session lock in the $case_name state is not proof that another session owns supervision"
+  done
+  pass "fm-turnend-guard: an absent, stale, or malformed session lock keeps the unchanged blocking behavior"
+}
+
+test_hook_non_owner_allow_does_not_consume_block_budget() {
+  local dir competitor before out status i
+  dir=$(make_primary_dir "$TMP_ROOT/hook-lock-budget")
+  install_fake_harness_session "$dir"
+  : > "$dir/state/task1.meta"
+  seed_claude_budget "$dir" 1
+  before=$(cat "$dir/state/.turnend-claude-blocks")
+  competitor=$(start_competing_harness_session "$dir") \
+    || fail "fixture did not produce a live competing harness session"
+  printf '%s\n' "$competitor" > "$dir/state/.lock"
+  i=0
+  while [ "$i" -lt 4 ]; do
+    out=$(run_hook_session "$dir" 0); status=$?
+    expect_code 0 "$status" "a read-only non-owner stop must be allowed every time, not only until the budget runs out"
+    assert_not_contains "$out" "TURN WOULD END BLIND" "a read-only non-owner stop must never block"
+    i=$((i + 1))
+  done
+  kill "$competitor" 2>/dev/null || true
+  wait "$competitor" 2>/dev/null || true
+  [ "$(cat "$dir/state/.turnend-claude-blocks")" = "$before" ] \
+    || fail "an allowed non-owner stop moved the bounded block budget: $(cat "$dir/state/.turnend-claude-blocks")"
+  assert_absent "$dir/state/.claude-autoarm.lock" "an allowed non-owner stop claimed the auto-arm owner lock"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "an allowed non-owner stop reached the attended fail-open alarm"
+  pass "fm-turnend-guard: repeated allowed non-owner stops never consume the bounded block budget"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -1665,3 +1868,8 @@ test_hook_claude_mode_away_mode_never_uses_stop_autoarm_fail_open
 test_hook_claude_mode_allow_resets_budget
 test_hook_claude_mode_waits_for_late_claim
 test_hook_claude_mode_secondmate_reblocks_like_primary
+test_hook_lock_owning_session_blocks_unchanged
+test_hook_non_owner_session_allows_turn_end
+test_hook_service_lock_owner_allows_turn_end
+test_hook_uncertain_lock_keeps_blocking
+test_hook_non_owner_allow_does_not_consume_block_budget

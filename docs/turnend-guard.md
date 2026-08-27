@@ -13,7 +13,7 @@ Do not infer this guard's scope, loop safety, or compatibility tradeoffs for tho
 
 `bin/fm-guard.sh` is a pull-based warning that runs only when another supervision command invokes it.
 The turn-end guard closes the remaining gap at the primary's own turn boundary.
-When work, a process-event source, or Relay polling needs supervision at that boundary and no identity-matched watcher has a fresh beacon, the harness integration must either block the turn end or force one bounded follow-up that uses the recovery instruction from the emitted session-start protocol.
+When the lock-owning session has work, a process-event source, or Relay polling that needs supervision at that boundary and no identity-matched watcher has a fresh beacon, the harness integration must either block the turn end or force one bounded follow-up that uses the recovery instruction from the emitted session-start protocol.
 The mid-turn pull warning uses the model-aware supervision verdict described below, while the turn-end guard keeps the PID-strict watcher predicate.
 The guard remains a backstop; [`watcher-continuity.md`](watcher-continuity.md) owns normal continuity.
 
@@ -25,6 +25,13 @@ The marker must be a regular non-symlink file whose whitespace-stripped first li
 An unmarked checkout or invalid marker falls through to the git-dir check.
 That check keeps crewmate and scout linked worktrees inert because their git dir differs from their git common dir.
 It also requires `AGENTS.md`, `bin/`, and the effective state directory.
+
+After that scope check the guard asks whether this session actually holds the home's session lock.
+When the shared lock API positively identifies a non-reclaimable owner outside this session's resolvable harness ancestry, the session is read-only under AGENTS.md section 3 and must not arm supervision at all, so the guard allows its turn to end and writes one stderr line describing the owner record it stood down for.
+That allow requires a successful `fm_session_lock_owner_live` query from `bin/fm-session-lock-lib.sh`, the same predicate acquisition uses to decide that reclamation must be refused.
+Live harness sessions and live declared service owners both count, while [`service-owner-lock.md`](service-owner-lock.md#limits) owns the identity-unverifiable live-service state that the query also preserves.
+An absent, malformed, or stale-owner lock, and a harness ancestry this process cannot resolve, all keep the blocking behavior below unchanged, because none of them proves that another session owns supervision.
+The decision comes before any budget accounting, so an allowed read-only stop never consumes the bounded block budget described under Claude below.
 
 For an in-scope primary, the guard counts in-flight work from `state/*.meta`.
 Registered `state/procevent/*.source` records also require supervision even though they have no task metadata.
@@ -72,7 +79,7 @@ In the default Codex mode, a true value lets the second stop finish after one fo
 
 Claude runs the guard with `--claude`, which ignores `stop_hook_active` and cooperates with the Stop-owned auto-arm.
 Claude Code sets `stop_hook_active=true` on every stop after any stop-hook continuation, including `asyncRewake` rewakes, which re-opened the 2026-07-21 blind window under the default one-shot behavior.
-The Claude mode waits up to `FM_CLAUDE_AUTOARM_SYNC_WAIT_MS` (default 800 milliseconds) and allows the stop when the watcher is healthy, `state/.claude-autoarm.lock` has a live `autoarm` role owner whose eventual failure must exit 2, or `state/.claude-autoarm-epoch` contains a fresh actionable rewake owned by this event epoch.
+For a lock-owning session, the Claude mode waits up to `FM_CLAUDE_AUTOARM_SYNC_WAIT_MS` (default 800 milliseconds) and allows the stop when the watcher is healthy, `state/.claude-autoarm.lock` has a live `autoarm` role owner whose eventual failure must exit 2, or `state/.claude-autoarm-epoch` contains a fresh actionable rewake owned by this event epoch.
 Fresh `failed` and `failed-suppressed` outcomes enter or advance the failure progression instead of acting as unconditional recovery proof.
 The auto-arm itself rechecks the healthy watcher predicate and retries a bounded number of times before reporting a genuine failure.
 The first fresh exhausted-failure epoch preserves its handoff without consuming a blocked-stop count, while later fresh failed epochs advance the same monotonic progression instead of resetting it.
@@ -146,7 +153,8 @@ That warning uses `bin/fm-supervision-instructions.sh --repair-line`, so it alwa
 
 ## Regression coverage
 
-`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
+`tests/fm-turnend-guard.test.sh` covers the predicate, main and secondmate primary scope, child-worktree exclusion, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, the live-lock and fresh-beacon guard predicate, session-lock ownership, the cooperative `--claude` claim wait, monotonic failed-epoch progression, bounded attended fail-open, post-alarm continuation suppression, positive recovery reset, Pi logical-run latching, missing-`jq` behavior, all five primary registrations, Grok native and legacy selection, typed field precedence, malformed input, and exactly-one-path safety.
+Its ownership cases run the real guard as the child of a fake harness session, so the ancestry walk terminates inside the fixture: the owning session still blocks, a competing live harness session and a live declared service owner each allow the stop with the diagnostic line, an absent, stale, or malformed lock still blocks, and repeated allowed non-owner stops leave the block budget untouched.
 `tests/fm-guard-stale-banner.test.sh` covers the pull-guard predicate, including the persistent-model fresh-leftover-beacon negative control, the auto-arm model's healthy fresh-beacon-without-a-watcher case and stale-beacon alarm, and the extension model's live-watcher path, ownership-qualified fresh hand-off, held-lock failures, independently broken ownership signals, stale-beacon alarm, queued-wake warning, and Pi and pi-signed harness routing.
 It also covers true-reason banner wording and reason-keyed episode dedup surviving a beacon mtime change.
 `tests/fm-cursor-primary.test.sh` covers the Cursor park end to end over real processes with no harness installed: each tracked Claude-shaped entrypoint standing down on a Cursor payload, both follow-up sources, the bounded repair nag and its reset, the nested loop bounds, supersession, away-mode and lock-ownership inertness, child-worktree exclusion, and that the adapter never exits 2.
