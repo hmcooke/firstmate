@@ -32,6 +32,12 @@ case "${1:-}" in
   list-windows)
     sed -n 's/^window=[^:]*://p' "${FM_HOME:?}"/state/*.meta
     ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence): every recorded task window, as the
+    # session:window selector alias the classifier matches on.
+    sed -n 's/^window=//p' "${FM_HOME:?}"/state/*.meta
+    ;;
   display-message)
     case "$*" in
       *pane_current_command*)

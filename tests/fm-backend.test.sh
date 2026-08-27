@@ -650,6 +650,12 @@ case "${1:-}" in
     fi
     exit 0 ;;
   list-windows) exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence). It emits one selector alias per line,
+    # so the fake answers with the aliases of the one live pane it models.
+    printf '%s\n' '%1' '@1' '$1' 'sess' 'sess:win' 'sess:1' 'sess:win.0' 'sess:1.0'
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -668,8 +674,8 @@ run_send_case() {  # <bin-root> <fakebin> <log> <home> -- <send args...>
 
 strip_send_preflight() {  # <log>
   local preflight
-  preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
-  awk -v preflight="$preflight" '$0 != preflight { print }' "$1"
+  preflight=$'tmux\x1flist-panes\x1f-a\x1f-F'
+  awk -v preflight="$preflight" 'index($0, preflight) != 1 { print }' "$1"
 }
 
 # The byte-identical old-vs-new tmux log comparison this test used to run
@@ -689,8 +695,8 @@ test_send_tmux_contract() {
   run_send_case "$ROOT" "$fb" "$log" "$home" -- "sess:win" --key Escape
   rc=$?
   expect_code 0 "$rc" "fm-send --key should succeed against a live fake pane"
-  assert_contains "$(cat "$log")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' \
-    "fm-send --key did not verify the explicit tmux target before sending"
+  assert_contains "$(cat "$log")" $'tmux'$'\x1f''list-panes'$'\x1f''-a'$'\x1f''-F' \
+    "fm-send --key did not verify the explicit tmux target against the pane inventory before sending"
   assert_contains "$(cat "$log")" $'\x1f''Escape' "fm-send --key did not send the named key"
   assert_not_contains "$(cat "$log")" $'\x1f''-l'$'\x1f' "fm-send --key must not type literal text"
 

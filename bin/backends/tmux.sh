@@ -246,6 +246,95 @@ fm_backend_tmux_foreground_argv0s() {  # <target>
       done
 }
 
+# fm_backend_tmux_server_gone_error: 0 when <stderr-text> is tmux's own
+# definitive "there is no server to ask" answer. That answer is positive
+# evidence of absence rather than a failed read: a tmux pane cannot outlive
+# its server, so no server means no pane. Every other failure - a permission
+# error, an over-long socket path, a protocol mismatch, a silent non-zero exit
+# - is a read we could not complete, and stays unknown. Shared by the presence
+# and agent-state classifiers so the two cannot drift.
+fm_backend_tmux_server_gone_error() {  # <stderr-text>
+  case "$1" in
+    *"no server running on "*) return 0 ;;
+    *"error connecting to "*" (No such file or directory)") return 0 ;;
+    *"error connecting to "*" (Connection refused)") return 0 ;;
+  esac
+  return 1
+}
+
+# fm_backend_tmux_target_presence: the tri-state endpoint-presence verdict for
+# one recorded tmux target. See bin/fm-backend.sh's fm_backend_target_presence
+# for the shared vocabulary and docs/tmux-backend.md "Endpoint presence" for
+# the empirical basis.
+#
+# The verdict comes from a server-wide `list-panes -a` INVENTORY, never from
+# `display-message -t <target>`. Verified against tmux 3.4: display-message
+# silently falls back to the active window, so it answers exit 0 with a real
+# pane id for `sess:fm-gone` (a window that does not exist) and exit 0 with
+# empty output for a session that does not exist. It therefore cannot produce
+# positive evidence of absence in either direction, and a classifier built on
+# it reports both a live endpoint and a closed one as "there".
+#
+# The target's own shape selects which selector alias to enumerate, and each
+# alias is a SINGLE-field format matched as a whole line. Two verified tmux
+# behaviours rule out packing several aliases into one format:
+#   - Under a non-UTF-8 locale (LC_ALL=C included) tmux vis-escapes every
+#     control character in its output, so an embedded newline comes back as
+#     `_` and an embedded tab or 0x1f comes back mangled too. No control
+#     character can serve as a field separator.
+#   - Every printable separator can legitimately appear inside a window name,
+#     so no printable one is safe either.
+# The locale is therefore left ambient rather than pinned to C, so a non-ASCII
+# window name renders as itself in a UTF-8 environment; a target carrying a
+# non-ASCII byte can still never earn `absent`, since a C-locale server would
+# render that name escaped and a non-match would prove nothing.
+#
+# Matching short-circuits, so a live endpoint costs one call; only the absent
+# path pays for the remaining aliases. A target shape this cannot enumerate -
+# tmux's exact-match `=` syntax, a glob, or a three-part selector - is
+# ambiguity and stays unknown, never absence.
+fm_backend_tmux_target_presence() {  # <target> -> present|absent|unknown
+  local target=$1 fmt inventory status
+  [ -n "$target" ] || { printf 'unknown'; return 0; }
+  case "$target" in
+    *=*|*'*'*|*'?'*|*'['*|*:*:*) printf 'unknown'; return 0 ;;
+  esac
+  case "$target" in
+    %[0-9]*) set -- '#{pane_id}' ;;
+    @[0-9]*) set -- '#{window_id}' ;;
+    '$'[0-9]*) set -- '#{session_id}' ;;
+    *:*)
+      set -- '#{session_name}:#{window_name}' \
+             '#{session_name}:#{window_index}' \
+             '#{session_name}:#{window_name}.#{pane_index}' \
+             '#{session_name}:#{window_index}.#{pane_index}'
+      ;;
+    *) set -- '#{session_name}' ;;
+  esac
+  for fmt do
+    if inventory=$(tmux list-panes -a -F "$fmt" 2>&1); then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+      fm_backend_tmux_server_gone_error "$inventory" && { printf 'absent'; return 0; }
+      printf 'unknown'
+      return 0
+    fi
+    if printf '%s\n' "$inventory" | grep -Fqx -- "$target"; then
+      printf 'present'
+      return 0
+    fi
+  done
+  # Every alias read succeeded and none named the target. That is positive
+  # evidence only for a target tmux would have rendered back byte for byte.
+  case "$target" in
+    *[![:print:]]*|*[!\ -~]*) printf 'unknown' ;;
+    *) printf 'absent' ;;
+  esac
+}
+
 # fm_backend_tmux_agent_state: recovery-grade harness-agent state for one
 # recorded target. See bin/fm-backend.sh's fm_backend_agent_state for the
 # shared state vocabulary and docs/tmux-backend.md "Agent liveness probe" for
@@ -279,11 +368,13 @@ fm_backend_tmux_agent_state() {  # <target>
   fi
   if [ "$inventory_status" -ne 0 ]; then
     case "$windows" in
-      *"can't find session:"*|*"no server running on "*|*"error connecting to "*" (No such file or directory)"|*"error connecting to "*" (Connection refused)")
-        printf 'missing'
-        ;;
+      *"can't find session:"*) printf 'missing' ;;
       *)
-        printf 'unreadable'
+        if fm_backend_tmux_server_gone_error "$windows"; then
+          printf 'missing'
+        else
+          printf 'unreadable'
+        fi
         ;;
     esac
     return 0

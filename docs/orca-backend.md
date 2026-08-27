@@ -45,6 +45,19 @@ worktree=<absolute Orca worktree path>
 
 ## Current lifecycle and safety
 
+### Endpoint presence
+
+Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
+An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+
+Orca exposes no terminal inventory, so the only positive evidence of absence available is a structured `ok:false` whose error names the terminal as not found; the verdict is read from that JSON body rather than from the exit status.
+A missing `orca` CLI, a non-zero exit with no JSON body, an unparseable body, and an `ok:false` carrying any other error code are all unknown.
+The exact not-found error code a real Orca build emits for a closed terminal is unverified - orca is not installed on the verification machine - so it is matched defensively by shape.
+The failure direction of a wrong guess is deliberate: an unmatched code reads unknown, which refuses, never absent.
+
+Because absence can never be positively established here, Orca is exempt from the confirmed-gone gate cleanup applies on every other backend before erasing a durable endpoint record.
+Cleanup removes the Orca-owned worktree rather than always closing the terminal itself, and gating on a verdict Orca cannot supply would refuse every Orca cleanup instead of protecting one.
+
 Spawn registers the repository, creates an independent worktree, reuses only the verified `result.terminal.handle` returned by Orca or creates a terminal explicitly, installs harness hooks, records metadata, and launches the selected harness.
 Exact command flags and response parsing are owned by `bin/backends/orca.sh` and script help.
 
@@ -76,6 +89,7 @@ It never raw-deletes an Orca worktree.
 
 ```sh
 tests/fm-backend-orca.test.sh
+tests/fm-backend-presence.test.sh
 tests/fm-backend.test.sh
 tests/fm-bootstrap.test.sh
 ```

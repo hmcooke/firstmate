@@ -44,9 +44,25 @@ Verify setup by spawning a small task and confirming its `fm-<id>` window appear
 
 ## Current behavior and safety
 
+### Endpoint presence
+
+Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
+An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+
+The tmux verdict comes from a server-wide `list-panes -a` inventory, never from `display-message -t <target>`.
+Verified against tmux 3.4: `display-message` silently falls back to the active window, so it answers exit 0 with a real pane id for a window that does not exist and exit 0 with empty output for a session that does not exist.
+It can therefore prove neither presence nor absence.
+The target's own shape selects which selector alias to enumerate - pane id, window id, session id, session name, or the `session:window` and `session:window.pane` forms in both name and index spelling - and each alias is a single-field format matched as a whole line.
+Two verified tmux behaviours rule out packing several aliases into one format: under a non-UTF-8 locale (`LC_ALL=C` included) tmux vis-escapes every control character it prints, so an embedded newline comes back as `_` and an embedded tab or `0x1f` comes back mangled, while every printable separator can legitimately appear inside a window name.
+The locale is therefore left ambient rather than pinned to `C`, and a target carrying a non-ASCII byte can never earn absent, since a C-locale server would render that name escaped and a non-match would prove nothing.
+Matching short-circuits, so a live endpoint costs one call and only the absent path pays for the remaining aliases.
+
+A readable inventory that omits the target is absent, and so is tmux's own definitive "no server running" or missing-socket answer, because a pane cannot outlive its server.
+Every other failure - a permission error, an over-long socket path, a protocol mismatch - is unknown, and so is a target shape the inventory cannot enumerate by value: tmux's exact-match `=` syntax, a glob, or a three-part selector.
+
 ### Agent liveness probe
 
-A target-existence check proves only that the pane exists.
+A target-presence check proves only that the pane exists.
 The deeper tmux agent-liveness probe first verifies exact window membership, then reads process names to distinguish a running harness from a bare idle shell.
 It classifies recognized Claude, Codex, OpenCode, Pi, pi-signed, Grok, Kimi, Cursor, and Muse process identities as `alive`, common shells as `dead`, an authoritatively absent window as `missing`, unreadable state as `unreadable`, and every other process as `ambiguous`.
 Only `dead` and `missing` authorize recovery because a false dead result could launch a duplicate agent.
@@ -102,6 +118,7 @@ Without that baseline, an `unknown` verdict is preserved untouched, so a busy-lo
 
 ```sh
 tests/fm-backend-tmux-smoke.test.sh
+tests/fm-backend-presence.test.sh
 tests/fm-tmux-agent-liveness.test.sh
 tests/fm-harness-liveness-drift-live-e2e.test.sh
 tests/fm-composer-ghost.test.sh

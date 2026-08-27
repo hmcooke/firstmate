@@ -57,8 +57,8 @@
 #      as fm_backend_cmux_target_ready's liveness probe (the design sketch's
 #      original suggestion): the very first send on a freshly created task
 #      would fail its own pre-flight readiness check. `list-panes` has no such
-#      gap and is used instead (fm_backend_cmux_surface_exists), mirroring
-#      zellij's own structural pane_exists check.
+#      gap and is used instead (fm_backend_cmux_surface_presence), mirroring
+#      zellij's own structural pane check.
 #   4. Closing a workspace's LAST surface is a THIRD shape, matching neither
 #      herdr (auto-closes the workspace) nor zellij (leaves a ghost tab):
 #      `close-surface` REFUSES outright with a typed error
@@ -325,14 +325,42 @@ fm_backend_cmux_scoped_title() {  # <fm-task-label>
   printf 'fm-%s-%s' "$home" "$rest"
 }
 
+# fm_backend_cmux_workspace_inventory: one "<id>\t<title>" line per live
+# workspace across EVERY window, or a non-zero return when the inventory could
+# not be read completely.
+#
+# `workspace list --json` with NO --window is scoped to the CURRENT window only
+# (verified live; the same scoping fm_backend_cmux_window_of_workspace already
+# walks around). Using that scoped call as the whole-app inventory made every
+# workspace in another window read as missing, which is a limit of what was
+# observed, not evidence the workspace is gone. So the inventory walks
+# `list-windows` and asks each window for its own scoped list, and refuses to
+# answer at all if any of those reads fails - a partial inventory can prove a
+# workspace present but never prove one absent.
+fm_backend_cmux_workspace_inventory() {  # -> "<workspace_id>\t<title>" lines
+  local wins wid wss rendered status
+  wins=$(fm_backend_cmux_cli list-windows --json --id-format uuids 2>/dev/null) || return 1
+  printf '%s' "$wins" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  while IFS= read -r wid; do
+    [ -n "$wid" ] || continue
+    wss=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$wid" 2>/dev/null) || return 1
+    rendered=$(printf '%s' "$wss" | jq -r '.workspaces[]? | "\(.id)\t\(.title)"' 2>/dev/null)
+    status=$?
+    [ "$status" -eq 0 ] || return 1
+    [ -z "$rendered" ] || printf '%s\n' "$rendered"
+  done < <(printf '%s' "$wins" | jq -r '.[]? | .id // empty' 2>/dev/null)
+}
+
 # fm_backend_cmux_workspace_id_for_label: the live workspace id whose title
 # equals <label>, or empty. cmux enforces no title uniqueness (finding #6),
-# so this adopts the FIRST match `jq` returns, mirroring herdr's/zellij's own
-# duplicate-check posture.
+# so this adopts the FIRST match the inventory returns, mirroring
+# herdr's/zellij's own duplicate-check posture. Reads every window
+# (fm_backend_cmux_workspace_inventory), so a task workspace the operator moved
+# to another window is still found.
 fm_backend_cmux_workspace_id_for_label() {  # <label>
   local label=$1
-  fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null \
-    | jq -r --arg want "$label" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1
+  fm_backend_cmux_workspace_inventory 2>/dev/null \
+    | awk -F'\t' -v want="$label" '$2 == want { print $1; exit }'
 }
 
 fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
@@ -379,9 +407,24 @@ fm_backend_cmux_parse_target() {  # <target>
   [ -n "$FM_BACKEND_CMUX_WORKSPACE" ] && [ -n "$FM_BACKEND_CMUX_SURFACE" ] && [ "$FM_BACKEND_CMUX_SURFACE" != "$target" ]
 }
 
-# fm_backend_cmux_surface_exists: does <surface_id> currently appear as one of
-# <workspace_id>'s surfaces, per list-panes? Structural existence check, never
-# a content read.
+# fm_backend_cmux_target_ready: the boolean "usable right now" view of
+# fm_backend_cmux_presence_probe, which owns the whole classification (never
+# read-screen - see fm_backend_cmux_surface_presence's header for the
+# fresh-surface pitfall that rules it out). Deliberately NOT a subshell call:
+# the send/capture paths depend on the probe's refreshed
+# FM_BACKEND_CMUX_WORKSPACE/FM_BACKEND_CMUX_SURFACE in their own shell. Only a
+# proven-present endpoint is ready; an unreadable one is not usable either, but
+# it is reported as unknown rather than gone by the presence view.
+fm_backend_cmux_target_ready() {  # <target> [expected-label]
+  fm_backend_cmux_presence_probe "$@"
+  [ "$FM_BACKEND_CMUX_PRESENCE" = present ]
+}
+
+# fm_backend_cmux_surface_presence: does <surface_id> currently appear as one of
+# <workspace_id>'s surfaces, per list-panes? Structural check, never a content
+# read. Present, absent, or unknown from one read whose exit status and JSON
+# shape are both checked: a readable pane list that omits the surface is
+# positive evidence, an unreadable one is not.
 #
 # Verified real-cmux pitfall NOT anticipated by the design sketch: read-screen
 # against a genuinely fresh surface that has never been written to yet fails
@@ -389,46 +432,114 @@ fm_backend_cmux_parse_target() {  # <target>
 # read-screen call fails this way (with or without --lines, any value,
 # regardless of how long you wait) until at least one `send` has actually
 # written to the surface, at which point it becomes reliably readable. This
-# would make read-screen unusable as fm_backend_cmux_target_ready's liveness
-# probe: the very first send_literal on a freshly created task's surface
-# would fail its own readiness pre-check before ever getting to write
-# anything. list-panes has no such gap (verified: correct, immediate output
-# on a completely untouched fresh surface), so it is the liveness primitive
-# instead - mirroring zellij's own pane_exists check
-# (fm_backend_zellij_pane_exists) rather than the design sketch's original
+# would make read-screen unusable as the liveness probe behind
+# fm_backend_cmux_target_ready: the very first send_literal on a freshly
+# created task's surface would fail its own readiness pre-check before ever
+# getting to write anything. list-panes has no such gap (verified: correct,
+# immediate output on a completely untouched fresh surface), so it is the
+# liveness primitive instead - mirroring zellij's own structural pane check
+# (fm_backend_zellij_presence_probe) rather than the design sketch's original
 # read-screen-based suggestion.
-fm_backend_cmux_surface_exists() {  # <workspace_id> <surface_id>
-  local wsid=$1 sfid=$2
-  fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>/dev/null \
-    | jq -e --arg s "$sfid" '[.panes[]? | select(.surface_ids // [] | index($s))] | length > 0' >/dev/null 2>&1
+fm_backend_cmux_surface_presence() {  # <workspace_id> <surface_id> -> present|absent|unknown
+  local wsid=$1 sfid=$2 out
+  out=$(fm_backend_cmux_cli list-panes --workspace "$wsid" --json --id-format uuids 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  printf '%s' "$out" | jq -e 'has("panes")' >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  if printf '%s' "$out" | jq -e --arg s "$sfid" '[.panes[]? | select(.surface_ids // [] | index($s))] | length > 0' >/dev/null 2>&1; then
+    printf 'present'
+  else
+    printf 'absent'
+  fi
 }
 
-# fm_backend_cmux_target_ready: parse the target and verify it is live via
-# fm_backend_cmux_surface_exists (never read-screen - see that function's
-# header for the fresh-surface pitfall this avoids). When the caller knows
-# the owning firstmate task label, refresh stale workspace/surface ids by label.
-fm_backend_cmux_target_ready() {  # <target> [expected-label]
-  local expected_label=${2:-} expected_title title wsid sfid
-  fm_backend_cmux_parse_target "$1" || return 1
-  if [ -n "$expected_label" ]; then
-    expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
-    title=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null | jq -r --arg id "$FM_BACKEND_CMUX_WORKSPACE" '.workspaces[]? | select(.id == $id) | .title' 2>/dev/null)
-    if [ "$title" = "$expected_title" ]; then
-      fm_backend_cmux_surface_exists "$FM_BACKEND_CMUX_WORKSPACE" "$FM_BACKEND_CMUX_SURFACE" && return 0
-      wsid=$FM_BACKEND_CMUX_WORKSPACE
-    elif [ -n "$title" ]; then
-      return 1
-    else
-      wsid=$(fm_backend_cmux_workspace_id_for_label "$expected_title")
-      [ -n "$wsid" ] || return 1
-    fi
-    sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
-    [ -n "$sfid" ] || return 1
-    FM_BACKEND_CMUX_WORKSPACE=$wsid
-    FM_BACKEND_CMUX_SURFACE=$sfid
+# fm_backend_cmux_title_scoped: the title cmux reports for <workspace_id> in the
+# CURRENT window, or empty when that scoped view does not hold it. Empty is
+# deliberately ambiguous here - the workspace may be live in another window -
+# and callers must fall back to the whole-app inventory before concluding
+# anything from it.
+fm_backend_cmux_title_scoped() {  # <workspace_id>
+  fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null \
+    | jq -r --arg id "$1" '.workspaces[]? | select(.id == $id) | .title' 2>/dev/null | head -1
+}
+
+fm_backend_cmux_title_in_inventory() {  # <inventory> <workspace_id>
+  printf '%s\n' "$1" | awk -F'\t' -v want="$2" '$1 == want { print $2; exit }'
+}
+
+fm_backend_cmux_id_in_inventory() {  # <inventory> <title>
+  printf '%s\n' "$1" | awk -F'\t' -v want="$2" '$2 == want { print $1; exit }'
+}
+
+# fm_backend_cmux_presence_probe: the single cmux endpoint classifier. Sets
+# FM_BACKEND_CMUX_PRESENCE to present|absent|unknown, and on a present verdict
+# leaves FM_BACKEND_CMUX_WORKSPACE/FM_BACKEND_CMUX_SURFACE holding the ids that
+# were actually verified - refreshed when the recorded pair was stale. Two
+# views sit on top of it: fm_backend_cmux_target_presence (read-only verdict)
+# and fm_backend_cmux_target_ready (the boolean the send/capture paths use,
+# which needs those refreshed ids in its own shell).
+#
+# Absence needs a COMPLETE observation, which for cmux means every window:
+# `workspace list` with no --window is scoped to the CURRENT window only
+# (verified live; the same scoping fm_backend_cmux_window_of_workspace already
+# walks around). A task workspace sitting in another window is invisible to
+# that scoped call, so a scoped miss is a limit of what was observed and never
+# evidence the workspace is gone - only fm_backend_cmux_workspace_inventory's
+# whole-app view, which refuses rather than answering partially, can settle it.
+# The scoped call is still tried FIRST so the common case (the workspace in the
+# current window) costs exactly what it always did, and the sweep is paid only
+# when the cheap view cannot see the endpoint.
+#
+# With the owning task label known, the workspace title is the identity that
+# survives an app relaunch (workspace ids do not - finding #5): a title match
+# refreshes stale ids, and a workspace id reused under a DIFFERENT title is
+# positive evidence this endpoint is gone.
+fm_backend_cmux_presence_probe() {  # <target> [expected-label]
+  local expected_label=${2:-} expected_title title inventory wsid sfid surface
+  FM_BACKEND_CMUX_PRESENCE=unknown
+  fm_backend_cmux_parse_target "$1" || return 0
+  if [ -z "$expected_label" ]; then
+    surface=$(fm_backend_cmux_surface_presence "$FM_BACKEND_CMUX_WORKSPACE" "$FM_BACKEND_CMUX_SURFACE")
+    case "$surface" in
+      present|absent) FM_BACKEND_CMUX_PRESENCE=$surface; return 0 ;;
+    esac
+    # The pane read was inconclusive; only a complete inventory can say whether
+    # the workspace itself is gone.
+    inventory=$(fm_backend_cmux_workspace_inventory) || return 0
+    title=$(fm_backend_cmux_title_in_inventory "$inventory" "$FM_BACKEND_CMUX_WORKSPACE")
+    [ -n "$title" ] || FM_BACKEND_CMUX_PRESENCE=absent
     return 0
   fi
-  fm_backend_cmux_surface_exists "$FM_BACKEND_CMUX_WORKSPACE" "$FM_BACKEND_CMUX_SURFACE"
+  expected_title=$(fm_backend_cmux_scoped_title "$expected_label")
+  title=$(fm_backend_cmux_title_scoped "$FM_BACKEND_CMUX_WORKSPACE")
+  if [ -z "$title" ]; then
+    inventory=$(fm_backend_cmux_workspace_inventory) || return 0
+    title=$(fm_backend_cmux_title_in_inventory "$inventory" "$FM_BACKEND_CMUX_WORKSPACE")
+  fi
+  if [ "$title" = "$expected_title" ]; then
+    surface=$(fm_backend_cmux_surface_presence "$FM_BACKEND_CMUX_WORKSPACE" "$FM_BACKEND_CMUX_SURFACE")
+    case "$surface" in
+      present) FM_BACKEND_CMUX_PRESENCE=present; return 0 ;;
+      unknown) return 0 ;;
+    esac
+    wsid=$FM_BACKEND_CMUX_WORKSPACE
+  elif [ -n "$title" ]; then
+    FM_BACKEND_CMUX_PRESENCE=absent
+    return 0
+  else
+    [ -n "${inventory:-}" ] || { inventory=$(fm_backend_cmux_workspace_inventory) || return 0; }
+    wsid=$(fm_backend_cmux_id_in_inventory "$inventory" "$expected_title")
+    [ -n "$wsid" ] || { FM_BACKEND_CMUX_PRESENCE=absent; return 0; }
+  fi
+  sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
+  [ -n "$sfid" ] || return 0
+  FM_BACKEND_CMUX_WORKSPACE=$wsid
+  FM_BACKEND_CMUX_SURFACE=$sfid
+  FM_BACKEND_CMUX_PRESENCE=present
+}
+
+fm_backend_cmux_target_presence() {  # <target> [expected-label] -> present|absent|unknown
+  fm_backend_cmux_presence_probe "$@"
+  printf '%s' "$FM_BACKEND_CMUX_PRESENCE"
 }
 
 # fm_backend_cmux_current_path: the live foreground process's cwd, or empty on

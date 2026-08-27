@@ -156,6 +156,18 @@ cmux is experimental, GUI-first, macOS-only, and can be selected explicitly or b
 cmux's container shape is one workspace per task with one surface, no per-home container split; workspace titles are scoped by the active home label plus a short hash of the resolved `FM_ROOT` path, and `--secondmate` spawns are refused, mirroring Orca.
 Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectable as a runtime backend.
 
+### Endpoint presence is tri-state
+
+Asking a backend whether a recorded endpoint is still there has three answers, not two: present, absent, or unknown.
+`absent` is a positive finding - the observation succeeded, covered the endpoint's whole scope, and showed it gone (or showed that id now belonging to something else).
+`unknown` is everything a boolean used to collapse into "gone": a CLI error, an unreachable server, an unparseable response, a missing tool, a malformed target, or an inventory whose scope cannot cover the endpoint.
+Absence of evidence is not evidence of absence, and treating it as such is how a transient backend failure gets a live worker's endpoint reclaimed.
+
+`bin/fm-backend.sh` owns the vocabulary and dispatches to each adapter's conforming classifier, so no backend holds a private variant and a backend with no classifier reports unknown rather than absent.
+Only `absent` may license a destructive or reclaiming action: erasing a durable endpoint record, replacing a pane, or handing a worktree back.
+Every consumer treats `unknown` as "still there for all we know" and refuses or defers with a message naming what it could not observe - the session-start digest reports such an endpoint `unknown` rather than dead, the structured fleet view leaves its `exists` field null, the busy classifier reports it unreadable rather than dead, and cleanup retains every durable record so a later rerun can retry the close.
+Each backend doc's "Endpoint presence" section records what counts as positive evidence on that backend and why.
+
 ## Worktrees, not branches in your checkout
 
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.

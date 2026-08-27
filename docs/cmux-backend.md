@@ -83,6 +83,20 @@ Workspace UUIDs are not stable across an app relaunch, so recovery searches by t
 
 ## Current operation and safety
 
+### Endpoint presence
+
+Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
+An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+
+For cmux, "could not cover the endpoint" is the load-bearing case: `workspace list` with no `--window` is scoped to the current window only, so a task workspace sitting in another window is invisible to it.
+A scoped miss is therefore a limit of what was observed and never evidence the workspace is gone.
+Absence needs the whole-app inventory, which walks `list-windows` and asks each window for its own scoped list, and which refuses to answer at all if any of those reads fails - a partial inventory can prove a workspace present but never prove one absent.
+The cheap current-window lookup is still tried first, so the common case costs exactly what it always did and the sweep is paid only when that view cannot see the endpoint.
+
+A readable `list-panes` response that omits the recorded surface is absent, and so is a complete inventory that holds neither the recorded workspace id nor the expected title.
+When the owning task label is known, a workspace id reused under a different title is also absent, because the title is the identity that survives an app relaunch while ids do not.
+Every failed or unparseable read is unknown.
+
 A genuinely fresh surface returns an internal error from `read-screen` until something has been written.
 Target readiness therefore uses the structural `list-panes` response instead of a content read.
 Capture remains bounded and locally trimmed after `read-screen` becomes available.
@@ -119,13 +133,15 @@ Real tests share the captain's running app rather than creating an isolated cmux
 - There is no native busy or push-event signal.
 - A target can disappear after structural readiness and before the operation.
 - The only-workspace cleanup path leaves a fresh default workspace and cannot close the window.
-- Label lookup and recovery are currently scoped to the current cmux window, so a task moved to a non-current window is a known recovery blind spot.
+- Label lookup and endpoint presence sweep every window, so a task moved to a non-current window is found rather than read as gone.
+  Orphan discovery (`fm_backend_cmux_list_live`) is still scoped to the current window; it produces a listing rather than a liveness verdict and has no consumer today.
 - Workspace ids do not survive app relaunch and are never recovery authority.
 
 ## Regression entry points
 
 ```sh
 tests/fm-backend-cmux.test.sh
+tests/fm-backend-presence.test.sh
 tests/fm-backend-cmux-smoke.test.sh
 ```
 

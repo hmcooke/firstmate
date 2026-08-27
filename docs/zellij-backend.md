@@ -60,6 +60,15 @@ An explicit raw `session:pane` target remains a pane-existence-only operator esc
 
 ## Current operation and safety
 
+### Endpoint presence
+
+Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
+An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+
+The Zellij verdict captures each read's exit status separately, because `list-sessions` and `action list-panes --json` report a failed query and an empty result identically once their output is piped.
+A successful session list that omits the session, or a successful pane list that omits the pane, is absent; when the owning task label is supplied, a pane that is live but positively belongs to a differently named tab is also absent, because its numeric id has been reused.
+A failed read, an unparseable body, an unreadable tab list, or a malformed target is unknown.
+
 Zellij's CLI action commands return exit 0 even for missing sessions or panes.
 The adapter therefore verifies session, terminal pane, and expected title before an operation and validates JSON or integer response shapes afterward.
 A pane can still disappear between verification and the operation; downstream submit, worktree-discovery, and stale detection report that narrow race rather than treating exit 0 as success.
@@ -106,6 +115,7 @@ Real test cleanup uses only an isolated non-`firstmate` session and the guard in
 
 ```sh
 tests/fm-backend-zellij.test.sh
+tests/fm-backend-presence.test.sh
 tests/fm-backend-zellij-smoke.test.sh
 ```
 

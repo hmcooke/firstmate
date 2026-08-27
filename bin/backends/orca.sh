@@ -223,6 +223,59 @@ if (r.terminal && Array.isArray(r.terminal.tail)) {
 '
 }
 
+# fm_backend_orca_target_presence: the tri-state endpoint-presence verdict for
+# one recorded terminal id. See bin/fm-backend.sh's fm_backend_target_presence
+# for the shared vocabulary.
+#
+# Orca exposes no terminal INVENTORY, so the only positive evidence of absence
+# available is a structured `ok:false` whose error names the terminal as not
+# found. Everything else - the orca CLI missing, a non-zero exit with no JSON
+# body, an unparseable body, or an `ok:false` carrying any other error code
+# (the runtime being unavailable, an auth failure) - is a read we could not
+# complete and stays unknown.
+#
+# UNVERIFIED against a real Orca build: orca is not installed on the
+# verification machine (docs/orca-backend.md), so the exact not-found error
+# code Orca emits for a closed terminal is matched defensively by shape rather
+# than pinned to one verified string. The failure direction of a wrong guess is
+# deliberate: an unmatched code reads unknown, which refuses, never absent.
+fm_backend_orca_target_presence() {  # <terminal-id> -> present|absent|unknown
+  local terminal=$1 out verdict
+  [ -n "$terminal" ] || { printf 'unknown'; return 0; }
+  command -v orca >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  # The verdict comes from the JSON body, never from the exit status: a
+  # business-logic "no such terminal" is a normal answer to this question, not
+  # a failed call, and Orca is free to report it with either exit code.
+  out=$(orca terminal read --terminal "$terminal" --limit 1 --json 2>/dev/null) || true
+  # shellcheck disable=SC2016  # Single quotes are deliberate: the snippet is Node source.
+  verdict=$(printf '%s' "$out" | node -e '
+const fs = require("fs");
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(0, "utf8"));
+} catch (err) {
+  process.stdout.write("unknown");
+  process.exit(0);
+}
+if (!data || typeof data !== "object") {
+  process.stdout.write("unknown");
+  process.exit(0);
+}
+if (data.ok === false) {
+  const err = data.error || {};
+  const notFound = /not[_ -]?found|no such|unknown[_ -]?terminal|does not exist/i;
+  const names = String(err.code || "") + " " + String(err.message || "");
+  process.stdout.write(notFound.test(names) ? "absent" : "unknown");
+  process.exit(0);
+}
+process.stdout.write("present");
+' 2>/dev/null) || verdict=
+  case "$verdict" in
+    present|absent|unknown) printf '%s' "$verdict" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # fm_backend_orca_composer_capture: the orca composer screen - one bounded
 # tail read of the live terminal. Deliberately NOT the old 200-line
 # backward-paged read: the composer is bottom-anchored, and paging back into

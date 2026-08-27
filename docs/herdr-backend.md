@@ -254,6 +254,15 @@ No Herdr-specific copy of that protocol exists.
 
 ## Restart and liveness behavior
 
+### Endpoint presence
+
+Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
+An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+
+The Herdr verdict comes from the structured `pane get` response, never from its exit status, because a business-logic "not found" is a normal answer here rather than a failed call.
+A structured `pane_not_found` is absent, a response whose echoed pane id round-trips is present, and everything else - an unreachable server, an unparseable body, a response shape that stops echoing the id, a malformed target - is unknown.
+That is the same conservative classifier the husk check and the agent-liveness probe below already used; the presence verdict now exposes it to every consumer instead of collapsing an unreadable pane into "gone".
+
 Stopping and restarting a named Herdr server preserves workspace, tab, pane, and label ids, but the underlying harness processes and live agent registrations do not survive.
 A restored same-labeled tab with a missing pane or no registered agent is a husk.
 Create replaces only a confidently dead or no-agent husk, creates the replacement before closing the old tab, and refuses live or unknown states.
@@ -324,6 +333,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 
 ```sh
 tests/fm-backend-herdr.test.sh
+tests/fm-backend-presence.test.sh
 tests/fm-backend-herdr-smoke.test.sh
 tests/fm-backend-herdr-prune-safety-e2e.test.sh
 tests/fm-backend-herdr-respawn-idem-e2e.test.sh

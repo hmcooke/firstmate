@@ -64,6 +64,15 @@ case "${1:-}" in
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
   list-windows) exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence), one selector alias per line. This fake
+    # models every target in this suite as live, matching display-message above,
+    # so a refusal here is always about the decision ledger, never the endpoint.
+    printf '%s\n' '%1' 'sess' 'sess:elsewhere' 'sess:fm-domain' \
+      'sess:fm-t1' 'sess:fm-t2' 'sess:fm-t3' 'sess:fm-t4' 'sess:fm-t5' \
+      'sess:fm-t6' 'sess:fm-t7' 'sess:fm-t8' 'sess:fm-t9'
+    exit 0 ;;
 esac
 exit 0
 SH

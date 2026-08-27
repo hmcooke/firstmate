@@ -98,6 +98,8 @@ Switching harness is therefore one ordinary relaunch rather than a separate mech
   zellij, orca, and cmux are refused rather than reported as successful blind.
 - An ambiguous or unreadable endpoint state refuses.
   Only a positively classified state acts.
+- Endpoint presence is tri-state, not a boolean: present, absent, or unknown, where absence needs positive evidence and every failed, timed-out, or scope-limited observation is unknown ([architecture](architecture.md#endpoint-presence-is-tri-state)).
+  This plane treats unknown as "still there for all we know", so an endpoint that cannot be observed refuses rather than being acted on as gone.
 - `fm-spawn --relaunch` independently refuses unless the recorded endpoint is positively agent-free and its shell is sitting in the recorded worktree, so a replacement can never join a live agent or start outside the copy holding the work.
 
 ## Capability matrix

@@ -504,11 +504,16 @@ task_json_lines() {
       fi
     else
       if [ -n "$target" ]; then
-        if fm_backend_target_exists "$backend" "$target" "fm-$id" >/dev/null 2>&1; then
-          endpoint_exists=true
-        else
-          endpoint_exists=false
-        fi
+        # Tri-state, not a boolean: exists:false is a claim the endpoint is
+        # gone, and recovery reads it that way, so an endpoint the backend
+        # could not be asked about stays null (bin/fm-backend.sh's
+        # fm_backend_target_presence) - the same value an unreachable remote
+        # already reports above.
+        case "$(fm_backend_target_presence "$backend" "$target" "fm-$id" 2>/dev/null)" in
+          present) endpoint_exists=true ;;
+          absent) endpoint_exists=false ;;
+          *) endpoint_exists=null ;;
+        esac
       fi
       if [ "$kind" = secondmate ] && [ -n "$target" ]; then
         agent_alive=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null || printf unknown)
