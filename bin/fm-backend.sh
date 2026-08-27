@@ -848,6 +848,11 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
 fm_backend_target_presence() {  # <backend> <target> [expected-label] -> present|absent|unknown
   local backend=$1 target=$2 expected_label=${3:-}
   fm_backend_source "$backend" 2>/dev/null || { printf 'unknown'; return 0; }
+  # An adapter that does not implement the classifier - an older bin/backends/
+  # file paired with a newer dispatcher - answers unknown rather than erroring,
+  # so a partially updated tree refuses instead of guessing.
+  declare -F "fm_backend_${backend}_target_presence" >/dev/null 2>&1 \
+    || { printf 'unknown'; return 0; }
   case "$backend" in
     tmux) fm_backend_tmux_target_presence "$target" ;;
     herdr) fm_backend_herdr_target_presence "$target" ;;

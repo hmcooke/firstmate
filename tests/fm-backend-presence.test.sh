@@ -519,7 +519,16 @@ test_dispatcher_contract() {
   [ "$(confirmed_gone "$fb" nosuchbackend some-target)" = no ] \
     || fail "an unknown backend must never confirm an endpoint gone"
 
-  pass "fm_backend_target_presence: an unroutable backend is unknown, never absent"
+  # A partially updated tree - an adapter older than the dispatcher asking it -
+  # answers unknown rather than erroring, so it refuses instead of guessing.
+  out=$(PATH="$(probe_path "$fb")" bash -c \
+    '. "$0/bin/fm-backend.sh"
+     fm_backend_source tmux
+     unset -f fm_backend_tmux_target_presence
+     fm_backend_target_presence tmux sess:fm-task' "$ROOT")
+  [ "$out" = unknown ] || fail "an adapter with no presence classifier must answer unknown, got '$out'"
+
+  pass "fm_backend_target_presence: an unroutable backend or a classifier-less adapter is unknown, never absent"
 }
 
 test_tmux_presence
