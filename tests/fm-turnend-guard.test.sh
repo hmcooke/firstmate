@@ -1649,7 +1649,7 @@ test_hook_claude_mode_secondmate_reblocks_like_primary() {
 # session records itself as the lock owner exactly as a real session does at
 # session start; with 0 it leaves state/.lock exactly as the test seeded it.
 run_hook_session() {  # <dir> <own-lock> [<guard-flag>]
-  local dir=$1 own=$2 flag=${3:---claude} home
+  local dir=$1 own=$2 flag=${3---claude} home
   home=$(cd "$dir" && pwd)
   # shellcheck disable=SC2016 # the fake harness expands FM_HOME inside its child shell.
   FM_GUARD_FLAG="$flag" FM_OWN_LOCK="$own" FM_HOME="$home" "$dir/fake-claude" -c '
@@ -1702,8 +1702,14 @@ test_hook_lock_owning_session_blocks_unchanged() {
   out=$(run_hook_session "$dir" 1); status=$?
   expect_code 2 "$status" "the session holding the home lock must still be blocked from ending blind"
   assert_contains "$out" "TURN WOULD END BLIND" "the owning session's block must carry the blind-turn banner"
+  assert_contains "$out" "The Stop-owned auto-arm did not claim this home either" \
+    "the --claude ownership case must carry the Claude-only auto-arm banner"
   assert_not_contains "$out" "read-only" "the owning session must never be treated as a read-only non-owner"
   assert_present "$dir/state/.turnend-claude-blocks" "the owning session's block must consume the bounded block budget"
+  out=$(run_hook_session "$dir" 1 ''); status=$?
+  expect_code 2 "$status" "the default-mode session holding the home lock must still be blocked from ending blind"
+  assert_not_contains "$out" "The Stop-owned auto-arm did not claim this home either" \
+    "the default-mode ownership case must not carry the Claude-only auto-arm banner"
   pass "fm-turnend-guard: the session holding the home lock keeps its unchanged blocking behavior"
 }
 
