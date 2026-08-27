@@ -6,6 +6,11 @@
 # Until then polling is a hard no-op; replies can still run in FMX_DRY_RUN
 # preview mode without a token.
 #
+# Its private-artifact primitives (fmx_private_artifact_*, fmx_single_link_*) are
+# generic 0600/0700 publication and validation helpers rather than Relay-specific
+# ones, and the agent-to-agent letterbox (bin/fm-letterbox-lib.sh) sources this
+# file to reuse them instead of keeping a second copy of that contract.
+#
 # This file is sourced, never executed. It defines:
 #   fmx_env_get <key> <file>   - read one KEY=VALUE from a .env-style file
 #   fmx_load_config            - resolve FMX_TOKEN, FMX_RELAY, FMX_DRY, FMX_MAX,

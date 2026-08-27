@@ -445,6 +445,12 @@ The session-start digest separately prints an "Public commitments awaiting deliv
 `FM_PF_RETRY_BACKOFF_SECS` (default 900) sets the next-attempt time recorded with a retryable delivery error.
 See [verification/public-followup.md](verification/public-followup.md) for the current maintainer evidence behind the restart end-to-end and the relay-disabled zero-overhead guarantee.
 
+## Agent-to-agent letterbox (.env)
+
+The letterbox is an optional peer correspondence channel that ships inert and activates only when a home's gitignored `.env` carries all four of `FM_LETTERBOX_REPO`, `FM_LETTERBOX_SELF`, `FM_LETTERBOX_PEER`, and `FM_LETTERBOX_TRANSPORT`.
+[letterbox.md](letterbox.md) is the single owner of its activation settings, optional tuning, generated artifacts, home-local state layout, and safety preconditions.
+`bin/fm-letterbox.sh --help` owns exact commands and flags.
+
 ## Process-to-event sources (state/procevent)
 
 A long-polling external process is registered as a *source* through its adapter, whose header and `--help` own the commands and flags.
