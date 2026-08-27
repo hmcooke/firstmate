@@ -16,8 +16,11 @@
 #   - absent requires POSITIVE evidence: a successful, in-scope observation
 #     that shows the recorded endpoint gone, or a definitive server-is-not-
 #     running answer that proves no endpoint can exist.
-#   - Every failed, unparseable, scope-limited, or tool-missing observation is
-#     unknown, for all five adapters.
+#   - Every failed, timed-out, unparseable, scope-limited, or tool-missing
+#     observation is unknown, for all five adapters. A timed-out read is driven
+#     as the exit status `timeout` itself returns, since none of these
+#     primitives carries its own deadline - a deadline belongs to the caller,
+#     and this is what its expiry looks like to the classifier.
 #   - fm_backend_target_exists stays the boolean compatibility view of present.
 #   - fm_backend_endpoint_confirmed_gone, the gate cleanup uses before erasing
 #     a durable endpoint record, is true only for absent.
@@ -134,6 +137,8 @@ case "\${1:-}" in
         printf '%s\n' 'permission denied' >&2; exit 1 ;;
       silent-failure)
         exit 1 ;;
+      timed-out)
+        exit 124 ;;
     esac
     ;;
 esac
@@ -163,9 +168,10 @@ test_tmux_presence() {
   fb=$(make_tmux "$TMP_ROOT/tmux-no-socket" no-socket)
   expect_presence "$fb" tmux sess:fm-task absent "a missing tmux socket proves no pane can exist"
 
-  for mode in long-path denied silent-failure; do
+  for mode in long-path denied silent-failure timed-out; do
     fb=$(make_tmux "$TMP_ROOT/tmux-$mode" "$mode")
-    expect_presence "$fb" tmux sess:fm-task unknown "a failed tmux inventory ($mode) is unknown, never absent"
+    expect_presence "$fb" tmux sess:fm-task unknown \
+      "a failed or timed-out tmux inventory ($mode) is unknown, never absent"
     [ "$(confirmed_gone "$fb" tmux sess:fm-task)" = no ] \
       || fail "a failed tmux inventory ($mode) must never confirm the endpoint gone"
   done
@@ -271,6 +277,7 @@ for a in "\$@"; do
       case '$mode' in
         pane-gone) printf '%s\n' '[{"id":9,"is_plugin":false,"tab_id":2}]'; exit 0 ;;
         panes-fail) printf '%s\n' 'zellij: query timed out' >&2; exit 1 ;;
+        panes-timed-out) exit 124 ;;
         panes-garbage) printf '%s\n' 'not json'; exit 0 ;;
         *) printf '%s\n' '[{"id":7,"is_plugin":false,"tab_id":2}]'; exit 0 ;;
       esac
@@ -306,9 +313,10 @@ test_zellij_presence() {
   fb=$(make_zellij "$TMP_ROOT/zellij-session-gone" session-gone)
   expect_presence "$fb" zellij sess:7 absent "a readable session list that omits the session is absence"
 
-  for mode in sessions-fail panes-fail panes-garbage; do
+  for mode in sessions-fail panes-fail panes-timed-out panes-garbage; do
     fb=$(make_zellij "$TMP_ROOT/zellij-$mode" "$mode")
-    expect_presence "$fb" zellij sess:7 unknown "a failed zellij read ($mode) is unknown, never absent"
+    expect_presence "$fb" zellij sess:7 unknown \
+      "a failed or timed-out zellij read ($mode) is unknown, never absent"
     [ "$(confirmed_gone "$fb" zellij sess:7)" = no ] \
       || fail "a failed zellij read ($mode) must never confirm the endpoint gone"
   done
@@ -347,6 +355,7 @@ case '$mode' in
   gone) printf '%s\n' '{"ok":false,"error":{"code":"terminal_not_found","message":"no such terminal"}}'; exit 0 ;;
   other-error) printf '%s\n' '{"ok":false,"error":{"code":"runtime_unavailable","message":"runtime down"}}'; exit 0 ;;
   transport) printf '%s\n' 'orca: runtime not reachable' >&2; exit 1 ;;
+  timed-out) exit 124 ;;
   garbage) printf '%s\n' 'not json'; exit 0 ;;
 esac
 exit 1
@@ -367,9 +376,10 @@ test_orca_presence() {
   expect_presence "$fb" orca term-1 absent "a structured not-found is positive evidence of absence"
   [ "$(confirmed_gone "$fb" orca term-1)" = yes ] || fail "an orca not-found must be confirmed gone"
 
-  for mode in other-error transport garbage no-cli; do
+  for mode in other-error transport timed-out garbage no-cli; do
     fb=$(make_orca "$TMP_ROOT/orca-$mode" "$mode")
-    expect_presence "$fb" orca term-1 unknown "a failed orca read ($mode) is unknown, never absent"
+    expect_presence "$fb" orca term-1 unknown \
+      "a failed or timed-out orca read ($mode) is unknown, never absent"
     [ "$(confirmed_gone "$fb" orca term-1)" = no ] \
       || fail "a failed orca read ($mode) must never confirm the endpoint gone"
   done
@@ -425,6 +435,7 @@ fi
 if [ "\${1:-}" = list-panes ]; then
   case '$mode' in
     panes-fail|workspace-gone-panes-fail) printf '%s\n' 'error: control socket closed' >&2; exit 1 ;;
+    panes-timed-out) exit 124 ;;
     panes-garbage) printf '%s\n' 'not json'; exit 0 ;;
     surface-gone) printf '%s\n' '{"panes":[{"selected_surface_id":"eeeeeeee-4444-4444-4444-444444444444","surface_ids":["eeeeeeee-4444-4444-4444-444444444444"]}]}'; exit 0 ;;
     *) printf '%s\n' '{"panes":[{"selected_surface_id":"$CMUX_SF","surface_ids":["$CMUX_SF"]}]}' ;;
@@ -473,10 +484,10 @@ test_cmux_presence() {
 
   # An unreadable pane list on a workspace the inventory still holds is a read
   # we could not finish, not proof the surface went away.
-  for mode in panes-fail panes-garbage; do
+  for mode in panes-fail panes-timed-out panes-garbage; do
     fb=$(make_cmux "$TMP_ROOT/cmux-$mode" "$mode" "$title")
     expect_presence "$fb" cmux "$CMUX_WS:$CMUX_SF" unknown \
-      "a failed cmux pane read ($mode) is unknown, never absent"
+      "a failed or timed-out cmux pane read ($mode) is unknown, never absent"
     [ "$(confirmed_gone "$fb" cmux "$CMUX_WS:$CMUX_SF")" = no ] \
       || fail "a failed cmux pane read ($mode) must never confirm the endpoint gone"
   done
