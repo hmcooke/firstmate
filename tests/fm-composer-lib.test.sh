@@ -135,6 +135,128 @@ test_real_text_is_pending() {
 }
 
 # =============================================================================
+# The glyph-plus-whitespace predicate (issue #1988).
+#
+# The load-bearing question every backend adapter asks is "is this row a
+# verified AGENT prompt glyph followed only by whitespace?", because an
+# affirmative `empty` is the only verdict the away-mode injector will type
+# into. Claude draws its empty composer as `❯` + U+00A0 NO-BREAK SPACE, so the
+# answer must not depend on which whitespace alphabet the ambient locale
+# happens to know: the same live pane once read `empty` under a UTF-8 shell and
+# `pending` under LC_ALL=C, which deferred every escalation in daemon contexts.
+#
+# The table below is declared INDEPENDENTLY of the library's own
+# FM_COMPOSER_UNICODE_SPACES, from Unicode's White_Space=Yes property, so this
+# coverage cannot go vacuous: dropping a code point from the library fails the
+# matching case here instead of silently shrinking what is tested. A future
+# harness that separates its glyph from its composer with a different space is
+# the recurrence this pins.
+#
+# ASCII space and tab are the only ASCII members included: the rest of the
+# ASCII whitespace block (LF, VT, FF, CR) separates captured ROWS and can never
+# appear inside one, so asserting it here would pin a shape no capture produces.
+#
+# The escapes are octal for the same reason the library's are: `$'\uXXXX'` is
+# bash 4.2+, and on the bash 3.2 macOS still ships it expands literally and
+# would silently assert nothing.
+# =============================================================================
+
+# <label>:<octal UTF-8 bytes> for one Unicode White_Space=Yes code point each.
+WHITESPACE_FORMS=(
+  'U+0009 CHARACTER TABULATION:\011'
+  'U+0020 SPACE:\040'
+  'U+0085 NEXT LINE:\0302\0205'
+  'U+00A0 NO-BREAK SPACE:\0302\0240'
+  'U+1680 OGHAM SPACE MARK:\0341\0232\0200'
+  'U+2000 EN QUAD:\0342\0200\0200'
+  'U+2001 EM QUAD:\0342\0200\0201'
+  'U+2002 EN SPACE:\0342\0200\0202'
+  'U+2003 EM SPACE:\0342\0200\0203'
+  'U+2004 THREE-PER-EM SPACE:\0342\0200\0204'
+  'U+2005 FOUR-PER-EM SPACE:\0342\0200\0205'
+  'U+2006 SIX-PER-EM SPACE:\0342\0200\0206'
+  'U+2007 FIGURE SPACE:\0342\0200\0207'
+  'U+2008 PUNCTUATION SPACE:\0342\0200\0210'
+  'U+2009 THIN SPACE:\0342\0200\0211'
+  'U+200A HAIR SPACE:\0342\0200\0212'
+  'U+2028 LINE SEPARATOR:\0342\0200\0250'
+  'U+2029 PARAGRAPH SEPARATOR:\0342\0200\0251'
+  'U+202F NARROW NO-BREAK SPACE:\0342\0200\0257'
+  'U+205F MEDIUM MATHEMATICAL SPACE:\0342\0201\0237'
+  'U+3000 IDEOGRAPHIC SPACE:\0343\0200\0200'
+)
+
+# Format characters a reader may mistake for blanks. Unicode gives both
+# White_Space=No, and the library deliberately omits them: folding them in
+# would substitute a guess for the property the library claims to follow, and
+# would widen the surface the injector types into.
+NON_WHITESPACE_FORMS=(
+  'U+200B ZERO WIDTH SPACE:\0342\0200\0213'
+  'U+FEFF ZERO WIDTH NO-BREAK SPACE:\0357\0273\0277'
+)
+
+AGENT_GLYPHS=('❯' '›' '⟩' '→')
+SHELL_GLYPHS=('>' '$' '%' '#')
+
+# assert_classify <label> <want> <bordered> <content>: one content verdict,
+# asserted under the ambient UTF-8 locale AND LC_ALL=C. Both run inside command
+# substitution, so the LC_ALL override cannot leak into the next case.
+assert_classify() {
+  local label=$1 want=$2 bordered=$3 content=$4 out
+  out=$(fm_composer_classify_content "$bordered" "$content")
+  [ "$out" = "$want" ] || fail "$label: expected $want, got '$out'"
+  out=$(LC_ALL=C fm_composer_classify_content "$bordered" "$content")
+  [ "$out" = "$want" ] || fail "$label under LC_ALL=C: expected $want, got '$out'"
+}
+
+test_agent_glyph_then_whitespace_is_empty() {
+  local form label ws glyph
+  for form in "${WHITESPACE_FORMS[@]}"; do
+    label=${form%%:*}
+    printf -v ws '%b' "${form#*:}"
+    for glyph in "${AGENT_GLYPHS[@]}"; do
+      assert_classify "bare '$glyph' + $label" empty 0 "${glyph}${ws}"
+      assert_classify "bordered '$glyph' + $label" empty 1 "${glyph}${ws}"
+    done
+  done
+  pass "fm_composer_classify_content: a verified agent glyph followed only by Unicode whitespace reads empty in both locales"
+}
+
+test_shell_glyph_then_whitespace_keeps_the_safety_rule() {
+  local form label ws glyph
+  for form in "${WHITESPACE_FORMS[@]}"; do
+    label=${form%%:*}
+    printf -v ws '%b' "${form#*:}"
+    for glyph in "${SHELL_GLYPHS[@]}"; do
+      # The dead-shell rule: widening the whitespace alphabet must never
+      # promote a bare shell prompt into an injectable empty composer.
+      assert_classify "bare '$glyph' + $label" unknown 0 "${glyph}${ws}"
+      # ...and must never demote the harness's own prompt inside a box.
+      assert_classify "bordered '$glyph' + $label" empty 1 "${glyph}${ws}"
+    done
+  done
+  pass "fm_composer_classify_content: a bare shell glyph plus any whitespace form stays unknown, bordered stays empty"
+}
+
+test_glyph_then_non_whitespace_is_pending() {
+  local form label ws glyph
+  for glyph in "${AGENT_GLYPHS[@]}"; do
+    assert_classify "bare '$glyph' + typed text" pending 0 "${glyph} fix the login bug"
+  done
+  # A zero-width format character is NOT whitespace here. Reading it as blank
+  # would report an empty composer for a row that carries a character, so these
+  # must stay non-empty even though they render as nothing.
+  for form in "${NON_WHITESPACE_FORMS[@]}"; do
+    label=${form%%:*}
+    printf -v ws '%b' "${form#*:}"
+    for glyph in "${AGENT_GLYPHS[@]}"; do
+      assert_classify "bare '$glyph' + $label" pending 0 "${glyph}${ws}"
+    done
+  done
+  pass "fm_composer_classify_content: typed text and zero-width format characters after a glyph stay non-empty"
+}
+
+# =============================================================================
 # fm_composer_classify_screen: the adapter-facing screen classifier and the
 # correctness matrix (audit data/fm-composer-consolidation-audit-s1, task
 # fm-composer-thin-adapter-refactor-r1).
@@ -186,6 +308,40 @@ test_matrix_claude_bare_nbsp_row() {
   # the styled=0 degradation defers instead of fabricating pending.
   assert_screen "claude typed on plain backends" unknown "$CAPS_PLAIN" "$typed"
   pass "matrix: claude's ❯+NBSP row reads empty on every profile in both locales (#1988)"
+}
+
+test_matrix_bare_row_survives_every_whitespace_form() {
+  # The same predicate through the adapter-facing entry point every backend
+  # actually calls. WHITESPACE_FORMS is the independent table declared above,
+  # so a future harness separating its glyph with any other Unicode space is
+  # already covered, and narrowing the library's set fails here.
+  local form label ws glyph screen shell agent_box shell_box box_want padding
+  printf -v padding '%21s' ''
+  for form in "${WHITESPACE_FORMS[@]}"; do
+    label=${form%%:*}
+    printf -v ws '%b' "${form#*:}"
+    for glyph in "${AGENT_GLYPHS[@]}"; do
+      screen=$'transcript line\n────────────────────────\n'"${glyph}${ws}"$'\n────────────────────────'
+      assert_screen "bare '$glyph' + $label on tmux" empty "$CAPS_TMUX" "$screen" 2 probe-absent
+      assert_screen "bare '$glyph' + $label on cmux/orca" empty "$CAPS_PLAIN" "$screen"
+    done
+    shell=$'transcript line\n────────────────────────\n$'"$ws"$'\n────────────────────────'
+    assert_screen "dead shell '\$' + $label on tmux" unknown "$CAPS_TMUX" "$shell" 2 probe-absent
+    assert_screen "dead shell '\$' + $label on cmux/orca" unknown "$CAPS_PLAIN" "$shell"
+
+    box_want=empty
+    if [ "$label" = 'U+0009 CHARACTER TABULATION' ]; then
+      # A tab is ASCII, so neither the Unicode-space fold nor the [!-~] map
+      # touches it, leaving a literal tab that cannot equal the all-spaces
+      # width. Geometry ambiguity correctly degrades to unknown.
+      box_want=unknown
+    fi
+    agent_box=$'╭────────────────────────╮\n│ ❯'"${ws}${padding}"$'│\n╰────────────────────────╯'
+    assert_screen "bordered agent glyph + $label" "$box_want" "$CAPS_PLAIN" "$agent_box"
+    shell_box=$'╭────────────────────────╮\n│ $'"${ws}${padding}"$'│\n╰────────────────────────╯'
+    assert_screen "bordered shell glyph + $label" "$box_want" "$CAPS_PLAIN" "$shell_box"
+  done
+  pass "matrix: all bare agent glyphs plus bordered agent and shell glyphs survive every Unicode whitespace form"
 }
 
 test_matrix_codex_dim_hint_row() {
@@ -607,7 +763,11 @@ test_empty_content_is_empty
 test_idle_placeholder_is_empty
 test_idle_placeholder_case_mode_is_explicit
 test_real_text_is_pending
+test_agent_glyph_then_whitespace_is_empty
+test_shell_glyph_then_whitespace_keeps_the_safety_rule
+test_glyph_then_non_whitespace_is_pending
 test_matrix_claude_bare_nbsp_row
+test_matrix_bare_row_survives_every_whitespace_form
 test_matrix_codex_dim_hint_row
 test_matrix_muse_truecolor_glyph_survives_signal_loss
 test_matrix_cursor_reverse_video_placeholder_remnant
