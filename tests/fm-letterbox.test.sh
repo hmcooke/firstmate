@@ -735,30 +735,70 @@ test_an_ack_on_any_other_class_leaves_the_exchange_open() {
   pass "an ack on a class other than notice leaves the letter open, as an owed answer"
 }
 
-test_a_claim_whose_stash_is_missing_is_redone_not_treated_as_done() {
-  local home store fakebin out id
-  read -r home store fakebin <<< "$(fixture crash-stash | tr '\n' ' ')"
+test_a_letter_announced_but_not_yet_claimed_is_announced_again() {
+  local home store fakebin out id claims
+  read -r home store fakebin <<< "$(fixture crash-claim | tr '\n' ' ')"
   id=archie-20260824T140311Z-9f2c1ab4
   inject_letter "$store" "$id" fact-lookup "q" "the content that must survive" >/dev/null
   out=$(run_poll "$home" "$store" "$fakebin")
   assert_contains "$out" "new $id" "the first intake must announce"
-  # The crash window the receiver order exists for: the claim landed, the stash
-  # did not (or was lost afterwards). A claim alone never proves the letter's
-  # content survived, so the intake is incomplete and must be redone.
+  assert_present "$home/state/letterbox/claims/$id.json" "the claim must be taken after the announcement"
+
+  # The crash window claim-last exists for: the card was stashed and announced,
+  # and the process died before the claim landed. Losing a letter is
+  # unrecoverable and announcing one twice is not, so the next poll must
+  # announce it again rather than assume it was handled.
+  rm -f "$home/state/letterbox/claims/$id.json"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "new $id" "an unclaimed card must be announced again (at-least-once)"
+  assert_present "$home/state/letterbox/claims/$id.json" "the repeat must complete the claim"
+  assert_grep "the content that must survive" "$home/state/letterbox/inbox/$id.json" \
+    "the repeated intake must leave the full content stashed"
+  claims=$(count_files "$home/state/letterbox/claims")
+  [ "$claims" = 1 ] || fail "one card must produce one claim, not $claims"
+
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "once the claim exists the card is complete and silent (got: $out)"
+  pass "a card announced but not yet claimed is announced again: announcement is at-least-once"
+}
+
+test_a_claimed_letter_is_not_reannounced_when_its_stash_is_removed() {
+  local home store fakebin out id
+  read -r home store fakebin <<< "$(fixture claim-boundary | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$id" fact-lookup "q" "please answer" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "new $id" "the first intake must announce"
+  # The claim is taken last, so its presence proves the card was stashed AND
+  # announced. A stash removed afterwards is a lost cache entry, not an
+  # unannounced letter, and the forge remains the record.
   rm -f "$home/state/letterbox/inbox/$id.json"
   out=$(run_poll "$home" "$store" "$fakebin")
-  assert_contains "$out" "new $id" "a claim with no stash must be re-announced, not treated as done"
-  assert_present "$home/state/letterbox/inbox/$id.json" "the poll must re-stash the letter"
-  assert_grep "the content that must survive" "$home/state/letterbox/inbox/$id.json" \
-    "the re-stash must recover the full content"
-  out=$(run_poll "$home" "$store" "$fakebin")
-  [ -z "$out" ] || fail "once stash and claim are both present the intake is complete (got: $out)"
-  pass "a claim whose inbox stash is missing is an incomplete intake and is redone"
+  [ -z "$out" ] || fail "a claimed card must not be re-announced (got: $out)"
+  pass "the claim is the completion boundary: a claimed card is never re-announced"
+}
+
+test_reply_works_before_the_claim_exists() {
+  local home store fakebin out number id
+  read -r home store fakebin <<< "$(fixture reply-unclaimed | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  number=$(inject_letter "$store" "$id" fact-lookup "q" "please answer")
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  # The at-least-once window: a handling turn can reach the letter before its
+  # claim landed, so replying must work from the stashed card alone.
+  rm -f "$home/state/letterbox/claims/$id.json"
+  printf 'the answer\n' > "$home/reply.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" reply "$id" --status answered --file "$home/reply.txt") \
+    || fail "reply must work before the claim exists: $out"
+  assert_grep "in-reply-to: $id" "$store/comments-$number.json" "the reply must be posted"
+  assert_grep '"replied":"answered"' <(jq -c . "$home/state/letterbox/claims/$id.json") \
+    "replying must create the claim it records itself in"
+  pass "a reply works inside the at-least-once window, before the claim exists"
 }
 
 test_an_answered_letter_is_not_redone_when_its_stash_is_cleaned_up() {
   local home store fakebin out id
-  read -r home store fakebin <<< "$(fixture crash-answered | tr '\n' ' ')"
+  read -r home store fakebin <<< "$(fixture answered-cleanup | tr '\n' ' ')"
   id=archie-20260824T140311Z-9f2c1ab4
   inject_letter "$store" "$id" fact-lookup "q" "please answer" >/dev/null
   run_poll "$home" "$store" "$fakebin" >/dev/null
@@ -969,7 +1009,9 @@ test_reply_refuses_a_letter_this_estate_sent
 test_close_refuses_without_a_terminal_reply_and_refuses_a_received_letter
 test_a_notice_ack_is_the_terminal_reply_that_closes_the_exchange
 test_an_ack_on_any_other_class_leaves_the_exchange_open
-test_a_claim_whose_stash_is_missing_is_redone_not_treated_as_done
+test_a_letter_announced_but_not_yet_claimed_is_announced_again
+test_a_claimed_letter_is_not_reannounced_when_its_stash_is_removed
+test_reply_works_before_the_claim_exists
 test_an_answered_letter_is_not_redone_when_its_stash_is_cleaned_up
 test_a_refused_card_is_not_redone_for_having_no_stash
 test_close_interrupted_after_the_forge_close_re_closes_harmlessly

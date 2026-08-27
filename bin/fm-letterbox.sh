@@ -377,7 +377,7 @@ cmd_send() {
 }
 
 cmd_reply() {
-  local id=${1-} status='' file='' number reply_id class
+  local id=${1-} status='' file='' number reply_id class sender stash
   shift 2>/dev/null || true
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -391,13 +391,29 @@ cmd_reply() {
   lb_status_allowed "$status" \
     || die "status ${status:-<none>} is not a reply status (ack, answered, declined, unable, accepted-for-review, expired)"
   [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || die "reply needs a readable --file"
-  lb_claim_exists "$STATE" "$id" || die "no claimed letter $id in this home"
-  [ "$(lb_claim_field "$STATE" "$id" from)" = "$LB_PEER" ] \
+  # Announcement is at-least-once and the claim is taken last, so a letter can be
+  # announced and handled in the narrow window before its claim exists. The
+  # stashed card is the fallback source of truth for those fields, and the claim
+  # is created here so the reply has somewhere to record itself.
+  stash="$(lb_dir "$STATE" inbox)/$id.json"
+  if lb_claim_exists "$STATE" "$id"; then
+    sender=$(lb_claim_field "$STATE" "$id" from)
+    class=$(lb_claim_field "$STATE" "$id" class)
+    number=$(lb_claim_field "$STATE" "$id" issue)
+  elif [ -f "$stash" ] && [ ! -L "$stash" ]; then
+    sender=$(jq -r '.from // ""' "$stash" 2>/dev/null)
+    class=$(jq -r '.class // ""' "$stash" 2>/dev/null)
+    number=$(jq -r '.issue // ""' "$stash" 2>/dev/null)
+  else
+    die "no letter $id in this home"
+  fi
+  [ "$sender" = "$LB_PEER" ] \
     || die "$id was sent by this estate, not received; there is nothing here to reply to"
-  class=$(lb_claim_field "$STATE" "$id" class)
   [ "$class" != reply ] || die "$id is a reply, not a letter; replies are not themselves answered"
-  number=$(lb_claim_field "$STATE" "$id" issue)
-  case "$number" in ''|*[!0-9]*) die "the claim for $id records no issue" ;; esac
+  case "$number" in ''|*[!0-9]*) die "the record for $id names no issue" ;; esac
+  lb_claim_exists "$STATE" "$id" \
+    || lb_claim_create "$STATE" "$id" "$class" "$sender" "$number" >/dev/null 2>&1 \
+    || die "cannot record a claim for $id"
   require_sendable "reply to $id" "$file"
   ensure_dirs
   workdir

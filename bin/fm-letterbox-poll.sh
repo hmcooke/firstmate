@@ -38,12 +38,20 @@
 #   no live task past FM_LETTERBOX_STALE_SECS
 #                                       -> re-surface it once per window
 #
-# ORDERING, and it is the safety property: the body is stashed BEFORE the claim,
-# and the claim is taken BEFORE the id reaches the output line, so a crash
-# between any two steps loses nothing and the next poll simply redoes the step
-# that did not complete. A complete intake is a stash AND a claim, so a claimed
-# id whose stash is missing is treated as incomplete and redone rather than as
-# finished. docs/letterbox.md carries the full crash matrix.
+# ORDERING, and it is the safety property. The receiver's completion boundary is
+# CLAIM-LAST: stash the card, announce it, THEN take the O_EXCL claim. The claim
+# is the only marker that suppresses a future announcement, so it must not exist
+# until the announcement it suppresses has actually been made. Every other
+# suppressing write - the resurface stamp and the transport cursor - lands after
+# the announcement for the same reason.
+#
+# The consequence is deliberate and must not be designed away: ANNOUNCEMENT IS
+# AT-LEAST-ONCE. A crash between printing the line and taking the claim makes the
+# next poll announce the same card again. Losing a letter is unrecoverable;
+# announcing one twice is not, so the ordering trades the recoverable failure for
+# the unrecoverable one. EVERY CONSUMER OF AN ANNOUNCEMENT MUST THEREFORE BE
+# IDEMPOTENT ON CARD ID - the letterbox-correspondence skill owns what that means
+# for a handling turn, and docs/letterbox.md carries the full crash matrix.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -125,6 +133,48 @@ announce() {
   if [ -z "$LINE" ]; then LINE=$1; else LINE="$LINE; $1"; fi
 }
 
+# Every write that would suppress a FUTURE announcement is queued here and
+# applied only after the announcement line has been printed. Nothing in this
+# buffer may be flushed early: flushing it before the print is exactly the
+# claim-before-announce ordering that can lose a letter.
+PENDING_CLAIMS=
+PENDING_RESURFACE=
+PENDING_CURSOR=
+
+queue_claim() {
+  PENDING_CLAIMS="$PENDING_CLAIMS$1	$2	$3	$4	$5
+"
+}
+
+queue_resurface() {
+  PENDING_RESURFACE="$PENDING_RESURFACE$1
+"
+}
+
+flush_suppressions() {
+  local cid cclass cfrom cissue crefusal
+  while IFS="	" read -r cid cclass cfrom cissue crefusal; do
+    [ -n "$cid" ] || continue
+    lb_claim_create "$STATE" "$cid" "$cclass" "$cfrom" "$cissue" "$crefusal" >/dev/null 2>&1
+    case "$?" in
+      1) [ -z "$crefusal" ] || lb_claim_set "$STATE" "$cid" refusal "$crefusal" >/dev/null 2>&1 || true ;;
+    esac
+  done <<EOF
+$PENDING_CLAIMS
+EOF
+  while IFS= read -r cid; do
+    [ -n "$cid" ] || continue
+    lb_claim_set_number "$STATE" "$cid" resurfaced "$(date -u +%s)" >/dev/null 2>&1 || true
+  done <<EOF
+$PENDING_RESURFACE
+EOF
+  # The cursor suppresses future comment fetches, so an early advance could hide
+  # a reply whose announcement was lost. It lands with the other suppressions.
+  if [ -n "$PENDING_CURSOR" ] && [ -f "$PENDING_CURSOR" ]; then
+    fmx_private_artifact_publish_stdin "$ROOT" "cursor" 600 < "$PENDING_CURSOR" 2>/dev/null || true
+  fi
+}
+
 OPEN_NUMBERS=" $(jq -r '.[].number' "$OPEN_JSON" 2>/dev/null | tr '\n' ' ')"
 
 # --- inbound letters --------------------------------------------------------
@@ -151,34 +201,28 @@ while [ "$i" -lt "$COUNT" ]; do
       KEY=$LB_F_ID
       lb_id_valid "$KEY" || KEY="issue-$NUMBER"
       if ! lb_claim_exists "$STATE" "$KEY"; then
-        if lb_claim_create "$STATE" "$KEY" refused "$LB_PEER" "$NUMBER" "$LB_REFUSAL"; then
-          announce "refused $KEY $LB_REFUSAL"
-        fi
+        announce "refused $KEY $LB_REFUSAL"
+        queue_claim "$KEY" refused "$LB_PEER" "$NUMBER" "$LB_REFUSAL"
       fi
       i=$((i + 1)); continue
       ;;
   esac
 
   ID=$LB_F_ID
-  # A complete intake is stash AND claim. An id that is claimed but whose stash
-  # is missing never completed, so it is redone here rather than treated as done.
-  if lb_claim_exists "$STATE" "$ID" && ! lb_claim_incomplete "$STATE" "$ID"; then
-    i=$((i + 1)); continue
-  fi
+  # The claim is the completion boundary and is taken last, so its presence
+  # proves this card was already stashed AND announced.
+  if lb_claim_exists "$STATE" "$ID"; then i=$((i + 1)); continue; fi
 
   # Credential refusal runs BEFORE the stash, on the whole issue body, because
   # the stash is itself a place a secret would land.
   if lb_scan_refuses "$RAW"; then
-    if lb_claim_create "$STATE" "$ID" "$LB_F_CLASS" "$LB_F_FROM" "$NUMBER" "$LB_SCAN_REASON"; then
-      announce "refused $ID $LB_SCAN_REASON"
-    elif lb_claim_set "$STATE" "$ID" refusal "$LB_SCAN_REASON"; then
-      announce "refused $ID $LB_SCAN_REASON"
-    fi
+    announce "refused $ID $LB_SCAN_REASON"
+    queue_claim "$ID" "$LB_F_CLASS" "$LB_F_FROM" "$NUMBER" "$LB_SCAN_REASON"
     i=$((i + 1)); continue
   fi
 
-  # Stash first, claim second: a crash between them costs one repeated stash and
-  # never a lost letter or a duplicate announcement.
+  # Stash, announce, then claim. A crash anywhere before the claim costs one
+  # repeated stash and one repeated announcement, and never a lost letter.
   if ! jq -n --arg id "$ID" --arg kind request --arg class "$LB_F_CLASS" \
     --arg from "$LB_F_FROM" --arg to "$LB_F_TO" --arg subject "$LB_F_SUBJECT" \
     --arg issued "$LB_F_ISSUED" --arg expires "$LB_F_EXPIRES" \
@@ -191,13 +235,8 @@ while [ "$i" -lt "$COUNT" ]; do
     emit_error_once "cannot write the letterbox inbox"
     exit 0
   fi
-  # The claim follows the stash. When the claim already exists the intake was
-  # incomplete, so the re-stash above completed it and it is announced now.
-  if lb_claim_create "$STATE" "$ID" "$LB_F_CLASS" "$LB_F_FROM" "$NUMBER"; then
-    announce "new $ID $LB_F_CLASS $LB_F_FROM"
-  elif lb_claim_exists "$STATE" "$ID"; then
-    announce "new $ID $LB_F_CLASS $LB_F_FROM"
-  fi
+  announce "new $ID $LB_F_CLASS $LB_F_FROM"
+  queue_claim "$ID" "$LB_F_CLASS" "$LB_F_FROM" "$NUMBER" ""
   i=$((i + 1))
 done
 
@@ -251,7 +290,7 @@ for receipt in "$SENT"/*.receipt; do
       if [ "$LB_F_KIND" = reply ] && [ "$LB_F_IN_REPLY_TO" = "$SENT_ID" ] \
         && lb_status_terminal "$LB_F_STATUS" "$(lb_claim_field "$STATE" "$SENT_ID" class)" \
         && ! lb_claim_consumed "$STATE" "$SENT_ID" "$LB_F_ID" \
-        && { ! lb_claim_exists "$STATE" "$LB_F_ID" || lb_claim_incomplete "$STATE" "$LB_F_ID"; }; then
+        && ! lb_claim_exists "$STATE" "$LB_F_ID"; then
         if ! lb_scan_refuses "$CRAW"; then
           if jq -n --arg id "$LB_F_ID" --arg kind reply --arg correlate "$SENT_ID" \
             --arg from "$LB_F_FROM" --arg status "$LB_F_STATUS" \
@@ -260,13 +299,12 @@ for receipt in "$SENT"/*.receipt; do
             '{id:$id,kind:$kind,"in-reply-to":$correlate,from:$from,status:$status,
               issued:$issued,body:$body,issue:$issue,seen:$seen}' 2>/dev/null \
             | fmx_private_artifact_publish_stdin "$INBOX" "$LB_F_ID.json" 600; then
-            if lb_claim_create "$STATE" "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" \
-              || lb_claim_exists "$STATE" "$LB_F_ID"; then
-              announce "reply $SENT_ID $LB_F_STATUS"
-            fi
+            announce "reply $SENT_ID $LB_F_STATUS"
+            queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" ""
           fi
-        elif lb_claim_create "$STATE" "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" "$LB_SCAN_REASON"; then
+        else
           announce "refused $LB_F_ID $LB_SCAN_REASON"
+          queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" "$LB_SCAN_REASON"
         fi
       fi
     fi
@@ -274,11 +312,12 @@ for receipt in "$SENT"/*.receipt; do
   done
 
   # The cursor advances only after this letter's comments were fully scanned, so
-  # an interrupted scan is simply redone next cycle.
+  # an interrupted scan is simply redone next cycle. It is staged here and
+  # published with the other suppressing writes, after the announcement.
   jq --arg n "$SENT_NUMBER" --arg u "$UPDATED" '.[$n] = $u' "$CURSOR_JSON" > "$CURSOR_JSON.new" 2>/dev/null \
     && mv -f "$CURSOR_JSON.new" "$CURSOR_JSON" 2>/dev/null || true
 done
-fmx_private_artifact_publish_stdin "$ROOT" "cursor" 600 < "$CURSOR_JSON" 2>/dev/null || true
+PENDING_CURSOR=$CURSOR_JSON
 
 # --- the stale backstop -----------------------------------------------------
 #
@@ -313,13 +352,24 @@ for claim in "$CLAIMS"/*.json; do
   RESURFACED=$(lb_claim_field "$STATE" "$CID" resurfaced)
   case "$RESURFACED" in ''|*[!0-9]*) RESURFACED=0 ;; esac
   [ "$((NOW - RESURFACED))" -ge "$LB_STALE_SECS" ] || continue
-  lb_claim_set_number "$STATE" "$CID" resurfaced "$NOW" || continue
   announce "stale $CID $(lb_claim_field "$STATE" "$CID" class)"
+  queue_resurface "$CID"
 done
 
-[ "$ITEMS" -gt 0 ] || exit 0
+if [ "$ITEMS" -eq 0 ]; then
+  # Nothing was announced, so the cursor is the only suppression to apply and it
+  # can only be hiding comments that were fully scanned and carried nothing.
+  flush_suppressions
+  exit 0
+fi
+
 if [ "$ITEMS" -gt 3 ]; then
   printf 'letterbox %s items: %s; +%s more\n' "$ITEMS" "$LINE" "$((ITEMS - 3))"
 else
   printf 'letterbox %s items: %s\n' "$ITEMS" "$LINE"
 fi
+
+# CLAIM-LAST. Only now that the announcement has been printed may anything that
+# suppresses a future announcement be written. A crash above this line re-runs
+# the whole intake next cycle, which is the at-least-once guarantee.
+flush_suppressions

@@ -65,19 +65,19 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
 The hints came from that run's `fm-test-timing-portable-serial` artifacts on 2026-08-27, where the lane ran 116 scripts in 2404395 ms of serial work.
-Two letterbox scripts were added on 2026-08-27 with locally measured hints (415 ms and 8839 ms), bringing the lane to 118 scripts and 2413649 ms.
+Two letterbox scripts were added on 2026-08-27 with locally measured hints (333 ms and 8385 ms), bringing the lane to 118 scripts and 2413113 ms.
 A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default, which stays close to the 20727 ms measured per-script mean.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 Balance is the whole point of refreshing them on schedule, because an unhinted script assigned the flat default can be an order of magnitude heavier than that default and lands its whole error on one shard.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of5` | 24 | 482737 ms (~8.05 min) |
-| `portable-serial-2of5` | 22 | 482724 ms (~8.05 min) |
-| `portable-serial-3of5` | 25 | 482736 ms (~8.05 min) |
-| `portable-serial-4of5` | 24 | 482727 ms (~8.05 min) |
-| `portable-serial-5of5` | 23 | 482725 ms (~8.05 min) |
-| imbalance | | 13 ms |
+| `portable-serial-1of5` | 23 | 482620 ms (~8.04 min) |
+| `portable-serial-2of5` | 25 | 482620 ms (~8.04 min) |
+| `portable-serial-3of5` | 22 | 482620 ms (~8.04 min) |
+| `portable-serial-4of5` | 23 | 482621 ms (~8.04 min) |
+| `portable-serial-5of5` | 25 | 482632 ms (~8.04 min) |
+| imbalance | | 12 ms |
 
 The single longest script, `tests/fm-pr-check-security.test.sh` at 226928 ms, is the floor for any shard count.
 

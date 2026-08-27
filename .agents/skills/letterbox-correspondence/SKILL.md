@@ -107,10 +107,28 @@ The wake stays durable and is re-presented on the next drain, which is exactly t
 
 Two orderings inside the tooling matter for the same reason, and neither is yours to reverse:
 
-- **Receiving** is stash, then claim, then announce.
-  A claimed id whose stash is missing is an incomplete intake, and the next poll redoes it rather than treating it as done.
+- **Receiving is claim-LAST**: stash the card, announce it, then take the claim.
+  The claim is the only thing that suppresses a future announcement, so it must not exist until the announcement it suppresses has been made.
 - **Consuming a terminal reply** is close the letter first, which is idempotent, then record the consumed reply id.
   A crash between the two re-closes harmlessly instead of stranding an open letter whose reply is already marked consumed.
+
+## Announcement is at-least-once, so BE IDEMPOTENT ON CARD ID
+
+Because the claim is taken after the announcement, a crash in between makes the next poll announce the same card again.
+That is deliberate: losing a letter is unrecoverable, announcing one twice is not.
+
+**Before acting on a `new <id>`, check whether this estate has already acted on that exact id.**
+Acting twice on one letter - two backlog items, two dispatched workers, two replies - is the failure this guards against.
+
+In order of reliability:
+
+1. The claim record, when one exists: a non-empty `task` means work already owns it, and a non-empty `replied` means it is already answered.
+   `bin/fm-letterbox.sh status` prints both.
+2. The backlog, when no claim exists yet - which is exactly the window this guarantee covers.
+   The backlog item you created for that letter names its id, so search for the id before creating a second one.
+
+A repeated announcement for an id you have already handled is a no-op: note it and move on.
+It is never a second letter, because a card id is chosen once by its sender and is immutable.
 
 ## Who closes, and the one channel invariant
 

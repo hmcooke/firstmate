@@ -26,8 +26,6 @@
 #   lb_card_reply_write ...     - serialise a reply card
 #   lb_issue_title <class> <id> - the generated, never authored, issue title
 #   lb_claim_* / lb_claim_field - atomic id claim and claim-record reads
-#   lb_claim_incomplete <state> <id> - a claim whose inbox stash is missing, so
-#                                 the intake never completed and must be redone
 #   lb_transport <verb> [args]  - dispatch to the configured transport adapter
 #   lb_scan_refuses <file>      - run the credential scanner, refusing on any
 #                                 non-clean result including a scanner failure
@@ -444,6 +442,13 @@ lb_card_reply_write() {
 # record: under the forge transport the forge holds the record, and these files
 # are a cache plus an idempotency marker.
 #
+# It is taken LAST, after the card is stashed and after it has been announced,
+# because it is the only thing that suppresses a future announcement and must
+# not exist until the announcement it suppresses has been made. Its presence
+# therefore proves the whole intake completed. The cost is that announcement is
+# at-least-once, which every consumer must handle by being idempotent on card
+# id; bin/fm-letterbox-poll.sh's header owns that contract.
+#
 # Fields:
 #   id class from issue claimed   written at claim time
 #   refusal                       set when the card was refused at parse
@@ -466,20 +471,6 @@ lb_claim_exists() {
   fmx_private_artifact_file_valid "$(lb_claim_dir "$1")" "$2.json" 600
 }
 
-# The receiver's order is stash, then claim, then announce. A claim whose inbox
-# stash is missing therefore records an INCOMPLETE intake, not a finished one:
-# the crash landed between the two writes, or the stash was lost afterwards. The
-# next poll must re-stash and announce rather than treating the id as done,
-# because a claim alone never proves the letter's content survived.
-# A refused card deliberately has no stash, and a letter this estate has already
-# answered is finished, so neither is incomplete.
-lb_claim_incomplete() {
-  local state=$1 id=$2
-  lb_claim_exists "$state" "$id" || return 1
-  [ -z "$(lb_claim_field "$state" "$id" refusal)" ] || return 1
-  [ -z "$(lb_claim_field "$state" "$id" replied)" ] || return 1
-  ! fmx_private_artifact_file_valid "$(lb_dir "$state" inbox)" "$id.json" 600
-}
 
 # lb_claim_create <state> <id> <class> <from> <issue> [refusal]
 # 0 = this caller claimed it, 1 = already claimed, 2 = could not claim.

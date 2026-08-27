@@ -202,6 +202,15 @@ There is no parallel store for peer obligations, which is what stops an acknowle
 Before a handling turn acknowledges a letterbox wake, one of these exists for every letter in it: a posted terminal reply, a created backlog item with its task metadata, or a posted `unable`/`declined` reply.
 If none exists the acknowledgement does not run, and the wake stays durable for idempotent re-handling.
 
+Inside the poll, the receiver's completion boundary is **claim-last**: stash the card, announce it, then take the claim.
+The claim is the only marker that suppresses a future announcement, so it must not exist until the announcement it suppresses has been made; the resurface stamp and the transport cursor land after the announcement for the same reason.
+
+The consequence is deliberate: **announcement is at-least-once**.
+A crash between printing the line and taking the claim makes the next poll announce the same card again.
+Losing a letter is unrecoverable and announcing one twice is not, so the ordering trades the recoverable failure for the unrecoverable one.
+Every consumer of an announcement is therefore idempotent on card id, and the `letterbox-correspondence` skill owns what that means for a handling turn.
+A card id is chosen once by its sender and is immutable, so a repeated announcement is always the same letter and never a second one.
+
 ## Crash matrix
 
 Process death is safe on both sides of every boundary.
@@ -209,9 +218,8 @@ Process death is safe on both sides of every boundary.
 | Death point | Outcome |
 |---|---|
 | After the forge write, before the sender's receipt | The next send reconciles it: the id was recorded in the outbox first, so the retry adopts the existing letter by title-matched id. No duplicate. |
-| After the stash, before the claim | The next poll re-stashes and claims. One announcement. |
-| After the claim, before the stash completed | The claim records an incomplete intake, so the next poll redoes it rather than treating the id as done. |
-| After the claim, before the wake append | The letter is claimed but unannounced; the stale backstop re-surfaces it within one `FM_LETTERBOX_STALE_SECS` window. |
+| After the stash, before the announcement | Nothing is claimed, so the next poll re-stashes and announces. No letter is lost. |
+| After the announcement, before the claim | The next poll announces the same card again. Announcement is at-least-once by design, and consumers are idempotent on card id. |
 | After the wake append, before acknowledgement | The wake is durable and re-presented on the next drain. |
 | After acknowledgement, before the reply | The obligation is an ordinary task, so it is in the session-start inventory and in the supervision predicate. |
 | After the forge close, before the consumed record | Closing is idempotent: re-running `close` closes again harmlessly and completes the record. |
