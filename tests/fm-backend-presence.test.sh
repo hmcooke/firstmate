@@ -166,9 +166,15 @@ test_tmux_presence() {
   expect_presence "$fb" tmux 'sess:fm-*' unknown "a glob tmux target is ambiguity, never absence"
   expect_presence "$fb" tmux 'sess:win:extra' unknown "a three-part tmux selector is ambiguity, never absence"
 
-  # A non-ASCII target cannot earn absence: a C-locale tmux server renders such
-  # a name escaped, so a non-match proves nothing about it.
+  # A non-ASCII target cannot earn absence in ANY locale: whether tmux escapes
+  # such a name depends on the SERVER's locale, which this client cannot read,
+  # so a non-match proves nothing either way. Both locales are exercised because
+  # a collation-based check would answer differently in each.
   expect_presence "$fb" tmux 'sess:café' unknown "a non-ASCII tmux window name is ambiguity, never absence"
+  ( export LC_ALL=C; expect_presence "$fb" tmux 'sess:café' unknown \
+    "a non-ASCII tmux window name is ambiguity under a C locale too" ) || exit 1
+  ( export LC_ALL=en_US.UTF-8; expect_presence "$fb" tmux 'sess:café' unknown \
+    "a non-ASCII tmux window name is ambiguity under a UTF-8 locale too" ) || exit 1
 
   pass "tmux presence: inventory-backed, and every failed read stays unknown"
 }

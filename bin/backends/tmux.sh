@@ -262,6 +262,18 @@ fm_backend_tmux_server_gone_error() {  # <stderr-text>
   return 1
 }
 
+# fm_backend_tmux_target_is_ascii_printable: 0 when every byte of <target> is
+# printable ASCII. The C locale is pinned for the comparison itself so the range
+# is a byte range rather than a collation order, which is what makes the answer
+# the same everywhere it is asked.
+fm_backend_tmux_target_is_ascii_printable() {  # <target>
+  local LC_ALL=C
+  case "$1" in
+    *[!\ -~]*) return 1 ;;
+  esac
+  return 0
+}
+
 # fm_backend_tmux_target_presence: the tri-state endpoint-presence verdict for
 # one recorded tmux target. See bin/fm-backend.sh's fm_backend_target_presence
 # for the shared vocabulary and docs/tmux-backend.md "Endpoint presence" for
@@ -285,9 +297,9 @@ fm_backend_tmux_server_gone_error() {  # <stderr-text>
 #   - Every printable separator can legitimately appear inside a window name,
 #     so no printable one is safe either.
 # The locale is therefore left ambient rather than pinned to C, so a non-ASCII
-# window name renders as itself in a UTF-8 environment; a target carrying a
-# non-ASCII byte can still never earn `absent`, since a C-locale server would
-# render that name escaped and a non-match would prove nothing.
+# window name renders as itself in a UTF-8 environment, and the closing guard
+# below keeps a C-locale environment - where tmux would escape that name -
+# from turning a non-match into absence.
 #
 # Matching short-circuits, so a live endpoint costs one call; only the absent
 # path pays for the remaining aliases. A target shape this cannot enumerate -
@@ -328,11 +340,12 @@ fm_backend_tmux_target_presence() {  # <target> -> present|absent|unknown
     fi
   done
   # Every alias read succeeded and none named the target. That is positive
-  # evidence only for a target tmux would have rendered back byte for byte.
-  case "$target" in
-    *[![:print:]]*|*[!\ -~]*) printf 'unknown' ;;
-    *) printf 'absent' ;;
-  esac
+  # evidence only for a target tmux would have rendered back byte for byte,
+  # which a name outside printable ASCII is not: the escaping depends on the
+  # SERVER's locale, which this client cannot read, so a non-match against such
+  # a name proves nothing either way.
+  fm_backend_tmux_target_is_ascii_printable "$target" || { printf 'unknown'; return 0; }
+  printf 'absent'
 }
 
 # fm_backend_tmux_agent_state: recovery-grade harness-agent state for one

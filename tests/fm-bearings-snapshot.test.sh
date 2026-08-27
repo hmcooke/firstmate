@@ -35,6 +35,16 @@ SH
 #!/usr/bin/env bash
 case "${1:-}" in
   display-message) case "$*" in *dead-*) exit 1 ;; *) printf '%%1\n' ;; esac ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence): one selector alias per line, with no
+    # target of its own. It applies this fake's same rule - every recorded
+    # window is live except a `dead-` one - by listing the window= values of
+    # every meta in this home and its sibling child homes.
+    { cat "${FM_HOME:?}"/state/*.meta 2>/dev/null
+      cat "${FM_HOME:?}"/../*/state/*.meta 2>/dev/null
+    } | sed -n 's/^window=//p' | grep -v 'dead-' | sort -u
+    ;;
   capture-pane)
     case "$*" in
       *fm-domain-alpha*) printf 'stale terminal summary: Phase 7 started\n> \n' ;;

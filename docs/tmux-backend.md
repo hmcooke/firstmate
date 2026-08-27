@@ -54,7 +54,7 @@ Verified against tmux 3.4: `display-message` silently falls back to the active w
 It can therefore prove neither presence nor absence.
 The target's own shape selects which selector alias to enumerate - pane id, window id, session id, session name, or the `session:window` and `session:window.pane` forms in both name and index spelling - and each alias is a single-field format matched as a whole line.
 Two verified tmux behaviours rule out packing several aliases into one format: under a non-UTF-8 locale (`LC_ALL=C` included) tmux vis-escapes every control character it prints, so an embedded newline comes back as `_` and an embedded tab or `0x1f` comes back mangled, while every printable separator can legitimately appear inside a window name.
-The locale is therefore left ambient rather than pinned to `C`, and a target carrying a non-ASCII byte can never earn absent, since a C-locale server would render that name escaped and a non-match would prove nothing.
+The locale is therefore left ambient rather than pinned to `C`, and a target outside printable ASCII can never earn absent in any locale: whether tmux escapes such a name depends on the server's locale, which the client cannot read, so a non-match proves nothing either way.
 Matching short-circuits, so a live endpoint costs one call and only the absent path pays for the remaining aliases.
 
 A readable inventory that omits the target is absent, and so is tmux's own definitive "no server running" or missing-socket answer, because a pane cannot outlive its server.
