@@ -256,8 +256,7 @@ No Herdr-specific copy of that protocol exists.
 
 ### Endpoint presence
 
-Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
-An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+Endpoint presence is a three-way verdict in which absence needs positive evidence; [architecture](architecture.md#endpoint-presence-is-tri-state) owns that rule and `bin/fm-backend.sh` owns the contract.
 
 The Herdr verdict comes from the structured `pane get` response, never from its exit status, because a business-logic "not found" is a normal answer here rather than a failed call.
 A structured `pane_not_found` is absent, a response whose echoed pane id round-trips is present, and everything else - an unreachable server, an unparseable body, a response shape that stops echoing the id, a malformed target - is unknown.

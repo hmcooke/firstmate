@@ -47,8 +47,7 @@ worktree=<absolute Orca worktree path>
 
 ### Endpoint presence
 
-Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
-An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+Endpoint presence is a three-way verdict in which absence needs positive evidence; [architecture](architecture.md#endpoint-presence-is-tri-state) owns that rule and `bin/fm-backend.sh` owns the contract.
 
 Orca exposes no terminal inventory, so the only positive evidence of absence available is a structured `ok:false` whose error names the terminal as not found; the verdict is read from that JSON body rather than from the exit status.
 A missing `orca` CLI, a non-zero exit with no JSON body, an unparseable body, and an `ok:false` carrying any other error code are all unknown.

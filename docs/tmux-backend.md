@@ -46,8 +46,7 @@ Verify setup by spawning a small task and confirming its `fm-<id>` window appear
 
 ### Endpoint presence
 
-Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
-An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+Endpoint presence is a three-way verdict in which absence needs positive evidence; [architecture](architecture.md#endpoint-presence-is-tri-state) owns that rule and `bin/fm-backend.sh` owns the contract.
 
 The tmux verdict comes from a server-wide `list-panes -a` inventory, never from `display-message -t <target>`.
 Verified against tmux 3.4: `display-message` silently falls back to the active window, so it answers exit 0 with a real pane id for a window that does not exist and exit 0 with empty output for a session that does not exist.

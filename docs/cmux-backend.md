@@ -85,8 +85,7 @@ Workspace UUIDs are not stable across an app relaunch, so recovery searches by t
 
 ### Endpoint presence
 
-Every runtime backend answers "is this recorded endpoint still there?" with a three-way verdict - present, absent, or unknown - and absence needs positive evidence.
-An observation that failed, timed out, or could not cover the endpoint is unknown, and no consumer may treat unknown as gone: [architecture](architecture.md#endpoint-presence-is-tri-state) owns the rule and `bin/fm-backend.sh` owns the contract.
+Endpoint presence is a three-way verdict in which absence needs positive evidence; [architecture](architecture.md#endpoint-presence-is-tri-state) owns that rule and `bin/fm-backend.sh` owns the contract.
 
 For cmux, "could not cover the endpoint" is the load-bearing case: `workspace list` with no `--window` is scoped to the current window only, so a task workspace sitting in another window is invisible to it.
 A scoped miss is therefore a limit of what was observed and never evidence the workspace is gone.
