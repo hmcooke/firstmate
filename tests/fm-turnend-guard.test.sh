@@ -1638,12 +1638,12 @@ test_hook_claude_mode_secondmate_reblocks_like_primary() {
 
 # --- HOOK: session-lock ownership --------------------------------------------
 #
-# A session that could not acquire the home's session lock is read-only
-# (AGENTS.md section 3) and must not arm supervision, so the guard must never
-# force it to continue. Ownership comes from the shared session-lock API, which
-# walks the caller's process ancestry, so every case here runs the real guard as
-# the child of a fake harness session: the walk terminates on that fixture
-# harness and can never reach whatever launched this suite.
+# A session positively identified as not holding the home's session lock is
+# read-only (AGENTS.md section 3) and must not arm supervision, so the guard must
+# never force it to continue. Ownership comes from the shared session-lock API,
+# which walks the caller's process ancestry, so every case here runs the real
+# guard as the child of a fake harness session: the walk terminates on that
+# fixture harness and can never reach whatever launched this suite.
 
 # Run the guard from inside a fake harness session. With <own-lock> = 1 that
 # session records itself as the lock owner exactly as a real session does at

@@ -32,14 +32,15 @@
 # primary checkout - the main home or a genuinely marked secondmate home - and
 # stay a silent, fast no-op inside child task worktrees.
 #
-# Session-lock ownership: a session that does not hold this home's session lock
-# is read-only by contract (AGENTS.md section 3) and must not arm supervision at
-# all, so it has nothing to supervise and this guard never forces it to
-# continue. Positive proof that ANOTHER live owner holds the lock - a second
-# harness session or a declared service owner - allows the stop silently and
-# records one stderr line. An absent, malformed, or stale-owner lock, and a
-# harness ancestry this process cannot resolve, all keep the blocking behavior
-# below exactly as it was.
+# Session-lock ownership: a session positively identified as not holding this
+# home's session lock is read-only by contract (AGENTS.md section 3) and must not
+# arm supervision at all, so it has nothing to supervise and this guard never
+# forces it to continue. A positive verdict from the shared "must reclamation be
+# refused?" predicate allows the stop silently and records one stderr line; that
+# verdict covers another live harness session, a live declared service owner,
+# and the API's documented identity-unverifiable live-service state. An absent,
+# malformed, or stale-owner lock, and a harness ancestry this process cannot
+# resolve, all keep the blocking behavior below exactly as it was.
 #
 # Loop-guard, codex/Grok (default) mode: never block twice in the same turn.
 # Codex uses stop_hook_active and Grok uses stopHookActive; typed camel-case
@@ -153,18 +154,19 @@ fi
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 # --- scope precisely to the session that OWNS this home ----------------------
-# A session that could not acquire and verify the home's session lock is
+# A session positively identified as not holding the home's session lock is
 # read-only (AGENTS.md section 3): it must not arm supervision, so forcing it to
 # continue only burns its bounded continuations while the owning session keeps
-# supervising. Allow only on positive proof that another live owner holds the
-# lock. fm_session_lock_owner_live is the single predicate that answers "must
-# reclamation be refused?", so a live harness session and a live declared
-# service owner are treated alike here exactly as they are at acquisition; it is
-# tested first because it is the cheap file-and-liveness read, before either
-# ancestry walk. Everything short of that proof keeps the blocking behavior
-# below unchanged, and none of it widens the fail-open: an absent, malformed, or
-# stale-owner lock is uncertainty this session may still resolve by claiming the
-# lock, and an unresolvable harness ancestry cannot prove non-ownership either.
+# supervising. Allow only when fm_session_lock_owner_live, the single predicate
+# that answers "must reclamation be refused?", positively says the recorded
+# owner cannot be displaced. A live harness session and the service-owner states
+# that predicate preserves are treated here exactly as they are at acquisition;
+# the library owns those exact states. The predicate is tested first because it
+# is the cheap file-and-liveness read, before either ancestry walk. Everything
+# short of that verdict keeps the blocking behavior below unchanged, and none of
+# it widens the fail-open: an absent, malformed, or stale-owner lock is
+# uncertainty this session may still resolve by claiming the lock, and an
+# unresolvable harness ancestry cannot prove non-ownership either.
 if fm_session_lock_owner_live "$STATE" \
   && ! fm_session_lock_owned_by_self "$STATE" \
   && fm_harness_ancestry_pids >/dev/null 2>&1; then
