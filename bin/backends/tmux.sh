@@ -303,13 +303,17 @@ fm_backend_tmux_target_is_ascii_printable() {  # <target>
 #
 # Matching short-circuits, so a live endpoint costs one call; only the absent
 # path pays for the remaining aliases. A target shape this cannot enumerate -
-# tmux's exact-match `=` syntax, a glob, or a three-part selector - is
+# tmux's exact-match `=` syntax, a glob, a three-part selector, or a `:window`
+# shorthand whose session tmux would fill in from the current client - is
 # ambiguity and stays unknown, never absence.
 fm_backend_tmux_target_presence() {  # <target> -> present|absent|unknown
   local target=$1 fmt inventory status
   [ -n "$target" ] || { printf 'unknown'; return 0; }
+  # Shapes the inventory cannot enumerate by value: tmux's exact-match `=`
+  # syntax, a glob, a three-part selector, and the `:window` / `session:`
+  # shorthands whose missing half tmux fills in from the current client.
   case "$target" in
-    *=*|*'*'*|*'?'*|*'['*|*:*:*) printf 'unknown'; return 0 ;;
+    *=*|*'*'*|*'?'*|*'['*|*:*:*|:*|*:) printf 'unknown'; return 0 ;;
   esac
   case "$target" in
     %[0-9]*) set -- '#{pane_id}' ;;

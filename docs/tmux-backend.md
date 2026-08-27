@@ -57,7 +57,7 @@ The locale is therefore left ambient rather than pinned to `C`, and a target out
 Matching short-circuits, so a live endpoint costs one call and only the absent path pays for the remaining aliases.
 
 A readable inventory that omits the target is absent, and so is tmux's own definitive "no server running" or missing-socket answer, because a pane cannot outlive its server.
-Every other failure - a permission error, an over-long socket path, a protocol mismatch - is unknown, and so is a target shape the inventory cannot enumerate by value: tmux's exact-match `=` syntax, a glob, or a three-part selector.
+Every other failure - a permission error, an over-long socket path, a protocol mismatch - is unknown, and so is a target shape the inventory cannot enumerate by value: tmux's exact-match `=` syntax, a glob, a three-part selector, or a `:window` shorthand whose session tmux would fill in from the current client.
 
 ### Agent liveness probe
 

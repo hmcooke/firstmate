@@ -41,6 +41,18 @@ TMP_ROOT=$(fm_test_tmproot fm-backend-presence)
 # comes first, and an absent-CLI case still sees no CLI at all.
 EXTRA_PATH=
 
+# PROBE_LOCALE pins the locale each probe runs under. It matters for exactly one
+# guarantee - a non-ASCII target can never earn `absent` - because a
+# collation-based check would answer differently per locale, so that case is
+# driven under both a C and a UTF-8 locale.
+PROBE_LOCALE=${LC_ALL:-${LANG:-C}}
+
+# probe_utf8_locale: an installed UTF-8 locale name, or empty when the machine
+# has none to offer.
+probe_utf8_locale() {
+  locale -a 2>/dev/null | grep -iE '\.(utf-?8)$' | head -1
+}
+
 probe_path() {
   if [ -n "$EXTRA_PATH" ]; then
     printf '%s:%s:%s' "$1" "$EXTRA_PATH" "$BASE_PATH"
@@ -52,14 +64,14 @@ probe_path() {
 presence() {  # <fakebin> <backend> <target> [expected-label]
   local fb=$1
   shift
-  PATH="$(probe_path "$fb")" bash -c \
+  PATH="$(probe_path "$fb")" LC_ALL="$PROBE_LOCALE" bash -c \
     '. "$0/bin/fm-backend.sh"; fm_backend_target_presence "$@"' "$ROOT" "$@"
 }
 
 exists() {  # <fakebin> <backend> <target> [expected-label] -> "exists"|"gone"
   local fb=$1
   shift
-  if PATH="$(probe_path "$fb")" bash -c \
+  if PATH="$(probe_path "$fb")" LC_ALL="$PROBE_LOCALE" bash -c \
     '. "$0/bin/fm-backend.sh"; fm_backend_target_exists "$@"' "$ROOT" "$@"; then
     printf 'exists'
   else
@@ -70,7 +82,7 @@ exists() {  # <fakebin> <backend> <target> [expected-label] -> "exists"|"gone"
 confirmed_gone() {  # <fakebin> <backend> <target> [expected-label] -> "yes"|"no"
   local fb=$1
   shift
-  if PATH="$(probe_path "$fb")" bash -c \
+  if PATH="$(probe_path "$fb")" LC_ALL="$PROBE_LOCALE" bash -c \
     '. "$0/bin/fm-backend.sh"; fm_backend_endpoint_confirmed_gone "$@"' "$ROOT" "$@"; then
     printf 'yes'
   else
@@ -130,7 +142,7 @@ SH
 }
 
 test_tmux_presence() {
-  local fb
+  local fb saved_locale utf8_locale
 
   fb=$(make_tmux "$TMP_ROOT/tmux-present" present)
   expect_presence "$fb" tmux sess:fm-task present "a window in a readable inventory is present"
@@ -165,16 +177,24 @@ test_tmux_presence() {
   expect_presence "$fb" tmux '=sess:=fm-task' unknown "tmux's exact-match target syntax is ambiguity, never absence"
   expect_presence "$fb" tmux 'sess:fm-*' unknown "a glob tmux target is ambiguity, never absence"
   expect_presence "$fb" tmux 'sess:win:extra' unknown "a three-part tmux selector is ambiguity, never absence"
+  expect_presence "$fb" tmux ':fm-task' unknown "a current-client :window shorthand is ambiguity, never absence"
+  expect_presence "$fb" tmux 'sess:' unknown "a current-client session: shorthand is ambiguity, never absence"
 
   # A non-ASCII target cannot earn absence in ANY locale: whether tmux escapes
   # such a name depends on the SERVER's locale, which this client cannot read,
   # so a non-match proves nothing either way. Both locales are exercised because
   # a collation-based check would answer differently in each.
-  expect_presence "$fb" tmux 'sess:café' unknown "a non-ASCII tmux window name is ambiguity, never absence"
-  ( export LC_ALL=C; expect_presence "$fb" tmux 'sess:café' unknown \
-    "a non-ASCII tmux window name is ambiguity under a C locale too" ) || exit 1
-  ( export LC_ALL=en_US.UTF-8; expect_presence "$fb" tmux 'sess:café' unknown \
-    "a non-ASCII tmux window name is ambiguity under a UTF-8 locale too" ) || exit 1
+  saved_locale=$PROBE_LOCALE
+  PROBE_LOCALE=C
+  expect_presence "$fb" tmux 'sess:café' unknown \
+    "a non-ASCII tmux window name is ambiguity under a C locale"
+  utf8_locale=$(probe_utf8_locale)
+  if [ -n "$utf8_locale" ]; then
+    PROBE_LOCALE=$utf8_locale
+    expect_presence "$fb" tmux 'sess:café' unknown \
+      "a non-ASCII tmux window name is ambiguity under a UTF-8 locale too"
+  fi
+  PROBE_LOCALE=$saved_locale
 
   pass "tmux presence: inventory-backed, and every failed read stays unknown"
 }
