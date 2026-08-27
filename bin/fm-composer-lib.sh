@@ -101,8 +101,10 @@
 # depend on the ambient locale. That predicate - a verified agent glyph
 # followed only by Unicode whitespace - is pinned over the WHOLE declared set
 # in both locales by tests/fm-composer-lib.test.sh, from a table declared
-# independently of the list below, so narrowing or widening it fails loudly
-# rather than quietly shrinking what is proven.
+# independently of the list below. Removing any declared form fails loudly
+# because each is asserted individually. Widening is pinned only for U+200B
+# and U+FEFF, which are asserted as non-whitespace negatives; folding another
+# non-whitespace sequence such as U+2060 WORD JOINER would still pass.
 #
 # KNOWN LIMITATION, deliberately not fixed here: `${v#?}` removes one BYTE
 # under LC_ALL=C and one CHARACTER under UTF-8, so a single-character strip of

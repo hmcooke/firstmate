@@ -315,18 +315,33 @@ test_matrix_bare_row_survives_every_whitespace_form() {
   # actually calls. WHITESPACE_FORMS is the independent table declared above,
   # so a future harness separating its glyph with any other Unicode space is
   # already covered, and narrowing the library's set fails here.
-  local form label ws screen shell
+  local form label ws glyph screen shell agent_box shell_box box_want padding
+  printf -v padding '%21s' ''
   for form in "${WHITESPACE_FORMS[@]}"; do
     label=${form%%:*}
     printf -v ws '%b' "${form#*:}"
-    screen=$'transcript line\n────────────────────────\n❯'"$ws"$'\n────────────────────────'
-    assert_screen "claude '❯' + $label on tmux" empty "$CAPS_TMUX" "$screen" 2 probe-absent
-    assert_screen "claude '❯' + $label on cmux/orca" empty "$CAPS_PLAIN" "$screen"
+    for glyph in "${AGENT_GLYPHS[@]}"; do
+      screen=$'transcript line\n────────────────────────\n'"${glyph}${ws}"$'\n────────────────────────'
+      assert_screen "bare '$glyph' + $label on tmux" empty "$CAPS_TMUX" "$screen" 2 probe-absent
+      assert_screen "bare '$glyph' + $label on cmux/orca" empty "$CAPS_PLAIN" "$screen"
+    done
     shell=$'transcript line\n────────────────────────\n$'"$ws"$'\n────────────────────────'
     assert_screen "dead shell '\$' + $label on tmux" unknown "$CAPS_TMUX" "$shell" 2 probe-absent
     assert_screen "dead shell '\$' + $label on cmux/orca" unknown "$CAPS_PLAIN" "$shell"
+
+    box_want=empty
+    if [ "$label" = 'U+0009 CHARACTER TABULATION' ]; then
+      # A tab is ASCII, so neither the Unicode-space fold nor the [!-~] map
+      # touches it, leaving a literal tab that cannot equal the all-spaces
+      # width. Geometry ambiguity correctly degrades to unknown.
+      box_want=unknown
+    fi
+    agent_box=$'╭────────────────────────╮\n│ ❯'"${ws}${padding}"$'│\n╰────────────────────────╯'
+    assert_screen "bordered agent glyph + $label" "$box_want" "$CAPS_PLAIN" "$agent_box"
+    shell_box=$'╭────────────────────────╮\n│ $'"${ws}${padding}"$'│\n╰────────────────────────╯'
+    assert_screen "bordered shell glyph + $label" "$box_want" "$CAPS_PLAIN" "$shell_box"
   done
-  pass "matrix: a bare agent-glyph row reads empty after every Unicode whitespace form, and a dead shell row still defers"
+  pass "matrix: all bare agent glyphs plus bordered agent and shell glyphs survive every Unicode whitespace form"
 }
 
 test_matrix_codex_dim_hint_row() {
