@@ -582,7 +582,7 @@ test_write_refuses_when_the_channel_is_not_private() {
   assert_present "$home/state/letterbox/write-error" \
     "the refusal must be recorded durably so it survives a lost turn"
   out=$(run_poll "$home" "$store" "$fakebin")
-  assert_contains "$out" "letterbox error:" "the poll must raise the refused write as a wake"
+  assert_contains "$out" "error: letterbox write refused" "the poll must raise the refused write as a wake"
   assert_contains "$out" "is not private" "the wake must name the visibility cause"
   # Back to private: normal operation resumes and the alarm clears.
   printf 'true\n' > "$store/private"
@@ -973,6 +973,202 @@ test_status_reports_activation_and_what_is_owed() {
   pass "status reports activation, the armed poll and the letters still owed a reply"
 }
 
+test_a_visibility_refusal_keeps_alarming_while_reads_continue() {
+  local home store fakebin out id
+  read -r home store fakebin <<< "$(fixture visibility-realarm | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  printf 'false\n' > "$store/private"
+  printf 'body\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject "s" --file "$home/body.txt" >/dev/null 2>&1 \
+    && fail "a write into a public channel must be refused"
+  [ "$(head -n1 "$home/state/letterbox/write-error")" = visibility ] \
+    || fail "a confirmed-public channel must be recorded as a visibility refusal"
+  inject_letter "$store" "$id" fact-lookup "q" "still delivered" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "error: letterbox write refused" "the refusal must be raised"
+  assert_contains "$out" "new $id fact-lookup archie" \
+    "a refused write must not disable intake: the letter must still be stashed and announced"
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] || fail "the error and the letter must share one wake line"
+  assert_present "$home/state/letterbox/inbox/$id.json" "the letter must be stashed despite the write-error"
+  assert_present "$home/state/letterbox/write-error" "a successful read must NOT clear a visibility refusal"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  [ -z "$out" ] || fail "inside the window the visibility alarm is rate-limited (got: $out)"
+  # Age the alarm marker past the window: the exposed channel must be raised again.
+  { printf '1\n'; sed '1d' "$home/state/letterbox/poll-error"; } > "$home/pe.new" \
+    && cat "$home/pe.new" > "$home/state/letterbox/poll-error"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  assert_contains "$out" "error: letterbox write refused" \
+    "an exposed channel must be re-raised once per window, never only once"
+  assert_contains "$out" "is not private" "the re-raised wake must still name the cause"
+  assert_present "$home/state/letterbox/write-error" "only a write that lands clears a visibility refusal"
+  pass "a visibility refusal never stops reads and re-alarms once per window until a write lands"
+}
+
+test_a_transport_write_error_clears_on_a_successful_read() {
+  local home store fakebin out id
+  read -r home store fakebin <<< "$(fixture write-transport | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  printf 'body\n' > "$home/body.txt"
+  # The visibility check itself cannot run: the fake forge has no visibility record.
+  rm -f "$store/private"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject "s" --file "$home/body.txt" 2>&1) \
+    && fail "a write whose visibility check cannot run must be refused"
+  assert_contains "$out" "cannot read $CHANNEL visibility" "the refusal must name the transport cause"
+  [ "$(head -n1 "$home/state/letterbox/write-error")" = transport ] \
+    || fail "an unreadable visibility must be recorded as a transport failure, not a visibility refusal"
+  printf 'true\n' > "$store/private"
+  inject_letter "$store" "$id" fact-lookup "q" "still delivered" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "error: letterbox write refused" "the transport failure must be raised once"
+  assert_contains "$out" "new $id" "a transport write-error must not suppress inbound intake"
+  assert_present "$home/state/letterbox/inbox/$id.json" "the letter must be stashed"
+  assert_absent "$home/state/letterbox/write-error" \
+    "a successful read proves the transport is back and must clear a transport-class write-error"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "once cleared, a transport write-error must not be raised again (got: $out)"
+  pass "a transport write-error is raised once, never blocks intake, and clears on the first good read"
+}
+
+test_a_scan_refused_reply_names_the_sent_letter_and_keeps_it_open() {
+  local home store fakebin out id number secret
+  read -r home store fakebin <<< "$(fixture refused-reply | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  # Synthetic, generated for this test, and not a real credential.
+  secret="ghp_$(awk 'BEGIN { while (i++ < 36) printf "B" }')"
+  inject_reply "$store" "$number" archie-20260824T150000Z-0badcafe "$id" answered "token $secret"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused archie-20260824T150000Z-0badcafe provider-key-prefix for $id" \
+    "a refused reply must name the SENT letter the requester can act on"
+  assert_not_contains "$out" "$secret" "the refusal must never carry the value"
+  assert_absent "$home/state/letterbox/inbox/archie-20260824T150000Z-0badcafe.json" \
+    "a refused reply must not be stashed"
+  [ "$(jq -r --argjson n "$number" '.[] | select(.number == $n) | .state' "$store/issues.json")" = open ] \
+    || fail "the sent letter must stay open: the peer still owes a clean answer"
+  out=$(run_lb "$home" "$store" "$fakebin" close "$id" 2>&1) \
+    && fail "close must refuse an answer that was never read"
+  assert_contains "$out" "no terminal reply" "close must say why it refuses"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "the refused reply is claimed and must not be re-announced (got: $out)"
+  # Past the window, the sent-letter backstop keeps the requester awake.
+  jq '.claimed = 1 | .resurfaced = 0' "$home/state/letterbox/claims/$id.json" > "$home/c.new" \
+    && cat "$home/c.new" > "$home/state/letterbox/claims/$id.json"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  assert_contains "$out" "unanswered $id fact-lookup" \
+    "a sent letter with no consumed terminal reply must be re-surfaced"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  [ -z "$out" ] || fail "the sent-letter backstop is rate-limited to once per window (got: $out)"
+  # The grammar-conformant resolution is an ordinary notice naming the refusal.
+  printf 'reply archie-20260824T150000Z-0badcafe was refused: provider-key-prefix\n' > "$home/notice.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject "refused reply" --file "$home/notice.txt") \
+    || fail "the notice resolving a refused reply must send: $out"
+  pass "a scan-refused reply names the sent letter, leaves it open, and the backstop keeps raising it"
+}
+
+test_a_sent_letter_with_a_consumed_reply_is_not_resurfaced() {
+  local home store fakebin out id number
+  read -r home store fakebin <<< "$(fixture unanswered-consumed | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  jq '.claimed = 1 | .resurfaced = 0' "$home/state/letterbox/claims/$id.json" > "$home/c.new" \
+    && cat "$home/c.new" > "$home/state/letterbox/claims/$id.json"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  assert_contains "$out" "unanswered $id" "a sent letter with no reply at all must be re-surfaced"
+  inject_reply "$store" "$number" archie-20260824T150000Z-0c1ea11e "$id" answered "clean answer"
+  # The fake forge stamps to the second, so a reply landing in the same second as
+  # the previous poll would be hidden by the cursor; drop it so the fetch runs.
+  rm -f "$home/state/letterbox/cursor"
+  jq '.resurfaced = 0' "$home/state/letterbox/claims/$id.json" > "$home/c.new" \
+    && cat "$home/c.new" > "$home/state/letterbox/claims/$id.json"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  assert_contains "$out" "reply $id answered" "the clean reply must be announced"
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "close must succeed"
+  jq '.resurfaced = 0' "$home/state/letterbox/claims/$id.json" > "$home/c.new" \
+    && cat "$home/c.new" > "$home/state/letterbox/claims/$id.json"
+  out=$(run_poll "$home" "$store" "$fakebin" FM_LETTERBOX_STALE_SECS=300)
+  [ -z "$out" ] || fail "a closed letter with its reply consumed must not be re-surfaced (got: $out)"
+  pass "the sent-letter backstop stops once the terminal reply is consumed and the letter closed"
+}
+
+test_a_reply_card_in_an_issue_body_is_ignored() {
+  local home store fakebin out n card
+  read -r home store fakebin <<< "$(fixture reply-as-issue | tr '\n' ' ')"
+  n=$(cat "$store/next")
+  printf '%s\n' "$((n + 1))" > "$store/next"
+  card=$(
+    printf '```letterbox/v1\n'
+    printf 'kind: reply\nv: 1\nid: archie-20260824T140311Z-9f2c1ab4\n'
+    printf 'in-reply-to: firstmate-20260824T140000Z-00000001\nfrom: %s\nto: %s\n' "$PEER" "$SELF"
+    printf 'status: answered\nissued: %s\nbody: |\n  not a letter\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '```\n'
+  )
+  jq --argjson n "$n" --arg b "$card" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + [{number: $n, title: "misfiled", body: $b, state: "open", user: {login: "archie"}, updated_at: $at}]' \
+    "$store/issues.json" > "$store/issues.json.new" && mv "$store/issues.json.new" "$store/issues.json"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "a reply card posted as an issue body must be ignored, not announced (got: $out)"
+  assert_absent "$home/state/letterbox/inbox/archie-20260824T140311Z-9f2c1ab4.json" \
+    "a reply card in an issue body must not be stashed as a request"
+  assert_absent "$home/state/letterbox/claims/archie-20260824T140311Z-9f2c1ab4.json" \
+    "a reply card in an issue body must not be claimed"
+  pass "a reply card posted as an issue body is ignored exactly like a card addressed elsewhere"
+}
+
+test_a_missing_gh_is_diagnosed_not_silent() {
+  local home store fakebin out rc no_gh
+  read -r home store fakebin <<< "$(fixture missing-gh | tr '\n' ' ')"
+  # The base PATH may carry a real gh, so its absence is simulated the way the
+  # bootstrap suite hides jq: command -v gh fails in every shell under test.
+  rm -f "$fakebin/gh"
+  no_gh="$home/no-gh.bash"
+  cat > "$no_gh" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = gh ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+SH
+  inject_letter "$store" archie-20260824T140311Z-9f2c1ab4 >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$no_gh"); rc=$?
+  expect_code 0 "$rc" "a poll without gh must still exit 0"
+  assert_contains "$out" "letterbox error: missing gh" \
+    "a home without gh must be told once rather than polling silently forever"
+  out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$no_gh")
+  [ -z "$out" ] || fail "the missing-gh diagnostic must be rate-limited (got: $out)"
+  out=$(BASH_ENV="$no_gh" run_lb "$home" "$store" "$fakebin" arm 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "arm must refuse without gh, which every read verb needs"
+  assert_contains "$out" "gh is required" "arm must name the missing dependency"
+  assert_absent "$home/state/letterbox.check.sh" "arm must not generate a shim it cannot serve"
+  pass "a missing gh is diagnosed once by the poll and refused by arm"
+}
+
+test_status_counts_only_sent_letters_still_awaiting_a_reply() {
+  local home store fakebin out id number
+  read -r home store fakebin <<< "$(fixture status-sent | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "1 sent and awaiting a reply from the peer" \
+    "an open sent letter must be counted as awaiting a reply"
+  inject_reply "$store" "$number" archie-20260824T150000Z-0c1ea11e "$id" answered "the answer"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "close must succeed"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "0 sent and awaiting a reply from the peer" \
+    "a sent letter whose reply was consumed and closed must not be counted as still open"
+  pass "status counts a sent letter only while its terminal reply is still unconsumed"
+}
+
 test_status_on_an_unconfigured_home_says_inert() {
   local home out
   home=$(make_home status-inert)
@@ -1023,3 +1219,10 @@ test_a_quiet_poll_costs_one_read_and_writes_nothing
 test_the_poll_stays_silent_when_the_transport_read_fails
 test_status_reports_activation_and_what_is_owed
 test_status_on_an_unconfigured_home_says_inert
+test_a_visibility_refusal_keeps_alarming_while_reads_continue
+test_a_transport_write_error_clears_on_a_successful_read
+test_a_scan_refused_reply_names_the_sent_letter_and_keeps_it_open
+test_a_sent_letter_with_a_consumed_reply_is_not_resurfaced
+test_a_reply_card_in_an_issue_body_is_ignored
+test_a_missing_gh_is_diagnosed_not_silent
+test_status_counts_only_sent_letters_still_awaiting_a_reply

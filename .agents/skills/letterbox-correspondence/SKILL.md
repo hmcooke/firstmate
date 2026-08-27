@@ -43,9 +43,12 @@ Three consequences, and none of them is optional:
 |---|---|---|
 | `new <id> <class> <from>` | A letter arrived and is stashed. | Classify and act, below. |
 | `reply <id> <status>` | The peer sent a terminal reply to a letter this estate sent. | Read it, use it, then `bin/fm-letterbox.sh close <id>`. |
-| `refused <id> <class>` | A card failed the grammar or the credential scan and was NOT stashed. | Reply `unable` naming the fault class. Never guess at what it meant. |
-| `stale <id> <class>` | A claimed letter still has no reply and no live task. | An obligation was dropped. Answer it, or create the task, now. |
-| `error: <message>` | A configuration fault, or a write this estate refused. | Fix the cause. A visibility refusal means the channel repository is no longer private, which is a captain-facing security event, not a routine error. |
+| `refused <id> <class>` | An inbound letter with a usable id failed the grammar or the credential scan and was NOT stashed. | `bin/fm-letterbox.sh reply <id> --status unable` naming the fault class. Never guess at what it meant. |
+| `refused <reply-id> <class> for <sent-id>` | The peer's terminal reply to `<sent-id>` was refused by the credential scan and was NOT stashed. | It cannot be answered in correlation and `close` refuses an answer that was never read, so `<sent-id>` stays open on purpose. Send `bin/fm-letterbox.sh send --class notice` naming `<reply-id>` and `<class>`, so the peer can answer cleanly; the `unanswered` backstop keeps raising `<sent-id>` until a clean reply is consumed. |
+| `refused issue-<n> <class>` | A card with no usable id failed the grammar. | It cannot be answered in correlation either. Send a `notice` naming `issue-<n>` and the fault class. |
+| `stale <id> <class>` | A claimed letter this estate received still has no reply and no live task. | An obligation was dropped. Answer it, or create the task, now. |
+| `unanswered <id> <class>` | A letter this estate sent is still open with no consumed terminal reply, past `FM_LETTERBOX_STALE_SECS`. | The peer still owes a clean answer. Consume and `close` a reply that has since arrived, or chase it with a `notice`; never close what was never read. |
+| `error: <message>` | A configuration fault, or a write this estate refused. | Fix the cause. Reads continue regardless. A visibility refusal means the channel repository is no longer private, which is a captain-facing security event, not a routine error, and it is re-raised once per window until a write lands. |
 
 ## What each class means, and what it does not
 

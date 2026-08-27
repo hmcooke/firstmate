@@ -6,7 +6,9 @@
 # Usage: fm-letterbox-transport-github.sh <verb> [args]
 #   require-private                    exit 0 only when the channel repository is
 #                                      still private; otherwise print one reason
-#                                      line and exit 1 (gh-axi)
+#                                      line and exit 2 when the repository is
+#                                      confirmed NOT private, or exit 1 when its
+#                                      visibility could not be read (gh-axi)
 #   list-open                          print a JSON array of open letters:
 #                                      [{number,title,body,author,updated}] (gh)
 #   comments <number>                  print a JSON array of replies on one
@@ -74,7 +76,7 @@ require_private() {
   }
   case "$out" in
     true) return 0 ;;
-    false) printf '%s is not private\n' "$REPO"; return 1 ;;
+    false) printf '%s is not private\n' "$REPO"; return 2 ;;
     *) printf 'cannot read %s visibility\n' "$REPO"; return 1 ;;
   esac
 }

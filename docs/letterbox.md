@@ -147,7 +147,11 @@ Each of these is refused at parse, on both the sending and the receiving side, r
 - A body over 8 KiB, which is **refused, not truncated**.
 - A card issued more than 24 hours in the future, which is the clock-skew guard.
 
-A refused card is named in the wake by its fault class so the handling turn can answer `unable`, and its content is never stashed as an accepted letter.
+A refused card is named in the wake by its fault class and its content is never stashed as an accepted letter.
+An inbound letter with a usable id is answered `unable` naming that class.
+A refused reply is named together with the sent letter it answers, and a card with no usable id is keyed `issue-<n>`; neither can be answered in correlation, so each is resolved with an ordinary `notice` letter naming the refused id and the class, and the letter stays open until a clean answer is consumed.
+
+A body authored through the forge's web editor arrives with CRLF line endings; a single trailing carriage return per line is stripped as line-ending normalisation, so such a card parses to exactly the fields its LF twin does and every refusal above still fires on it.
 
 ## Credential refusal
 
@@ -170,6 +174,11 @@ Immediately before **every** write, the transport verifies through the API that 
 
 That converts "the repository was accidentally made public" from a silent, ongoing exposure into a hard stop plus an alarm.
 The refusal is recorded durably under `state/letterbox/write-error`, so the poll raises it as a wake even if the turn that hit it was lost, and it clears on the next write that lands.
+
+A refused write never disables reads: the poll keeps taking in letters, detecting replies and running the backstop with the record in place.
+The record's first line is its class, so the poll decides structurally rather than by reading the prose.
+A `transport` record (the visibility check itself could not run) is raised once and cleared by the first successful poll read.
+A `visibility` record (the repository is confirmed not private) is never cleared by a read, only by a write that lands, and is re-raised once per `FM_LETTERBOX_STALE_SECS` window so an exposed channel cannot go quiet after a single wake.
 
 ## Home-local state
 
@@ -223,13 +232,17 @@ Process death is safe on both sides of every boundary.
 | After the wake append, before acknowledgement | The wake is durable and re-presented on the next drain. |
 | After acknowledgement, before the reply | The obligation is an ordinary task, so it is in the session-start inventory and in the supervision predicate. |
 | After the forge close, before the consumed record | Closing is idempotent: re-running `close` closes again harmlessly and completes the record. |
-| After a refused write, before anyone notices | The refusal is durable under `state/letterbox/write-error` and the next poll raises it as a wake. |
+| After a refused write, before anyone notices | The refusal is durable under `state/letterbox/write-error` and the next poll raises it as a wake while reads continue. A `transport` record clears on the first successful read; a `visibility` record is re-raised once per window until a write lands. |
+| The peer's terminal reply is refused by the credential scan | The reply is never stashed; the wake names both the refused reply and the sent letter. The sent letter stays open, the `unanswered` backstop keeps raising it once per window, and the requester sends a `notice` naming the refused id and class so the peer can answer cleanly. |
 
 ### The stale backstop
 
-A claimed letter whose issue is still open, which has neither a terminal reply from this estate nor a linked live task, is re-surfaced by the poll once per `FM_LETTERBOX_STALE_SECS` window.
+A claimed letter this estate received whose issue is still open, which has neither a terminal reply from this estate nor a linked live task, is re-surfaced by the poll as `stale` once per `FM_LETTERBOX_STALE_SECS` window.
 
-This is the part that does not depend on anyone remembering.
+A letter this estate sent whose issue is still open and whose terminal reply it has not consumed is re-surfaced as `unanswered` on the same window.
+That covers a reply that was refused by the credential scan, and one that never came: the requester keeps being woken instead of the letter going silent, and the letter stays open because the peer still owes a clean answer.
+
+This is the part that does not depend on anyone remembering, on either side of an exchange.
 It costs nothing extra, because the open-issue set is already in hand from the poll's single read.
 
 ## Cost shape

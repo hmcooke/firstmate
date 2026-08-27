@@ -15,8 +15,9 @@
 #       poll. Idempotent. Refuses unless all four activation settings are valid.
 #   fm-letterbox.sh status
 #       Local-only report: activation, whether the poll is armed and registered,
-#       unanswered letters, letters this estate sent that are still open, and any
-#       outbox record whose transport call never completed. Makes no API call.
+#       unanswered letters, letters this estate sent whose terminal reply it has
+#       not yet consumed, and any outbox record whose transport call never
+#       completed. Makes no API call.
 #   fm-letterbox.sh list
 #       Local-only listing of every stashed letter and reply with its state.
 #   fm-letterbox.sh read <id>
@@ -39,7 +40,10 @@
 #
 # Every write first verifies through the transport that the channel repository is
 # still private and REFUSES if it is not, recording the refusal durably so the
-# poll raises it even if this turn is lost. Every write also runs
+# poll raises it even if this turn is lost. The record is classed: its first line
+# is "visibility" when the repository is confirmed not private, which the poll
+# keeps alarming on until a write lands, or "transport" when the check itself
+# could not run, which a successful poll read clears. Every write also runs
 # bin/fm-secret-scan.sh over the assembled card first and refuses on anything but
 # a clean result; it refuses, it never redacts.
 set -u
@@ -67,7 +71,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,44p' "$0" | sed -e 's/^# \{0,1\}//'
+  sed -n '2,48p' "$0" | sed -e 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -95,9 +99,11 @@ ensure_dirs() {
 }
 
 # A refused write is durable state so it survives a lost turn: the poll raises it
-# on the next cycle. Cleared by the next write that actually lands.
+# on the next cycle. Cleared by the next write that actually lands. The first
+# line is the class (visibility or transport) so the poll decides structurally,
+# never by reading the prose, whether a successful read may clear it.
 record_write_error() {
-  printf '%s\n' "$1" \
+  printf '%s\n%s\n' "$1" "$2" \
     | fmx_private_artifact_publish_stdin "$(ROOT_DIR)" "write-error" 600 2>/dev/null || true
 }
 
@@ -110,12 +116,15 @@ clear_write_error() {
 # call, and it is what turns an accidentally public channel from a silent
 # ongoing exposure into a hard stop plus an alarm.
 require_private_channel() {
-  local reason
-  if reason=$(lb_transport require-private 2>/dev/null); then
-    return 0
-  fi
+  local reason rc class
+  reason=$(lb_transport require-private 2>/dev/null); rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  case "$rc" in
+    2) class=visibility ;;
+    *) class=transport ;;
+  esac
   [ -n "$reason" ] || reason="cannot confirm $LB_REPO is private"
-  record_write_error "letterbox write refused: $reason"
+  record_write_error "$class" "letterbox write refused: $reason"
   die "refusing to write: $reason"
 }
 
@@ -184,6 +193,7 @@ write_shim() {
 cmd_arm() {
   require_active
   command -v gh-axi >/dev/null 2>&1 || die "gh-axi is required to reach the channel"
+  command -v gh >/dev/null 2>&1 || die "gh is required to read the channel"
   [ -f "$FM_ROOT/bin/fm-letterbox-poll.sh" ] && [ ! -L "$FM_ROOT/bin/fm-letterbox-poll.sh" ] \
     || die "bin/fm-letterbox-poll.sh is unavailable"
   ensure_dirs
@@ -249,6 +259,7 @@ cmd_status() {
     [ "$(lb_claim_field "$STATE" "$id" class)" != reply ] || continue
     if [ "$(lb_claim_field "$STATE" "$id" from)" = "$LB_SELF" ]; then
       [ -e "$(lb_dir "$STATE" sent)/$id.receipt" ] || continue
+      [ -z "$(lb_claim_field "$STATE" "$id" consumed)" ] || continue
       sent_open=$((sent_open + 1))
     else
       [ -z "$(lb_claim_field "$STATE" "$id" replied)" ] || continue
@@ -257,7 +268,7 @@ cmd_status() {
         "$( [ -n "$(lb_claim_field "$STATE" "$id" task)" ] && printf ' -> task %s' "$(lb_claim_field "$STATE" "$id" task)" )"
     fi
   done
-  printf '  %s letter(s) awaiting a reply from this estate, %s sent, %s unsent\n' "$owed" "$sent_open" "$unsent"
+  printf '  %s letter(s) awaiting a reply from this estate, %s sent and awaiting a reply from the peer, %s unsent\n' "$owed" "$sent_open" "$unsent"
 }
 
 cmd_list() {

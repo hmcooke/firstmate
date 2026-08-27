@@ -24,9 +24,16 @@
 #   a transport read failure or timeout -> print nothing, exit 0; the next cycle
 #                                          retries, so a flaky network never
 #                                          spends a firstmate turn
-#   a configuration fault, a refused
-#   write recorded by fm-letterbox.sh,
-#   or a missing dependency             -> one rate-limited diagnostic line
+#   a configuration fault or a
+#   missing dependency                  -> one rate-limited diagnostic line
+#   a refused write recorded by
+#   fm-letterbox.sh                     -> raised as an error item, and READS
+#       CONTINUE: a refused write never disables intake. A "transport" class
+#       record (the visibility check itself could not run) is raised once and
+#       cleared by the first successful read; a "visibility" class record (the
+#       channel repository is confirmed not private) is never cleared by a
+#       read, only by a write that lands, and is re-raised once per
+#       FM_LETTERBOX_STALE_SECS window so an exposed channel cannot go quiet
 #   a new peer letter                   -> secret-scan the body, stash the card
 #       to state/letterbox/inbox/<id>.json, atomically claim
 #       state/letterbox/claims/<id>.json, and name it on the one output line
@@ -34,9 +41,18 @@
 #       the handling turn can answer "unable" naming the fault class
 #   a terminal peer reply to a letter
 #   this estate sent                    -> stash and claim it once, and name it
+#   a terminal peer reply refused by
+#   the credential scan                 -> claim it once and name the refusal
+#       together with the SENT letter it answers, which is the id the requester
+#       can act on: the sent letter stays open, and the resolution is an
+#       ordinary class=notice letter naming the refused id and the reason
 #   a claimed letter with no reply and
 #   no live task past FM_LETTERBOX_STALE_SECS
 #                                       -> re-surface it once per window
+#   a letter this estate sent whose
+#   issue is still open with no consumed
+#   terminal reply past that window     -> re-surface it once per window, so a
+#       sent letter whose answer was refused or never came cannot go silent
 #
 # ORDERING, and it is the safety property. The receiver's completion boundary is
 # CLAIM-LAST: stash the card, announce it, THEN take the O_EXCL claim. The claim
@@ -76,15 +92,28 @@ CLAIMS=$(lb_claim_dir "$STATE")
 SENT=$(lb_dir "$STATE" sent)
 
 # One rate-limited diagnostic: the same message is announced once, not once per
-# cycle, exactly as the relay poll's error marker works.
+# cycle, exactly as the relay poll's error marker works. The marker's first
+# line is the epoch it was raised at, so a caller that passes a window re-raises
+# the same message once per window instead of once ever.
+error_raised_within() {
+  local msg=$1 window=$2 stamp
+  fmx_private_artifact_file_valid "$ROOT" "poll-error" 600 || return 1
+  [ "$(sed '1d' "$ROOT/poll-error" 2>/dev/null)" = "$msg" ] || return 1
+  [ "$window" -gt 0 ] 2>/dev/null || return 0
+  stamp=$(head -n1 "$ROOT/poll-error" 2>/dev/null)
+  case "$stamp" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(($(date -u +%s) - stamp))" -lt "$window" ]
+}
+
+mark_error_raised() {
+  printf '%s\n%s\n' "$(date -u +%s)" "$1" \
+    | fmx_private_artifact_publish_stdin "$ROOT" "poll-error" 600 2>/dev/null || true
+}
+
 emit_error_once() {
   local msg=$1
-  if fmx_private_artifact_file_valid "$ROOT" "poll-error" 600 \
-    && [ "$(cat "$ROOT/poll-error" 2>/dev/null)" = "$msg" ]; then
-    return 0
-  fi
-  printf '%s\n' "$msg" \
-    | fmx_private_artifact_publish_stdin "$ROOT" "poll-error" 600 2>/dev/null || true
+  error_raised_within "$msg" 0 && return 0
+  mark_error_raised "$msg"
   printf 'letterbox error: %s\n' "$msg"
 }
 
@@ -99,28 +128,52 @@ if [ -n "$LB_CONFIG_ERROR" ]; then
 fi
 command -v jq >/dev/null 2>&1 || { emit_error_once "missing jq"; exit 0; }
 command -v gh-axi >/dev/null 2>&1 || { emit_error_once "missing gh-axi"; exit 0; }
+command -v gh >/dev/null 2>&1 || { emit_error_once "missing gh"; exit 0; }
 
 # A write that fm-letterbox.sh refused - most importantly the visibility
 # precondition - is durable state, so it survives the turn that hit it and is
-# raised here even if that turn was lost.
+# raised here even if that turn was lost. It NEVER stops the read path below: a
+# refused write must not disable intake. Its first line is the class.
 WRITE_ERROR_FILE="$ROOT/write-error"
+WRITE_ERROR_CLASS=
+WRITE_ERROR_MSG=
+WRITE_ERROR_WINDOW=0
 if fmx_private_artifact_file_valid "$ROOT" "write-error" 600; then
-  WRITE_ERROR=$(cat "$WRITE_ERROR_FILE" 2>/dev/null || true)
-  if [ -n "$WRITE_ERROR" ]; then
-    emit_error_once "$WRITE_ERROR"
-    exit 0
-  fi
+  WRITE_ERROR_CLASS=$(head -n1 "$WRITE_ERROR_FILE" 2>/dev/null || true)
+  WRITE_ERROR_MSG=$(sed '1d' "$WRITE_ERROR_FILE" 2>/dev/null || true)
+  case "$WRITE_ERROR_CLASS" in
+    visibility) WRITE_ERROR_WINDOW=$LB_STALE_SECS ;;
+    transport) : ;;
+    *) WRITE_ERROR_CLASS=transport ;;
+  esac
+fi
+PENDING_ERROR=
+if [ -n "$WRITE_ERROR_MSG" ] && ! error_raised_within "$WRITE_ERROR_MSG" "$WRITE_ERROR_WINDOW"; then
+  PENDING_ERROR=$WRITE_ERROR_MSG
 fi
 
 WORK=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-letterbox-poll.XXXXXX") || exit 0
 trap 'rm -rf -- "$WORK"' EXIT HUP INT TERM
 
 OPEN_JSON="$WORK/open.json"
-if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null; then
+if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
+  || ! jq -e 'type == "array"' "$OPEN_JSON" >/dev/null 2>&1; then
+  # The read failed, so nothing below can run this cycle; a pending write-error
+  # is still raised rather than waiting on a transport that may stay down.
+  if [ -n "$PENDING_ERROR" ]; then
+    mark_error_raised "$PENDING_ERROR"
+    printf 'letterbox error: %s\n' "$PENDING_ERROR"
+  fi
   exit 0
 fi
-jq -e 'type == "array"' "$OPEN_JSON" >/dev/null 2>&1 || exit 0
-clear_error
+# A successful read clears a transport-class write-error: the check that failed
+# was the transport itself, and it is demonstrably back. A visibility-class
+# record is untouched, because a readable repository says nothing about whether
+# it is private; only a write that lands clears that.
+if [ "$WRITE_ERROR_CLASS" != visibility ]; then
+  clear_error
+  [ -z "$WRITE_ERROR_CLASS" ] || rm -f "$WRITE_ERROR_FILE" 2>/dev/null || true
+fi
 
 # Announcements accumulate here and are printed as ONE line at the end, so a
 # busy cycle still costs exactly one wake.
@@ -132,6 +185,8 @@ announce() {
   [ "$ITEMS" -le 3 ] || return 0
   if [ -z "$LINE" ]; then LINE=$1; else LINE="$LINE; $1"; fi
 }
+
+[ -z "$PENDING_ERROR" ] || announce "error: $PENDING_ERROR"
 
 # Every write that would suppress a FUTURE announcement is queued here and
 # applied only after the announcement line has been printed. Nothing in this
@@ -153,6 +208,7 @@ queue_resurface() {
 
 flush_suppressions() {
   local cid cclass cfrom cissue crefusal
+  [ -z "$PENDING_ERROR" ] || mark_error_raised "$PENDING_ERROR"
   while IFS="	" read -r cid cclass cfrom cissue crefusal; do
     [ -n "$cid" ] || continue
     lb_claim_create "$STATE" "$cid" "$cclass" "$cfrom" "$cissue" "$crefusal" >/dev/null 2>&1
@@ -208,6 +264,9 @@ while [ "$i" -lt "$COUNT" ]; do
       ;;
   esac
 
+  # A reply card posted as an issue body answers nothing that lives here: it is
+  # ignored exactly as a card addressed elsewhere is, never stashed as a letter.
+  [ "$LB_F_KIND" = request ] || { i=$((i + 1)); continue; }
   ID=$LB_F_ID
   # The claim is the completion boundary and is taken last, so its presence
   # proves this card was already stashed AND announced.
@@ -303,7 +362,10 @@ for receipt in "$SENT"/*.receipt; do
             queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" ""
           fi
         else
-          announce "refused $LB_F_ID $LB_SCAN_REASON"
+          # The wake names the SENT letter too: a refused reply cannot be
+          # answered in correlation, so the letter it answers is what the
+          # requester acts on, and the sent-letter backstop keeps raising it.
+          announce "refused $LB_F_ID $LB_SCAN_REASON for $SENT_ID"
           queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" "$LB_SCAN_REASON"
         fi
       fi
@@ -321,11 +383,21 @@ PENDING_CURSOR=$CURSOR_JSON
 
 # --- the stale backstop -----------------------------------------------------
 #
-# This is what does not depend on anyone remembering. A claimed letter whose
-# issue is still open, which has neither a terminal reply from this estate nor a
-# linked live task, is re-surfaced once per FM_LETTERBOX_STALE_SECS window. It
-# is the answer to "what if the obligation was dropped between the claim and the
-# task", and it is free: the open-issue set is already in hand.
+# This is what does not depend on anyone remembering, on either side of an
+# exchange, and it is free: the open-issue set is already in hand.
+#
+#   "stale": a claimed letter this estate RECEIVED whose issue is still open,
+#   which has neither a terminal reply from this estate nor a linked live task.
+#   It is the answer to "what if the obligation was dropped between the claim
+#   and the task".
+#
+#   "unanswered": a letter this estate SENT whose issue is still open and whose
+#   terminal reply it has not consumed. It is the answer to "what if the peer's
+#   reply was refused, or never came": the requester keeps being woken instead
+#   of the letter going silent, and resolves it with an ordinary class=notice
+#   letter, or by consuming a clean reply, or by whatever closes the issue.
+#
+# Either is re-surfaced once per FM_LETTERBOX_STALE_SECS window.
 NOW=$(date -u +%s)
 for claim in "$CLAIMS"/*.json; do
   [ -e "$claim" ] || continue
@@ -336,23 +408,32 @@ for claim in "$CLAIMS"/*.json; do
   lb_id_valid "$CID" || continue
   jq -e '.' "$claim" >/dev/null 2>&1 || continue
   CFROM=$(lb_claim_field "$STATE" "$CID" from)
-  [ "$CFROM" = "$LB_PEER" ] || continue
-  [ "$(lb_claim_field "$STATE" "$CID" class)" != reply ] || continue
-  [ -z "$(lb_claim_field "$STATE" "$CID" replied)" ] || continue
+  CCLASS=$(lb_claim_field "$STATE" "$CID" class)
+  [ "$CCLASS" != reply ] || continue
+  if [ "$CFROM" = "$LB_PEER" ]; then
+    VERB=stale
+    [ -z "$(lb_claim_field "$STATE" "$CID" replied)" ] || continue
+    CTASK=$(lb_claim_field "$STATE" "$CID" task)
+    if [ -n "$CTASK" ] && [ -e "$STATE/$CTASK.meta" ]; then continue; fi
+  elif [ "$CFROM" = "$LB_SELF" ]; then
+    VERB=unanswered
+    [ -e "$SENT/$CID.receipt" ] || continue
+    [ -z "$(lb_claim_field "$STATE" "$CID" consumed)" ] || continue
+  else
+    continue
+  fi
   CNUMBER=$(lb_claim_field "$STATE" "$CID" issue)
   case "$OPEN_NUMBERS" in
     *" $CNUMBER "*) : ;;
     *) continue ;;
   esac
-  CTASK=$(lb_claim_field "$STATE" "$CID" task)
-  if [ -n "$CTASK" ] && [ -e "$STATE/$CTASK.meta" ]; then continue; fi
   CLAIMED=$(lb_claim_field "$STATE" "$CID" claimed)
   case "$CLAIMED" in ''|*[!0-9]*) continue ;; esac
   [ "$((NOW - CLAIMED))" -ge "$LB_STALE_SECS" ] || continue
   RESURFACED=$(lb_claim_field "$STATE" "$CID" resurfaced)
   case "$RESURFACED" in ''|*[!0-9]*) RESURFACED=0 ;; esac
   [ "$((NOW - RESURFACED))" -ge "$LB_STALE_SECS" ] || continue
-  announce "stale $CID $(lb_claim_field "$STATE" "$CID" class)"
+  announce "$VERB $CID $CCLASS"
   queue_resurface "$CID"
 done
 

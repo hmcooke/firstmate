@@ -205,7 +205,10 @@ lb_issue_title() {
 # field (body) written as a block scalar and required to come last.
 #
 # Every body line is indented by exactly two spaces, which is what stops body
-# content from reaching column 0 and closing the fence it lives in. The block
+# content from reaching column 0 and closing the fence it lives in. A single
+# trailing carriage return per line is line-ending normalisation and nothing
+# more: a CRLF body authored through a forge's web editor parses to exactly the
+# fields its LF twin does, and every refusal still fires on it. The block
 # scalar clips a single trailing newline, exactly as YAML "|" does, so a body
 # round-trips through serialise-then-parse unchanged apart from that clip.
 #
@@ -258,7 +261,7 @@ lb_card_parse() {
   local file=$1 now=${2-} line key val content fences
   lb_card_reset
   [ -f "$file" ] && [ ! -L "$file" ] || return 2
-  fences=$(grep -c "^$LB_CARD_FENCE\$" -- "$file" 2>/dev/null || printf '0')
+  fences=$(grep -c "^$LB_CARD_FENCE$(printf '\r')\{0,1\}\$" -- "$file" 2>/dev/null || printf '0')
   case "$fences" in
     0) return 2 ;;
     1) : ;;
@@ -267,6 +270,7 @@ lb_card_parse() {
 
   local in_block=0 in_body=0 body_started=0 body=''
   while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
     if [ "$in_block" -eq 0 ]; then
       [ "$line" = "$LB_CARD_FENCE" ] && in_block=1
       continue
@@ -475,14 +479,47 @@ lb_claim_exists() {
 # lb_claim_create <state> <id> <class> <from> <issue> [refusal]
 # 0 = this caller claimed it, 1 = already claimed, 2 = could not claim.
 lb_claim_create() {
-  local state=$1 id=$2 class=$3 from=$4 issue=$5 refusal=${6-}
-  jq -n --arg id "$id" --arg class "$class" --arg from "$from" \
+  local state=$1 id=$2 class=$3 from=$4 issue=$5 refusal=${6-} tmp rc
+  tmp=$(lb_claim_tmp) || return 2
+  if ! jq -n --arg id "$id" --arg class "$class" --arg from "$from" \
     --argjson issue "$issue" --argjson claimed "$(date -u +%s)" \
     --arg refusal "$refusal" \
     '{id:$id,class:$class,from:$from,issue:$issue,claimed:$claimed,
       refusal:$refusal,task:"",replied:"",reply_id:"",resurfaced:0,consumed:[]}' \
-    2>/dev/null \
-    | fmx_private_artifact_publish_stdin_once "$(lb_claim_dir "$state")" "$id.json" 600
+    > "$tmp" 2>/dev/null || ! jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    return 2
+  fi
+  fmx_private_artifact_publish_stdin_once "$(lb_claim_dir "$state")" "$id.json" 600 < "$tmp"
+  rc=$?
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
+# The rewrite helpers never pipe jq straight into the publisher: jq's output is
+# written to a private temp file and published only once jq succeeded and
+# produced an object, so a claim that jq cannot read is left exactly as it was
+# and the caller sees the failure instead of an empty file over a good claim.
+lb_claim_tmp() {
+  (umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-claim.XXXXXX")
+}
+
+# lb_claim_rewrite <state> <id> <jq-filter> [jq args...]
+lb_claim_rewrite() {
+  local state=$1 id=$2 filter=$3 path tmp rc
+  shift 3
+  path=$(lb_claim_path "$state" "$id")
+  [ -f "$path" ] || return 1
+  tmp=$(lb_claim_tmp) || return 1
+  if ! jq "$@" "$filter" "$path" > "$tmp" 2>/dev/null \
+    || ! jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  fmx_private_artifact_publish_stdin "$(lb_claim_dir "$state")" "$id.json" 600 < "$tmp"
+  rc=$?
+  rm -f -- "$tmp"
+  return "$rc"
 }
 
 lb_claim_field() {
@@ -494,19 +531,16 @@ lb_claim_field() {
 # lb_claim_set <state> <id> <field> <value>: rewrite one claim field in place.
 # The claim already exists here, so this is a replace rather than a claim.
 lb_claim_set() {
-  local state=$1 id=$2 field=$3 value=$4 path
-  path=$(lb_claim_path "$state" "$id")
-  [ -f "$path" ] || return 1
-  jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$path" 2>/dev/null \
-    | fmx_private_artifact_publish_stdin "$(lb_claim_dir "$state")" "$id.json" 600
+  local state=$1 id=$2 field=$3 value=$4
+  # shellcheck disable=SC2016 # A jq filter, expanded by jq.
+  lb_claim_rewrite "$state" "$id" '.[$f] = $v' --arg f "$field" --arg v "$value"
 }
 
 lb_claim_set_number() {
-  local state=$1 id=$2 field=$3 value=$4 path
-  path=$(lb_claim_path "$state" "$id")
-  [ -f "$path" ] || return 1
-  jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$path" 2>/dev/null \
-    | fmx_private_artifact_publish_stdin "$(lb_claim_dir "$state")" "$id.json" 600
+  local state=$1 id=$2 field=$3 value=$4
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  # shellcheck disable=SC2016 # A jq filter, expanded by jq.
+  lb_claim_rewrite "$state" "$id" '.[$f] = $v' --arg f "$field" --argjson v "$value"
 }
 
 # Terminal-reply dedupe: a reply id is recorded in the claim BEFORE the issue is
@@ -519,11 +553,9 @@ lb_claim_consumed() {
 }
 
 lb_claim_consume() {
-  local state=$1 id=$2 reply=$3 path
-  path=$(lb_claim_path "$state" "$id")
-  [ -f "$path" ] || return 1
-  jq --arg r "$reply" '.consumed = ((.consumed // []) + [$r] | unique)' "$path" 2>/dev/null \
-    | fmx_private_artifact_publish_stdin "$(lb_claim_dir "$state")" "$id.json" 600
+  local state=$1 id=$2 reply=$3
+  # shellcheck disable=SC2016 # A jq filter, expanded by jq.
+  lb_claim_rewrite "$state" "$id" '.consumed = ((.consumed // []) + [$r] | unique)' --arg r "$reply"
 }
 
 # --- credential refusal -----------------------------------------------------

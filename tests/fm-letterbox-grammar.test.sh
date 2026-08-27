@@ -432,6 +432,71 @@ SH
   pass "the scan gate refuses when the scanner itself cannot run"
 }
 
+test_crlf_card_parses_identically_to_its_lf_twin() {
+  local dir lf crlf
+  dir="$TMP_ROOT/crlf"; mkdir -p "$dir"
+  write_request "$dir/lf.md" archie-20260824T140311Z-9f2c1ab4 fact-lookup "web authored" "line one
+line two"
+  sed "s/\$/$(printf '\r')/" "$dir/lf.md" > "$dir/crlf.md"
+  grep -q "$(printf '\r')" "$dir/crlf.md" || fail "the CRLF twin must actually carry carriage returns"
+  cat > "$dir/snippet.sh" <<'SH'
+lb_card_parse "$1" "$NOW" || { echo "REFUSED ${LB_REFUSAL}"; exit 1; }
+printf 'id=%s\nclass=%s\nfrom=%s\nto=%s\nsubject=%s\nissued=%s\nBODY<<%s>>\n' \
+  "$LB_F_ID" "$LB_F_CLASS" "$LB_F_FROM" "$LB_F_TO" "$LB_F_SUBJECT" "$LB_F_ISSUED" "$LB_F_BODY"
+SH
+  lf=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/lf.md") || fail "the LF card must parse: $lf"
+  crlf=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/crlf.md") \
+    || fail "a CRLF card authored through a web editor must parse, not be silently ignored: $crlf"
+  [ "$lf" = "$crlf" ] || fail "a CRLF card must parse to exactly the fields of its LF twin
+LF:
+$lf
+CRLF:
+$crlf"
+  case "$crlf" in *"$(printf '\r')"*) fail "no field may keep a carriage return" ;; esac
+  # Every refusal still fires on a CRLF card: the normalisation is line endings only.
+  write_request "$dir/bad-lf.md" archie-20260824T140311Z-9f2c1ab4 merge-pr
+  sed "s/\$/$(printf '\r')/" "$dir/bad-lf.md" > "$dir/bad-crlf.md"
+  crlf=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/bad-crlf.md") \
+    && fail "a CRLF card outside the class allowlist must still be refused"
+  assert_contains "$crlf" "REFUSED unknown-class" "the CRLF refusal must name the same class"
+  pass "a CRLF-authored card parses to the same fields as its LF twin and is refused on the same faults"
+}
+
+test_claim_rewrites_never_publish_over_a_claim_jq_cannot_read() {
+  local dir out
+  dir="$TMP_ROOT/claim-jq"; mkdir -p "$dir"
+  cat > "$dir/snippet.sh" <<'SH'
+state=$1
+id=archie-20260824T140311Z-9f2c1ab4
+lb_claim_create "$state" "$id" fact-lookup archie 7; printf 'create=%s\n' "$?"
+lb_claim_create "$state" "$id" fact-lookup archie 7; printf 'again=%s\n' "$?"
+lb_claim_create "$state" archie-20260824T140311Z-00000002 fact-lookup archie notanumber; printf 'badissue=%s\n' "$?"
+[ -e "$(lb_claim_path "$state" archie-20260824T140311Z-00000002)" ] && printf 'badissue-file=present\n'
+lb_claim_set "$state" "$id" task letter-work; printf 'set=%s\n' "$?"
+printf 'task=%s\n' "$(lb_claim_field "$state" "$id" task)"
+lb_claim_set_number "$state" "$id" resurfaced notanumber; printf 'setnum=%s\n' "$?"
+printf 'not json\n' > "$(lb_claim_path "$state" "$id")"
+lb_claim_set "$state" "$id" task other; printf 'corrupt-set=%s\n' "$?"
+lb_claim_set_number "$state" "$id" resurfaced 5; printf 'corrupt-setnum=%s\n' "$?"
+lb_claim_consume "$state" "$id" archie-20260824T150000Z-0c1ea11e; printf 'corrupt-consume=%s\n' "$?"
+printf 'after<<%s>>\n' "$(cat "$(lb_claim_path "$state" "$id")")"
+SH
+  out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/state")
+  assert_contains "$out" "create=0" "the first claim must succeed"
+  assert_contains "$out" "again=1" "a second claim of the same id must report already claimed"
+  assert_contains "$out" "badissue=2" "a claim jq cannot build must report an error, not success"
+  assert_not_contains "$out" "badissue-file=present" "a claim jq could not build must leave no file"
+  assert_contains "$out" "set=0" "a field rewrite on a good claim must succeed"
+  assert_contains "$out" "task=letter-work" "the rewrite must land"
+  assert_contains "$out" "setnum=1" "a non-numeric number must be refused"
+  assert_contains "$out" "corrupt-set=1" "a rewrite of an unreadable claim must fail"
+  assert_contains "$out" "corrupt-setnum=1" "a numeric rewrite of an unreadable claim must fail"
+  assert_contains "$out" "corrupt-consume=1" "a consume on an unreadable claim must fail"
+  assert_contains "$out" "after<<not json>>" \
+    "a failed rewrite must leave the claim byte for byte as it was, never an empty file"
+  pass "claim rewrites publish only what jq produced, so a jq failure never empties a claim"
+}
+
 # ---------------------------------------------------------------------------
 
 test_card_round_trips_through_serialise_and_parse
@@ -456,3 +521,5 @@ test_scanner_honesty_control_n7_records_the_measured_limit
 test_scanner_positive_control_passes_ordinary_prose
 test_scanner_treats_its_own_failure_as_a_refusal
 test_scanner_gate_refuses_when_the_scanner_cannot_run
+test_crlf_card_parses_identically_to_its_lf_twin
+test_claim_rewrites_never_publish_over_a_claim_jq_cannot_read
