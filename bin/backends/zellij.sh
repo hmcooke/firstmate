@@ -388,6 +388,46 @@ fm_backend_zellij_target_ready() {  # <target> [expected-label]
   [ "$FM_BACKEND_ZELLIJ_PRESENCE" = present ]
 }
 
+# fm_backend_zellij_no_sessions_answer: 0 when <listing-text> is zellij's own
+# definitive "there are no sessions at all" answer to a failed `list-sessions`.
+# That answer is positive evidence of absence rather than a failed read: a
+# zellij pane cannot outlive its session, and no session means no pane. It is
+# the zellij counterpart of fm_backend_tmux_server_gone_error. Every other
+# non-zero result - a connection error, a read killed by a caller deadline
+# that yields no output, an unrecognisable body - is a read we could not
+# complete, and stays unknown.
+#
+# Zellij is NOT installed on the verification machine, so the exact text zellij
+# emits for this answer is matched defensively by shape rather than pinned to
+# verified output. The failure direction is deliberate: an unmatched answer
+# reads unknown, which refuses, never absent.
+fm_backend_zellij_no_sessions_answer() {  # <listing-text>
+  case "$1" in
+    *"No active zellij sessions found"*) return 0 ;;
+  esac
+  return 1
+}
+
+# fm_backend_zellij_session_exited: 0 when the NON-short `list-sessions`
+# listing marks <session> as EXITED (resurrectable). The short listing still
+# names such a session, but no pane query can succeed against it, so without
+# this read an ended session would answer unknown forever and cleanup could
+# never complete. An EXITED marker on the recorded session is positive
+# evidence the endpoint is gone; a listing that cannot be read, or one in
+# which the session appears without that marker, is not, and returns 1 so the
+# caller stays unknown.
+#
+# Zellij is NOT installed on the verification machine, so the EXITED marker
+# (rendered as "(EXITED - attach to resurrect)" in the documented output) is
+# matched defensively by shape rather than pinned to verified output. The
+# failure direction is deliberate: an unmatched listing reads unknown, which
+# refuses, never absent.
+fm_backend_zellij_session_exited() {  # <session>
+  local listing
+  listing=$(zellij list-sessions --no-formatting 2>/dev/null) || return 1
+  printf '%s\n' "$listing" | awk -v want="$1" '$1 == want && index($0, "EXITED") > 0 { found = 1 } END { exit !found }'
+}
+
 # fm_backend_zellij_presence_probe: the single zellij endpoint classifier. Sets
 # FM_BACKEND_ZELLIJ_PRESENCE to present|absent|unknown, leaving the parsed
 # FM_BACKEND_ZELLIJ_SESSION/FM_BACKEND_ZELLIJ_PANE in place for the two views
@@ -402,7 +442,11 @@ fm_backend_zellij_target_ready() {  # <target> [expected-label]
 # that omits the session, or a successful pane list that omits the pane, is
 # positive evidence the recorded endpoint is gone; a failed read, an
 # unparseable body, or a malformed target is a read we could not complete and
-# stays unknown. When the caller supplies the owning task label, a pane that is
+# stays unknown. Two explicit zellij answers are absence rather than failure:
+# a failed session list carrying the no-sessions answer
+# (fm_backend_zellij_no_sessions_answer), and a listed session whose pane read
+# fails while the non-short listing marks it EXITED
+# (fm_backend_zellij_session_exited). When the caller supplies the owning task label, a pane that is
 # live but positively belongs to a differently named tab is absence of THIS
 # endpoint (its numeric id was reused), while an unreadable tab list is not.
 fm_backend_zellij_presence_probe() {  # <target> [expected-label]
@@ -412,10 +456,16 @@ fm_backend_zellij_presence_probe() {  # <target> [expected-label]
   case "$FM_BACKEND_ZELLIJ_PANE" in
     ''|*[!0-9]*) return 0 ;;
   esac
-  sessions=$(zellij list-sessions --short --no-formatting 2>/dev/null) || return 0
+  if ! sessions=$(zellij list-sessions --short --no-formatting 2>&1); then
+    fm_backend_zellij_no_sessions_answer "$sessions" && FM_BACKEND_ZELLIJ_PRESENCE=absent
+    return 0
+  fi
   printf '%s\n' "$sessions" | grep -qxF "$FM_BACKEND_ZELLIJ_SESSION" \
     || { FM_BACKEND_ZELLIJ_PRESENCE=absent; return 0; }
-  panes=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null) || return 0
+  if ! panes=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null); then
+    fm_backend_zellij_session_exited "$FM_BACKEND_ZELLIJ_SESSION" && FM_BACKEND_ZELLIJ_PRESENCE=absent
+    return 0
+  fi
   printf '%s' "$panes" | jq -e . >/dev/null 2>&1 || return 0
   tab_id=$(printf '%s' "$panes" \
     | jq -r --argjson p "$FM_BACKEND_ZELLIJ_PANE" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1)

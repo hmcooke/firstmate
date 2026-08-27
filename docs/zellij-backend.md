@@ -67,6 +67,9 @@ Endpoint presence is a three-way verdict in which absence needs positive evidenc
 The Zellij verdict captures each read's exit status separately, because `list-sessions` and `action list-panes --json` report a failed query and an empty result identically once their output is piped.
 A successful session list that omits the session, or a successful pane list that omits the pane, is absent; when the owning task label is supplied, a pane that is live but positively belongs to a differently named tab is also absent, because its numeric id has been reused.
 A failed read, an unparseable body, an unreadable tab list, or a malformed target is unknown.
+Two explicit Zellij answers are positive absence rather than failed reads, mirroring the tmux no-server rule: a failed `list-sessions` that carries Zellij's own no-sessions answer means no session exists so the recorded pane cannot, and a session that the short listing still names but the non-short listing marks EXITED (resurrectable) has no live pane to read.
+The EXITED listing is consulted only when the session is listed and the pane read fails; an unrelated `list-sessions` error, a read killed by a caller deadline with no output, a non-short listing that cannot be read, or a listed session without the EXITED marker all stay unknown.
+Zellij is not installed on the verification machine, so the exact text of the no-sessions answer and the EXITED marker are matched defensively by shape rather than pinned to verified output; the failure direction is deliberate, because an unmatched answer reads unknown, which refuses, never absent.
 
 Zellij's CLI action commands return exit 0 even for missing sessions or panes.
 The adapter therefore verifies session, terminal pane, and expected title before an operation and validates JSON or integer response shapes afterward.

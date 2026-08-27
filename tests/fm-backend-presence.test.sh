@@ -264,18 +264,31 @@ make_zellij() {  # <dir> <mode>
   cat > "$fakebin/zellij" <<SH
 #!/usr/bin/env bash
 set -u
+short=0
+for a in "\$@"; do [ "\$a" = --short ] && short=1; done
 for a in "\$@"; do
   case "\$a" in
     list-sessions)
       case '$mode' in
         sessions-fail) printf '%s\n' 'zellij: could not connect' >&2; exit 1 ;;
+        sessions-timed-out) exit 124 ;;
+        no-sessions) printf '%s\n' 'No active zellij sessions found.'; exit 1 ;;
         session-gone) printf '%s\n' 'other'; exit 0 ;;
+        session-exited|session-exited-listing-fail|session-listed-panes-fail)
+          if [ "\$short" = 1 ]; then printf '%s\n' 'sess'; exit 0; fi
+          case '$mode' in
+            session-exited) printf '%s\n' 'sess [Created 2h ago] (EXITED - attach to resurrect)'; exit 0 ;;
+            session-exited-listing-fail) printf '%s\n' 'zellij: could not connect' >&2; exit 1 ;;
+            *) printf '%s\n' 'sess [Created 2h ago]'; exit 0 ;;
+          esac
+          ;;
         *) printf '%s\n' 'sess'; exit 0 ;;
       esac
       ;;
     list-panes)
       case '$mode' in
         pane-gone) printf '%s\n' '[{"id":9,"is_plugin":false,"tab_id":2}]'; exit 0 ;;
+        session-exited|session-exited-listing-fail|session-listed-panes-fail) printf '%s\n' 'Error: session "sess" is not running' >&2; exit 1 ;;
         panes-fail) printf '%s\n' 'zellij: query timed out' >&2; exit 1 ;;
         panes-timed-out) exit 124 ;;
         panes-garbage) printf '%s\n' 'not json'; exit 0 ;;
@@ -312,8 +325,21 @@ test_zellij_presence() {
 
   fb=$(make_zellij "$TMP_ROOT/zellij-session-gone" session-gone)
   expect_presence "$fb" zellij sess:7 absent "a readable session list that omits the session is absence"
+  fb=$(make_zellij "$TMP_ROOT/zellij-no-sessions" no-sessions)
+  expect_presence "$fb" zellij sess:7 absent "zellij's explicit no-sessions answer is positive absence"
+  [ "$(confirmed_gone "$fb" zellij sess:7)" = yes ] || fail "the no-sessions answer must confirm the endpoint gone"
+  fb=$(make_zellij "$TMP_ROOT/zellij-session-exited" session-exited)
+  expect_presence "$fb" zellij sess:7 absent "a listed session marked EXITED whose pane read fails is positive absence"
+  [ "$(confirmed_gone "$fb" zellij sess:7)" = yes ] || fail "an EXITED zellij session must confirm the endpoint gone"
+  for mode in session-listed-panes-fail session-exited-listing-fail; do
+    fb=$(make_zellij "$TMP_ROOT/zellij-$mode" "$mode")
+    expect_presence "$fb" zellij sess:7 unknown \
+      "a listed session whose pane read fails without an EXITED marker ($mode) is unknown, never absent"
+    [ "$(confirmed_gone "$fb" zellij sess:7)" = no ] \
+      || fail "a failed pane read on a listed session ($mode) must never confirm the endpoint gone"
+  done
 
-  for mode in sessions-fail panes-fail panes-timed-out panes-garbage; do
+  for mode in sessions-fail sessions-timed-out panes-fail panes-timed-out panes-garbage; do
     fb=$(make_zellij "$TMP_ROOT/zellij-$mode" "$mode")
     expect_presence "$fb" zellij sess:7 unknown \
       "a failed or timed-out zellij read ($mode) is unknown, never absent"

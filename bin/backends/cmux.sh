@@ -494,7 +494,7 @@ fm_backend_cmux_id_in_inventory() {  # <inventory> <title>
 # refreshes stale ids, and a workspace id reused under a DIFFERENT title is
 # positive evidence this endpoint is gone.
 fm_backend_cmux_presence_probe() {  # <target> [expected-label]
-  local expected_label=${2:-} expected_title title inventory wsid sfid surface
+  local expected_label=${2:-} expected_title title inventory inventory_read=0 wsid sfid surface
   FM_BACKEND_CMUX_PRESENCE=unknown
   fm_backend_cmux_parse_target "$1" || return 0
   if [ -z "$expected_label" ]; then
@@ -513,6 +513,7 @@ fm_backend_cmux_presence_probe() {  # <target> [expected-label]
   title=$(fm_backend_cmux_title_scoped "$FM_BACKEND_CMUX_WORKSPACE")
   if [ -z "$title" ]; then
     inventory=$(fm_backend_cmux_workspace_inventory) || return 0
+    inventory_read=1
     title=$(fm_backend_cmux_title_in_inventory "$inventory" "$FM_BACKEND_CMUX_WORKSPACE")
   fi
   if [ "$title" = "$expected_title" ]; then
@@ -526,7 +527,7 @@ fm_backend_cmux_presence_probe() {  # <target> [expected-label]
     FM_BACKEND_CMUX_PRESENCE=absent
     return 0
   else
-    [ -n "${inventory:-}" ] || { inventory=$(fm_backend_cmux_workspace_inventory) || return 0; }
+    [ "$inventory_read" = 1 ] || { inventory=$(fm_backend_cmux_workspace_inventory) || return 0; }
     wsid=$(fm_backend_cmux_id_in_inventory "$inventory" "$expected_title")
     [ -n "$wsid" ] || { FM_BACKEND_CMUX_PRESENCE=absent; return 0; }
   fi
