@@ -21,9 +21,11 @@
 #   - fm_backend_target_exists stays the boolean compatibility view of present.
 #   - fm_backend_endpoint_confirmed_gone, the gate cleanup uses before erasing
 #     a durable endpoint record, is true only for absent.
-#   - tmux presence comes from a session inventory, never from display-message:
-#     tmux silently falls back to the active window, so display-message reports
-#     a window that does not exist as live.
+#   - tmux presence comes from a server-wide pane inventory, never from
+#     display-message: tmux silently falls back to the active window, so
+#     display-message reports a window that does not exist as live. The target's
+#     shape selects a single-field alias format, and a shape the inventory
+#     cannot enumerate by value stays unknown.
 #   - cmux presence sweeps every window, because `workspace list` with no
 #     --window is scoped to the current window only.
 set -u
