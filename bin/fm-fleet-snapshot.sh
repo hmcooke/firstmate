@@ -29,7 +29,9 @@
 #     fm-classify-lib.sh's authoritative status_open_decisions fold and reconciled
 #     against current_state; hints.pending_decision and hints.blocked_event are
 #     booleans derived from that set.
-#     endpoint.exists is the cheap backend endpoint-presence read.
+#     endpoint.exists is the cheap backend endpoint-presence read, tri-state:
+#     true (present), false (positively absent), or null (could not be observed,
+#     never a claim the endpoint is gone; fm-backend.sh fm_backend_target_presence).
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
 #   scout_reports[]: present data/<id>/report.md pointers.
