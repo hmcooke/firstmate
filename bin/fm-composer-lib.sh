@@ -98,9 +98,19 @@
 # fm_composer_normalize_trim_var is the one fix: it maps every code point
 # Unicode gives the property White_Space=Yes outside ASCII onto a plain ASCII
 # space before any trim or comparison, byte-exactly, so the verdict cannot
-# depend on the ambient locale. Glyph strips use literal byte-exact pattern
-# removal for the same reason: `${v#?}` removes one BYTE under LC_ALL=C and
-# one CHARACTER under UTF-8, which used to leave partial multibyte residue.
+# depend on the ambient locale. That predicate - a verified agent glyph
+# followed only by Unicode whitespace - is pinned over the WHOLE declared set
+# in both locales by tests/fm-composer-lib.test.sh, from a table declared
+# independently of the list below, so narrowing or widening it fails loudly
+# rather than quietly shrinking what is proven.
+#
+# KNOWN LIMITATION, deliberately not fixed here: `${v#?}` removes one BYTE
+# under LC_ALL=C and one CHARACTER under UTF-8, so a single-character strip of
+# a multibyte glyph is locale-dependent and leaves partial UTF-8 residue. This
+# is a bash/locale constraint, not a firstmate choice. Every glyph strip in
+# this file therefore removes the matched glyph as a LITERAL byte sequence
+# (`${v#*"$glyph"}`) instead, which is correct in every locale; a future edit
+# that "simplifies" one back to `${v#?}` reintroduces the residue.
 #
 # Re-sourcing is a cheap idempotent redefinition, so this file needs no
 # include guard (matching bin/fm-tmux-lib.sh).
@@ -504,6 +514,8 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   [ -n "$content" ] || { printf 'empty'; return 0; }
   fm_composer_idle_matches "$content" "$idle_re" "$idle_case" && idle_collision=1
   if fm_composer_leading_prompt_glyph_var glyph "$content"; then
+    # Byte-exact literal removal, never `${content#?}`: see the header's KNOWN
+    # LIMITATION - a one-character strip of a multibyte glyph is locale-dependent.
     content=${content#*"$glyph"}
   fi
   fm_composer_normalize_trim_var content
