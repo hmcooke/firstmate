@@ -1230,6 +1230,79 @@ test_own_unsent_recovery_after_swallowed_enter_clears_buffer() {
   pass "a swallowed Enter then recovery submits our own digest with Enter only and clears the buffer"
 }
 
+test_recovery_recognises_an_envelope_prefix_soft_wrap() {
+  local dir state fakebin sent attempts msg first second
+  dir=$(make_bordered_case own-unsent-prefix-wrap)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  fm_operational_input_encode away-supervisor "done: recovered prefix wrap" msg \
+    || fail "could not encode the prefix-wrap recovery digest"
+  first=${msg%%supervisor:*}
+  second="supervisor:${msg#*supervisor:}"
+  [ "$first" != "$msg" ] || fail "could not split the envelope prefix fixture"
+  printf '❯ %s\n%s\n' "$first" "$second" > "$dir/composer"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_INJECT_CONFIRM_SLEEP=0.05 \
+    inject_recover_own_unsent firstmate:0 tmux "$state" "$msg" \
+    || fail "recovery rejected its own envelope when the prefix was soft-wrapped"
+
+  [ "$(grep -c 'ENTER-ATTEMPT' "$attempts" 2>/dev/null || true)" -eq 1 ] \
+    || fail "prefix-wrap recovery did not submit with exactly one Enter"
+  grep -F 'FIRSTMATE_OP' "$sent" >/dev/null \
+    && fail "prefix-wrap recovery retyped the digest"
+  grep -F 'FIRSTMATE_OP' "$dir/composer" >/dev/null \
+    && fail "prefix-wrap recovery left the digest in the composer"
+  pass "own-envelope recovery recognises a soft wrap inside its prefix"
+}
+
+test_mid_token_soft_wrap_recovers_once_without_duplicate_delivery() {
+  local dir state fakebin sent attempts pending first second
+  dir=$(make_bordered_case own-unsent-mid-token-wrap)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: midtokenvalue"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+    FM_FAKE_PERSIST_SWALLOW=1 FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report the mid-token digest delivered"
+  pending=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" \
+    fm_backend_composer_content tmux firstmate:0) \
+    || fail "could not read the swallowed mid-token digest"
+  first=${pending%%midtokenvalue*}mid
+  second="tokenvalue${pending#*midtokenvalue}"
+  [ "$first" != "${pending}mid" ] || fail "could not split the mid-token fixture"
+  printf '❯ %s\n%s\n' "$first" "$second" > "$dir/composer"
+  rm -f "$dir/.swallow"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "recovery rejected the same digest after a mid-token soft wrap"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "mid-token recovery did not clear the delivered digest buffer"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery retyped the digest"
+  [ "$(grep -c '^\[ENTER\]$' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery did not submit the pending digest exactly once"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "an empty post-recovery buffer should be a no-op"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery duplicated the delivered digest"
+  [ "$(grep -c '^\[ENTER\]$' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery submitted the delivered digest more than once"
+  pass "a mid-token soft wrap recovers once without retyping or duplicate delivery"
+}
+
 test_recovery_of_different_own_envelope_keeps_buffer() {
   local dir state fakebin sent other
   dir=$(make_bordered_case own-unsent-different-envelope)
@@ -1985,6 +2058,32 @@ test_pane_is_busy_herdr_native_busy_state() {
   pass "pane_is_busy: herdr native busy_state='busy' short-circuits without a capture fallback"
 }
 
+test_native_idle_keeps_busy_text_in_an_unsent_digest_recoverable() {
+  local dir state pending enter_log
+  dir=$(make_supercase native-idle-own-unsent-busy-text)
+  state="$dir/state"; enter_log="$dir/enter.log"; : > "$enter_log"
+  afk_enter "$state"
+  fm_operational_input_encode away-supervisor \
+    "done: captured esc to interrupt while diagnosing" pending \
+    || fail "could not encode the native-idle recovery digest"
+  (
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf 'idle'; }
+    fm_backend_capture() { printf '%s\n' "$pending"; }
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_composer_content() { printf '%s' "$pending"; }
+    fm_backend_submit_enter() { printf '[ENTER]\n' >> "$enter_log"; printf 'empty'; }
+    fm_backend_send_text_submit() { fail "native-idle recovery retyped the pending digest"; }
+    FM_DAEMON_PRIMARY_HARNESS=claude FM_SUPERVISOR_BACKEND=herdr \
+      FM_SUPERVISOR_TARGET="default:w1:p2" \
+      inject_msg "done: captured esc to interrupt while diagnosing" "$state" \
+      || fail "native idle did not keep recovery reachable for a digest containing busy text"
+  ) || fail "native-idle own-unsent recovery subshell failed"
+  [ "$(grep -c '^\[ENTER\]$' "$enter_log" 2>/dev/null || true)" -eq 1 ] \
+    || fail "native-idle recovery did not resubmit the pending digest exactly once"
+  pass "native idle keeps an own-unsent digest containing Claude busy text recoverable"
+}
+
 test_primary_busy_guard_is_harness_scoped() {
   (
     fm_backend_busy_state() { printf 'unknown'; }
@@ -2199,6 +2298,8 @@ test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
 test_normal_flush_clears_stale_wedge_marker
 test_own_unsent_recovery_after_swallowed_enter_clears_buffer
+test_recovery_recognises_an_envelope_prefix_soft_wrap
+test_mid_token_soft_wrap_recovers_once_without_duplicate_delivery
 test_recovery_of_different_own_envelope_keeps_buffer
 test_recovery_accepts_tmux_idle_to_busy_confirmation
 test_pending_human_draft_is_never_recovered
@@ -2236,6 +2337,7 @@ test_fm_send_exits_nonzero_on_unproven_submit
 test_discover_supervisor_backend_precedence
 test_discover_supervisor_target_herdr
 test_pane_is_busy_herdr_native_busy_state
+test_native_idle_keeps_busy_text_in_an_unsent_digest_recoverable
 test_primary_busy_guard_is_harness_scoped
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted
 test_pane_input_pending_herdr_dispatch

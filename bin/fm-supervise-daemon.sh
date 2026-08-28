@@ -600,6 +600,7 @@ pane_is_busy() {  # <target> [backend]
   native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)
   case "$native" in
     busy) return 0 ;;
+    idle) return 1 ;;
   esac
   tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || return 1
   printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 \
@@ -1145,8 +1146,12 @@ _inject_own_envelope_prefix() {
 inject_composer_own_unsent_content() {  # <target> <backend>
   local target=$1 backend=$2 content prefix
   content=$(fm_backend_composer_content "$backend" "$target" 2>/dev/null) || return 1
-  [ -n "$content" ] || return 1
   prefix=$(_inject_own_envelope_prefix)
+  fm_composer_normalize_spaces_var content
+  fm_composer_normalize_spaces_var prefix
+  content=${content//[$' \t\r\n\v\f']/}
+  prefix=${prefix//[$' \t\r\n\v\f']/}
+  [ -n "$content" ] || return 1
   case "$content" in "$prefix"*) printf '%s' "$content"; return 0 ;; esac
   return 1
 }
@@ -1167,8 +1172,11 @@ _inject_recover_attempts() {  # <state>
 # is unblocked) but returns 1, so the newer items are delivered in full on the
 # next cycle instead of being dropped as already-sent.
 inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
-  local target=$1 backend=$2 state=$3 msg=$4 attempts max verdict recovered
+  local target=$1 backend=$2 state=$3 msg=$4 attempts max verdict recovered requested
   recovered=$(inject_composer_own_unsent_content "$target" "$backend") || return 1
+  requested=$msg
+  fm_composer_normalize_spaces_var requested
+  requested=${requested//[$' \t\r\n\v\f']/}
   max=${FM_INJECT_RECOVER_ATTEMPTS:-$INJECT_RECOVER_ATTEMPTS_DEFAULT}
   attempts=$(_inject_recover_attempts "$state")
   if [ "$attempts" -ge "$max" ]; then
@@ -1185,7 +1193,7 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
   fi
   rm -f "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
   rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
-  if [ "$recovered" = "$msg" ]; then
+  if [ "$recovered" = "$requested" ]; then
     log "inject recovery: submitted our own unsent digest with Enter only; delivery confirmed"
     return 0
   fi
