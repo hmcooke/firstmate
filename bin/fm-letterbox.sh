@@ -353,14 +353,21 @@ cmd_arm() {
 }
 
 cmd_retire() {
-  local removed=0
-  if [ -e "$STATE/letterbox.check.sh" ] || [ -L "$STATE/letterbox.check.sh" ]; then
-    rm -f -- "$STATE/letterbox.check.sh" && removed=1
-  fi
-  if [ -e "$STATE/letterbox.check-trust" ] || [ -L "$STATE/letterbox.check-trust" ]; then
-    rm -f -- "$STATE/letterbox.check-trust" && removed=1
-  fi
-  if [ "$removed" -eq 1 ]; then
+  local armed=0 path residual=''
+  for path in "$STATE/letterbox.check.sh" "$STATE/letterbox.check-trust"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      armed=1
+      if ! rm -f -- "$path" && { [ -e "$path" ] || [ -L "$path" ]; }; then
+        residual="${residual}${residual:+, }$path"
+        continue
+      fi
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        residual="${residual}${residual:+, }$path"
+      fi
+    fi
+  done
+  [ -z "$residual" ] || die "letterbox retirement incomplete; still present: $residual"
+  if [ "$armed" -eq 1 ]; then
     printf 'letterbox retired: poll shim and registration removed; letters, claims and receipts kept\n'
   else
     printf 'letterbox was not armed in this home\n'
@@ -378,6 +385,40 @@ unsent_ids() {
     [ -e "$(lb_dir "$STATE" sent)/$id.receipt" ] && continue
     printf '%s\n' "$id"
   done
+}
+
+status_claim_fields() {
+  local claim=$1 sep
+  sep=$(printf '\037')
+  jq -er --arg sep "$sep" '
+    def clean_text:
+      type == "string" and (explode | all(. >= 32 and . != 127));
+    def field_text($key):
+      has($key) and (.[$key] | clean_text);
+    select(
+      type == "object"
+      and (.class | (clean_text and (length > 0)))
+      and (.from | (clean_text and (length > 0)))
+      and field_text("refusal")
+      and field_text("resend_required")
+      and field_text("resent_as")
+      and field_text("replied")
+      and field_text("task")
+      and (.consumed | type == "array" and all(.[]; clean_text))
+    )
+    | [
+        .class,
+        .from,
+        .refusal,
+        .resend_required,
+        .resent_as,
+        (.consumed | length | tostring),
+        .replied,
+        .task,
+        "valid"
+      ]
+    | join($sep)
+  ' "$claim"
 }
 
 cmd_status() {
@@ -398,7 +439,9 @@ cmd_status() {
   else
     printf '  poll: not armed; run: fm-letterbox.sh arm\n'
   fi
-  local id claim reason owed=0 sent_open=0 unsent=0 resend=0 unanswerable=0
+  local id claim reason fields sep cclass cfrom crefusal cresend cresent cconsumed creplied ctask marker
+  local owed=0 sent_open=0 unsent=0 resend=0 unanswerable=0 unreadable=0 task_suffix
+  sep=$(printf '\037')
   workdir
   for id in $(unsent_ids); do
     unsent=$((unsent + 1))
@@ -411,31 +454,48 @@ cmd_status() {
   for claim in "$(lb_claim_dir "$STATE")"/*.json; do
     [ -e "$claim" ] || continue
     id=$(basename "$claim" .json)
-    [ "$(lb_claim_field "$STATE" "$id" class)" != reply ] || continue
+    if ! fields=$(status_claim_fields "$claim" 2>/dev/null); then
+      unreadable=$((unreadable + 1))
+      printf '  UNREADABLE: %s claim (cannot classify its obligation)\n' "$id"
+      continue
+    fi
+    IFS="$sep" read -r cclass cfrom crefusal cresend cresent cconsumed creplied ctask marker <<< "$fields"
+    if [ "$marker" != valid ] \
+      || { [ "$cfrom" != "$LB_SELF" ] && [ "$cfrom" != "$LB_PEER" ]; } \
+      || { [ "$cclass" != reply ] && [ "$cclass" != refused ] && ! lb_class_allowed "$cclass"; } \
+      || { [ -n "$cresend" ] && [ "$cresend" != true ]; } \
+      || { [ "$cresend" = true ] && [ "$cclass" != notice ]; } \
+      || { [ -n "$cresent" ] && { [ "$cclass" != notice ] || ! lb_id_valid "$cresent"; }; } \
+      || { [ -n "$creplied" ] && ! lb_status_allowed_for_class "$creplied" "$cclass"; }; then
+      unreadable=$((unreadable + 1))
+      printf '  UNREADABLE: %s claim (cannot classify its obligation)\n' "$id"
+      continue
+    fi
+    [ "$cclass" != reply ] || continue
     if ! lb_id_valid "$id"; then
       unanswerable=$((unanswerable + 1))
       printf '  UNANSWERABLE: %s %s (no usable card id, so nothing can reply to it; resolve it with a notice naming that key)\n' \
-        "$id" "$(lb_claim_field "$STATE" "$id" refusal)"
+        "$id" "$crefusal"
       continue
     fi
-    if [ "$(lb_claim_field "$STATE" "$id" from)" = "$LB_SELF" ]; then
+    if [ "$cfrom" = "$LB_SELF" ]; then
       [ -e "$(lb_dir "$STATE" sent)/$id.receipt" ] || continue
-      if [ "$(lb_claim_field "$STATE" "$id" resend_required)" = true ] \
-        && [ -z "$(lb_claim_field "$STATE" "$id" resent_as)" ]; then
+      if [ "$cresend" = true ] && [ -z "$cresent" ]; then
         resend=$((resend + 1))
         printf '  RESEND REQUIRED: %s notice (the peer refused it; send a corrected notice under a new id)\n' "$id"
       fi
-      [ -z "$(lb_claim_field "$STATE" "$id" consumed)" ] || continue
+      [ "$cconsumed" -eq 0 ] || continue
       sent_open=$((sent_open + 1))
     else
-      [ -z "$(lb_claim_field "$STATE" "$id" replied)" ] || continue
+      [ -z "$creplied" ] || continue
       owed=$((owed + 1))
-      printf '  OWED: %s %s%s\n' "$id" "$(lb_claim_field "$STATE" "$id" class)" \
-        "$( [ -n "$(lb_claim_field "$STATE" "$id" task)" ] && printf ' -> task %s' "$(lb_claim_field "$STATE" "$id" task)" )"
+      task_suffix=
+      [ -z "$ctask" ] || task_suffix=" -> task $ctask"
+      printf '  OWED: %s %s%s\n' "$id" "$cclass" "$task_suffix"
     fi
   done
-  printf '  %s letter(s) awaiting a reply from this estate, %s sent and awaiting a reply from the peer, %s unsent, %s requiring resend, %s unanswerable\n' \
-    "$owed" "$sent_open" "$unsent" "$resend" "$unanswerable"
+  printf '  %s letter(s) awaiting a reply from this estate, %s sent and awaiting a reply from the peer, %s unsent, %s requiring resend, %s unanswerable, %s unreadable\n' \
+    "$owed" "$sent_open" "$unsent" "$resend" "$unanswerable" "$unreadable"
 }
 
 cmd_list() {

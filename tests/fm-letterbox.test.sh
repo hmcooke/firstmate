@@ -492,6 +492,20 @@ test_retire_removes_the_poll_and_keeps_the_records() {
   pass "retire removes the poll and its registration while keeping durable records"
 }
 
+test_retire_fails_and_names_every_registration_artifact_left_behind() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture retire-residual | tr '\n' ' ')"
+  run_lb "$home" "$store" "$fakebin" arm >/dev/null || fail "arm must succeed"
+  install_failing_rm_for "$fakebin" "$home/state/letterbox.check.sh"
+  out=$(run_lb "$home" "$store" "$fakebin" retire 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "retire must fail while an armed shim remains"
+  assert_contains "$out" "$home/state/letterbox.check.sh" "retire must name the artifact it could not remove"
+  assert_not_contains "$out" "letterbox retired:" "retire must not claim that a residual shim was removed"
+  assert_present "$home/state/letterbox.check.sh" "the injected removal failure must leave the shim in place"
+  assert_absent "$home/state/letterbox.check-trust" "retire must still remove the independently removable registration"
+  pass "retire reports failure and names every registration artifact still present"
+}
+
 # ---------------------------------------------------------------------------
 # receiving
 
@@ -1806,6 +1820,23 @@ test_status_reports_activation_and_what_is_owed() {
   pass "status reports activation, the armed poll and the letters still owed a reply"
 }
 
+test_status_reports_an_unreadable_claim_without_inventing_an_obligation() {
+  local home store fakebin out id claim
+  read -r home store fakebin <<< "$(fixture status-unreadable | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$id" fact-lookup q body >/dev/null
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  claim="$home/state/letterbox/claims/$id.json"
+  printf '{not-json\n' > "$claim"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must report unreadable durable state: $out"
+  assert_contains "$out" "UNREADABLE: $id claim" "status must admit that the claim cannot be classified"
+  assert_not_contains "$out" "OWED: $id" "an unreadable claim must not become an invented inbound obligation"
+  assert_contains "$out" "0 letter(s) awaiting a reply from this estate" \
+    "an unreadable claim must not update the owed counter"
+  assert_contains "$out" "1 unreadable" "the summary must count unreadable claims separately"
+  pass "status reports unreadable claims without inventing obligation state"
+}
+
 test_a_visibility_refusal_keeps_alarming_while_reads_continue() {
   local home store fakebin out id
   read -r home store fakebin <<< "$(fixture visibility-realarm | tr '\n' ' ')"
@@ -2153,14 +2184,35 @@ SH
 }
 
 install_failing_card_cat() {
-  local fakebin=$1 real
+  local fakebin=$1 counter=$2 real
   real=$(command -v cat)
   cat > "$fakebin/cat" <<SH
 #!/usr/bin/env bash
-case "\${1:-}" in */fm-letterbox.*/card.md) exit 5 ;; esac
+case "\${1:-}" in
+  */fm-letterbox.*/card.md)
+    count=0
+    [ ! -f "$counter" ] || count=\$("$real" "$counter")
+    count=\$((count + 1))
+    printf '%s\n' "\$count" > "$counter"
+    [ "\$count" -ne 2 ] || exit 5
+    ;;
+esac
 exec "$real" "\$@"
 SH
   chmod +x "$fakebin/cat"
+}
+
+install_failing_rm_for() {
+  local fakebin=$1 target=$2 real
+  real=$(command -v rm)
+  cat > "$fakebin/rm" <<SH
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  [ "\$arg" != "$target" ] || exit 5
+done
+exec "$real" "\$@"
+SH
+  chmod +x "$fakebin/rm"
 }
 
 test_a_failed_stash_is_never_published_announced_or_claimed() {
@@ -2595,13 +2647,16 @@ test_reconciliation_never_adopts_after_a_required_outbox_field_read_fails() {
 }
 
 test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record() {
-  local home store fakebin out rc
+  local home store fakebin out rc counter
   read -r home store fakebin <<< "$(fixture serialized-card-read | tr '\n' ' ')"
   printf 'body\n' > "$home/body.txt"
-  install_failing_card_cat "$fakebin"
+  counter="$home/card-read-count"
+  install_failing_card_cat "$fakebin" "$counter"
   out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "an unreadable serialized card must stop the send"
-  assert_contains "$out" "unreadable card" "the failed serialized-card read must be named"
+  assert_contains "$out" "cannot read the serialized letter card" \
+    "the pre-publication serialized-card read failure must be named"
+  [ "$(cat "$counter")" = 2 ] || fail "the injector must fail the second card read at the publication boundary"
   [ "$(count_files "$home/state/letterbox/outbox")" = 0 ] \
     || fail "an unreadable card must never become an empty outbox record"
   [ "$(jq -r 'length' "$store/issues.json")" = 0 ] || fail "an unreadable card must never reach the forge"
@@ -2610,6 +2665,18 @@ test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record() {
 
 # ---------------------------------------------------------------------------
 
+if [ -n "${FM_LETTERBOX_TEST_ONLY:-}" ]; then
+  case "$FM_LETTERBOX_TEST_ONLY" in
+    test_*)
+      declare -F "$FM_LETTERBOX_TEST_ONLY" >/dev/null \
+        || fail "unknown selected letterbox test: $FM_LETTERBOX_TEST_ONLY"
+      "$FM_LETTERBOX_TEST_ONLY"
+      exit 0
+      ;;
+    *) fail "invalid selected letterbox test: $FM_LETTERBOX_TEST_ONLY" ;;
+  esac
+fi
+
 test_poll_unconfigured_is_a_hard_noop
 test_poll_partial_configuration_stays_inert
 test_poll_reports_a_configuration_fault_once
@@ -2617,6 +2684,7 @@ test_arm_generates_the_shim_and_registers_it
 test_registered_shim_survives_the_watchers_validation
 test_supervision_is_required_with_only_the_letterbox_shim
 test_retire_removes_the_poll_and_keeps_the_records
+test_retire_fails_and_names_every_registration_artifact_left_behind
 test_poll_stashes_claims_and_announces_a_new_letter
 test_second_sighting_of_the_same_letter_produces_nothing
 test_poll_ignores_a_letter_addressed_elsewhere
@@ -2671,6 +2739,7 @@ test_a_reply_in_the_cursors_own_second_is_still_fetched
 test_a_settled_sent_letter_makes_no_comment_fetch_on_a_quiet_poll
 test_the_poll_stays_silent_when_the_transport_read_fails
 test_status_reports_activation_and_what_is_owed
+test_status_reports_an_unreadable_claim_without_inventing_an_obligation
 test_status_on_an_unconfigured_home_says_inert
 test_a_visibility_refusal_keeps_alarming_while_reads_continue
 test_a_transport_write_error_survives_a_successful_read_until_a_write_lands
