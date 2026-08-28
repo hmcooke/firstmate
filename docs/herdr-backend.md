@@ -212,16 +212,16 @@ Enter, Escape, and Ctrl-C are supported.
 Slash and dollar-prefixed input uses the shared harness-aware settle before the first Enter so a completion popup cannot consume it.
 Text is typed once; only Enter is retried.
 
-On an idle or done native baseline, submit confirmation waits for `working` or `blocked` across a bounded polling window.
-On an already active or unreadable baseline, it falls back to conservative composer clearance.
+On an idle or done native baseline, submit confirmation waits for `working` or `blocked` across a bounded polling window, and a missed transition remains pending while only Enter is retried.
+On an already active or unreadable baseline, it falls back to conservative composer clearance and a rendered idle-to-busy transition.
 A fully unreadable target stops retrying and reports unknown.
 
-Some harnesses never present a legibly idle native baseline at all, so the composer fallback is their only path.
+Some harnesses never present a legibly idle native baseline at all, so the conservative fallback is their only path.
 Herdr reports a Cursor pane `blocked` in every state, and Cursor's mid-turn composer renders its placeholder beside a right-aligned busy token, which is composer content and therefore `pending` on a composer that holds no user text.
-That fallback alone reported every delivered steer as unconfirmed, so it is paired with a rendered-footer transition: the pane's verified busy footer is read once before the first Enter, and an idle-to-busy transition across that Enter confirms the submit.
+Only the away daemon's pre-injection busy guard and Herdr's pre-Enter rendered-busy baseline exclude the selected composer region, so the daemon's pending digest cannot establish either precondition.
+Herdr's post-Enter rendered read, tmux delivery busy state, and pending-reply observation keep the whole tail because Cursor's verified `ctrl+c to stop` signal shares its composer row.
 It is the same semantic signal the native path uses and the same one the tmux submit core reads, so a pane already mid-turn before the text was typed still reports `pending` rather than borrowing another turn as proof of this delivery.
-The composer verdict itself is deliberately unchanged: a right-aligned status token on the composer row stays content for every other caller, including the away-mode pre-injection guard.
-The poll density bounds the residual possibility of an extremely fast complete turn; a missed transition can cause only a redundant Enter on an empty composer, never duplicate message text.
+Cursor delivery confirmation on tmux and Herdr is therefore unchanged by the away-mode composer exclusion.
 
 `pane read --lines N` can return empty output when N is below the viewport height.
 The capture owner requests at least 200 lines from Herdr and trims locally to the caller's bound.
@@ -243,7 +243,8 @@ ANSI capture preserves de-emphasized placeholder style.
 If the ANSI capture ever fails, the plain fallback declares itself unstyled and the classifier degrades a glyph row carrying trailing text to `unknown` instead of misreading ghost suggestions as typed input, which safely defers injection and eventually raises the wedge alarm.
 
 A bare shell prompt is never an empty agent composer.
-Away-mode injection proceeds only on an affirmative `empty` result, never on unknown.
+Typing a new away-mode digest proceeds only on an affirmative `empty` result, never on unknown.
+The [own-unsent recovery](#own-unsent-recovery) below is the sole later-cycle exception to the away-mode pre-injection guard for a pending composer.
 This prevents a dead agent pane from receiving and possibly executing an escalation as shell input.
 
 The current operational envelope starts with U+2063 and `FIRSTMATE_OP: `.
@@ -294,6 +295,25 @@ It refuses Zellij, Orca, and cmux as supervisor backends rather than applying th
 For Herdr, target existence, native state, capture, composer state, and verified submit all route through the shared backend dispatcher and the explicit named-session CLI owner.
 The pane-independent max-defer alert is configured in [`wedge-alarm.md`](wedge-alarm.md).
 
+Herdr's native agent state and the shared classifiers are accurate for a Claude supervisor pane in both directions: an idle pane reports `done` or `idle` with an empty composer and is injectable, and a mid-turn pane reports `working` and is not.
+Delivery starvation therefore comes from what is sitting in the composer, not from a misread verdict, and no harness-specific busy fallback is warranted.
+
+### Own-unsent recovery
+
+The daemon types a digest once and never retypes it, so an Enter that does not confirm leaves that digest in the supervisor composer.
+Without recovery the composer guard then reads `pending` on every later cycle and refuses to type for as long as the text sits there, which turns one swallowed Enter into an indefinite away-mode delivery outage that only a human clearing the pane can end.
+
+The daemon may therefore resubmit a pending composer with Enter alone, and only when the extracted composer content begins with its own away-supervisor envelope (`bin/fm-operational-input.sh`).
+Only content carrying that envelope at the start is treated as daemon-authored; every other pending composer keeps deferring and alarming exactly as before.
+Recovery reads the composer through `fm_backend_composer_content`, which returns the composer region only, so a digest already delivered and echoed into the transcript above cannot be mistaken for unsent text.
+Re-sends are bounded per buffered digest, and an unrecoverable composer still raises the max-defer wedge alarm.
+An affirmatively empty composer ends the episode and restores the full recovery budget, so an exhausted budget cannot starve a later digest.
+When the buffer has grown since the digest was typed, the recovered submit does not clear it and the newer items are delivered by the next flush.
+
+Authorship is proven from the envelope alone, so recovery only reaches a digest whose envelope is still visible in the composer.
+A digest long enough to scroll its own opening out of the composer's viewport shows no envelope, reads as ordinary pending text, and keeps deferring and alarming as before.
+That is the fail-safe direction and it is deliberate: no weaker authorship signal is accepted, because the cost of a wrong verdict is submitting somebody else's input.
+
 Harnesses with native tracked background execution can run the daemon in their terminal.
 Pi has no such mechanism.
 `bin/fm-afk-launch.sh` therefore creates a dedicated unfocused Herdr workspace, runs the daemon there with an explicit supervisor target and backend, records the exact daemon pane, and closes only that pane on stop.
@@ -327,11 +347,15 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
   The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
 - Only tmux and Herdr can host the away-mode supervisor terminal.
+- Own-unsent recovery needs the digest's envelope visible in the composer, so a digest that has scrolled its opening out of view is not recovered.
+- The Herdr non-idle fallback compares a composer-excluded pre-Enter baseline with a whole-tail post-Enter read, so a swallowed long digest whose visible suffix contains a verified busy token can be reported as confirmed.
 
 ## Regression entry points
 
 ```sh
 tests/fm-backend-herdr.test.sh
+tests/fm-composer-lib.test.sh
+tests/fm-daemon.test.sh
 tests/fm-backend-presence.test.sh
 tests/fm-backend-herdr-smoke.test.sh
 tests/fm-backend-herdr-prune-safety-e2e.test.sh

@@ -23,8 +23,8 @@
 #
 # IN-BAND OPERATIONAL INPUT. bin/fm-operational-input.sh constructs every
 # current daemon injection as the typed away-supervisor kind after the stable
-# FM_OPERATIONAL_PREFIX. A human cannot type its leading U+2063 from a normal
-# keyboard at the start of a message, and Herdr transports it as text.
+# FM_OPERATIONAL_PREFIX. U+2063 has no normal keyboard keystroke, and Herdr
+# transports it as text.
 # Firstmate's contract: a message that starts with the current prefix, or a
 # legacy bare-marker daemon escalation, is internal (stay afk); an unmarked
 # message means the captain is back (exit afk, flush catch-up, resume per-wake
@@ -33,12 +33,11 @@
 # /afk.
 #
 # Reliability model (see the /afk skill):
-#   - Nothing is lost in away mode: while state/.afk exists, the watcher reverts
-#     to daemon-owned one-shot behavior and enqueues every wake to
-#     state/.wake-queue BEFORE advancing its suppression markers, so a
-#     crash/restart/missed injection is recovered on the next fm-wake-drain.sh.
-#     After a watcher cycle, the daemon handles every durable row through that
-#     drain and acknowledges it only after routing completes.
+#   - Nothing is lost in away mode: while state/.afk exists, every watcher cycle
+#     uses one-shot behavior and enqueues each wake to state/.wake-queue BEFORE
+#     advancing its suppression markers. Once the daemon wins the home-scoped
+#     singleton, it handles every durable row through fm-wake-drain.sh and
+#     acknowledges it only after routing completes.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
 #   - Bounded wedge latency: a stale pane without a declared external wait is
@@ -134,6 +133,15 @@
 #                                   not misread as pending input.
 #          FM_INJECT_CONFIRM_SLEEP  seconds between daemon submit checks
 #                                   (default 0.5)
+#          FM_INJECT_RECOVER_ATTEMPTS Enter-only recovery cycles allowed for
+#                                   one buffered digest (default 3). An
+#                                   affirmatively empty composer ends the
+#                                   episode and restores the full budget.
+#          FM_WATCHER_COLLISION_ESCALATE_SECS seconds before a persistent
+#                                   pre-away watcher ownership collision is
+#                                   queued once for escalation (default 600;
+#                                   0 disables). Verified daemon ownership ends
+#                                   the episode.
 #          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
@@ -210,6 +218,18 @@ WEDGE_ALARM_NOTIFIER_PID=
 INJECT_FAIL_SLEEP_DEFAULT=30
 INJECT_CONFIRM_RETRIES_DEFAULT=3
 INJECT_CONFIRM_SLEEP_DEFAULT=0.5
+# How many CYCLES may attempt own-unsent recovery for one buffered digest before
+# the daemon stops re-sending Enter and lets the wedge alarm own the stall. A
+# composer that keeps our envelope across this many attempts is not swallowing
+# one Enter, it is refusing input, and hammering it adds nothing.
+INJECT_RECOVER_ATTEMPTS_DEFAULT=3
+# How long another watcher cycle may own supervision before the daemon says so.
+# While a pre-existing cycle holds the home-scoped singleton, the daemon's own
+# watcher child exits with a status line instead of a wake, so the daemon
+# performs no triage of its own until that cycle closes. Wakes are still
+# detected and queued durably by the cycle that holds the lock, so this is a
+# deferral rather than a loss - but a long one must not be silent.
+WATCHER_COLLISION_ESCALATE_SECS_DEFAULT=600
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -588,10 +608,10 @@ pane_is_busy() {  # <target> [backend]
   native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)
   case "$native" in
     busy) return 0 ;;
+    idle) return 1 ;;
   esac
   tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || return 1
-  printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 \
-    | fm_busy_lines_match "$harness"
+  printf '%s' "$tail40" | fm_busy_lines_match "$harness" 12 exclude
 }
 
 # pane_input_pending dispatches through fm_backend_composer_state and treats
@@ -1093,6 +1113,128 @@ window_for_task() {  # <task-key> [state]
   return 1
 }
 
+# --- own-unsent recovery ----------------------------------------------------
+#
+# One swallowed Enter used to end away-mode delivery permanently. inject_msg
+# types the digest ONCE and deliberately leaves it in the composer when the
+# submit cannot be confirmed; from the next cycle the composer guard reads
+# `pending` and refuses to type for as long as the text remains.
+#
+# Recovery is permitted for EXACTLY one thing: our OWN away-supervisor envelope
+# still sitting unsent in the composer. Only content beginning with that
+# envelope is treated as daemon-authored, so every other pending composer keeps
+# deferring and alarming exactly as before. tests/fm-daemon.test.sh pins the
+# captain-draft guarantee.
+#
+# Enter ONLY, never a retype: the text is already there, and retyping would
+# concatenate two sentinel-prefixed digests into one corrupted turn.
+
+# The exact header a digest WE typed carries. bin/fm-operational-input.sh owns
+# the bytes; this composes the away-supervisor form in one place.
+_inject_own_envelope_prefix() {
+  printf '%s%s: ' "$FM_OPERATIONAL_HEADER_PREFIX" away-supervisor
+}
+
+# Prints the supervisor composer's own-unsent content and returns 0 when it
+# begins with our envelope. An unreadable composer, an unsupported backend,
+# and an empty read all return 1:
+# recovery needs positive proof of authorship, never an absence of evidence.
+# The composer's extracted user content already has the harness's prompt glyph
+# and furniture removed, so a digest WE typed begins the content exactly at its
+# envelope. Anchoring at the start is what makes this authorship evidence
+# rather than a substring search: a human quoting the marker mid-draft does not
+# match, and neither does an already-delivered digest echoed in the transcript,
+# which the extractor never returns.
+inject_composer_own_unsent_content() {  # <target> <backend>
+  local target=$1 backend=$2 content prefix
+  content=$(fm_backend_composer_content "$backend" "$target" 2>/dev/null) || return 1
+  prefix=$(_inject_own_envelope_prefix)
+  fm_composer_normalize_spaces_var content
+  fm_composer_normalize_spaces_var prefix
+  content=${content//[$' \t\r\n\v\f']/}
+  prefix=${prefix//[$' \t\r\n\v\f']/}
+  [ -n "$content" ] || return 1
+  case "$content" in "$prefix"*) printf '%s' "$content"; return 0 ;; esac
+  return 1
+}
+
+_inject_recover_attempts() {  # <state>
+  local counter="$1/.subsuper-inject-recover-attempts" n
+  if [ ! -e "$counter" ]; then
+    printf '0'
+    return 0
+  fi
+  n=$(cat "$counter" 2>/dev/null) || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+
+_inject_recover_attempts_store() {  # <state> <next>
+  local counter="$1/.subsuper-inject-recover-attempts" tmp
+  tmp="$counter.tmp.$$"
+  if ! printf '%s\n' "$2" > "$tmp" 2>/dev/null || ! mv "$tmp" "$counter" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+_inject_recover_attempts_reset() {  # <state>
+  local counter="$1/.subsuper-inject-recover-attempts"
+  [ ! -e "$counter" ] || rm -f "$counter" 2>/dev/null
+}
+
+# inject_recover_own_unsent: submit our own unsent digest with Enter only.
+#
+# Returns 0 ONLY when the submit was confirmed AND the recovered text is the
+# same digest this call was asked to deliver, because the caller clears the
+# escalation buffer on 0. When the buffer has grown since we typed, the
+# composer held an older, smaller digest: recovery still submits it (the pane
+# is unblocked) but returns 1, so the newer items are delivered in full on the
+# next cycle instead of being dropped as already-sent.
+inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
+  local target=$1 backend=$2 state=$3 msg=$4 attempts max verdict recovered requested
+  recovered=$(inject_composer_own_unsent_content "$target" "$backend") || return 1
+  requested=$msg
+  fm_composer_normalize_spaces_var requested
+  requested=${requested//[$' \t\r\n\v\f']/}
+  max=${FM_INJECT_RECOVER_ATTEMPTS:-$INJECT_RECOVER_ATTEMPTS_DEFAULT}
+  case "$max" in
+    ''|*[!0-9]*)
+      log "inject recovery: invalid attempt limit '$max'; using $INJECT_RECOVER_ATTEMPTS_DEFAULT"
+      max=$INJECT_RECOVER_ATTEMPTS_DEFAULT
+      ;;
+  esac
+  if ! attempts=$(_inject_recover_attempts "$state"); then
+    log "inject recovery exhausted: recovery budget state is invalid or unreadable"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
+  if [ "$attempts" -ge "$max" ]; then
+    log "inject recovery exhausted after $attempts attempts; our own unsent digest is still in the supervisor composer"
+    return 1
+  fi
+  if ! _inject_recover_attempts_store "$state" "$((attempts + 1))"; then
+    log "inject recovery exhausted: recovery budget could not be persisted"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
+  verdict=$(fm_backend_submit_enter "$backend" "$target" \
+    "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
+    "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}")
+  if [ "$verdict" != empty ]; then
+    log "inject recovery: our own unsent digest is still unsubmitted (verdict=$verdict); deferring"
+    return 1
+  fi
+  _inject_recover_attempts_reset "$state" || true
+  rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
+  if [ "$recovered" = "$requested" ]; then
+    log "inject recovery: submitted our own unsent digest with Enter only; delivery confirmed"
+    return 0
+  fi
+  log "inject recovery: cleared our own unsent digest from the composer; the current digest delivers next cycle"
+  return 1
+}
+
 # --- injection --------------------------------------------------------------
 # inject_msg: send one escalation digest to the supervisor pane.
 # Returns 0 on successful inject (or empty buffer), non-zero if the pane is
@@ -1110,9 +1252,10 @@ window_for_task() {  # <task-key> [state]
 #     Pending means Enter was swallowed; unknown is treated as undelivered by
 #     this strict daemon path.
 #   - COMPOSER GUARD before typing: if the cursor line already has real content
-#     after dim/faint ghost text and borders are ignored (a human's half-typed
-#     line, or a previous injection's unsent text), defer entirely - injecting
-#     would merge with the human's text.
+#     after dim/faint ghost text and borders are ignored, never type a new
+#     digest. Human text remains deferred, while the one exception for our OWN
+#     unsent envelope lets inject_recover_own_unsent above resubmit Enter only
+#     so a single swallowed Enter cannot end away-mode delivery permanently.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded
   state="${2:-$(_state_root)}"
@@ -1151,6 +1294,17 @@ inject_msg() {  # <message> [state]
   #      stays buffered for the next cycle or the catch-up flush.
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
+    #   c) Own-unsent recovery: a pending composer holding OUR OWN envelope is
+    #      a swallowed Enter, not someone else's input, so resubmit it with
+    #      Enter only instead of deferring on it forever. Anything else pending
+    #      falls straight through to the deferral below, untouched.
+    case "$composer" in
+      pending|pending-unproven)
+        if inject_recover_own_unsent "$target" "$backend" "$state" "$msg"; then
+          return 0
+        fi
+        ;;
+    esac
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
@@ -1163,10 +1317,25 @@ inject_msg() {  # <message> [state]
   # re-export of fm_tmux_submit_core - byte-identical to calling it directly.
   retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
+  # Reaching an affirmatively empty composer ends any previous unsent episode:
+  # whatever was stuck is gone, so a fresh digest starts with a full recovery
+  # budget rather than inheriting an exhausted one.
+  if ! _inject_recover_attempts_reset "$state"; then
+    log "inject deferred: stale recovery budget could not be cleared"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
   verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
   if [ "$verdict" = empty ]; then
+    # Delivered: no unsent text of ours remains, so drop any recovery state a
+    # previous swallowed Enter left behind.
+    rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
     return 0  # Backend confirmed the submit.
   fi
+  # Our text is now sitting unsent in the composer. Record it as session-scoped
+  # diagnostic evidence; recovery compares the extracted composer with the
+  # current digest directly and never trusts this sidecar as authorship proof.
+  printf '%s' "$msg" > "$state/.subsuper-inject-unsent" 2>/dev/null || true
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1
 }
@@ -1197,6 +1366,64 @@ is_wake_reason() {  # <reason>
     signal:*|stale:*|check:*|heartbeat|heartbeat:*) return 0 ;;
   esac
   return 1
+}
+
+# --- watcher-ownership collision --------------------------------------------
+#
+# `watcher: already running pid N` on the daemon's watcher child means a cycle
+# armed before away mode still owns this home's singleton. The daemon retries
+# each tick and takes over when that cycle closes, so ownership does resolve -
+# but until it does the daemon classifies nothing, and before this it recorded
+# that only in its own log. A cycle armed just before /afk can hold the lock for
+# hours (the Claude Stop hook is inert under away mode, so nothing re-arms it),
+# and away mode is exactly when nobody is reading the log.
+#
+# Adopting the live cycle outright belongs to the arm layer
+# (bin/fm-watch-arm.sh, docs/watcher-continuity.md), which already owns attach
+# and successor-following; routing the daemon's child through it is a larger
+# change than this one and is tracked separately. What is fixed here is the
+# silence: a collision that persists past the bound is escalated once, so the
+# captain learns that away-mode triage is deferred instead of assuming it is
+# running.
+note_watcher_collision() {  # <state> <reason>
+  local state=$1 reason=$2 since marker bound age epoch key notice buf
+  since="$state/.subsuper-watcher-collision-since"
+  marker="$state/.subsuper-watcher-collision-escalated"
+  [ -e "$since" ] || _now > "$since"
+  bound=${FM_WATCHER_COLLISION_ESCALATE_SECS:-$WATCHER_COLLISION_ESCALATE_SECS_DEFAULT}
+  [ "$bound" -gt 0 ] || return 0
+  [ -e "$marker" ] && return 0
+  # Epoch-in-content, the same sidecar convention _oldest_line_age reads, so the
+  # episode survives a touch of the file. A corrupt sidecar restarts the clock
+  # rather than escalating off a garbage age.
+  epoch=$(cat "$since" 2>/dev/null || true)
+  case "$epoch" in
+    ''|*[!0-9]*) _now > "$since"; return 0 ;;
+  esac
+  age=$(( $(_now) - epoch ))
+  [ "$age" -ge "$bound" ] || return 0
+  key="[watcher-collision-epoch=$epoch]"
+  notice="blocked: away-mode triage deferred ${age}s - another watcher cycle owns supervision for this home (${reason}); wakes are still queued durably and are handled when it closes $key"
+  buf="$state/.subsuper-escalations"
+  if ! grep -Fq -- "$key" "$buf" 2>/dev/null; then
+    escalate_add "$state" "$notice" || { log "watcher collision escalation could not be queued"; return 1; }
+  fi
+  if ! : > "$marker" 2>/dev/null; then
+    log "watcher collision escalation was queued but its episode marker could not be written"
+    return 1
+  fi
+}
+
+# A real wake or verified child ownership ends the collision episode.
+clear_watcher_collision() {  # <state>
+  rm -f "$1/.subsuper-watcher-collision-since" "$1/.subsuper-watcher-collision-escalated" 2>/dev/null || true
+}
+
+clear_watcher_collision_if_owned() {  # <state> <watcher-pid>
+  local state=$1 watcher_pid=$2 owner
+  owner=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$watcher_pid" ] && [ "$owner" = "$watcher_pid" ] || return 1
+  clear_watcher_collision "$state"
 }
 
 # --- dispatch one wake reason to self-handle or escalate --------------------
@@ -1534,10 +1761,12 @@ fm_super_main() {
         # skipped (rc=0, this is normal idle, not a crash).
         if ! is_wake_reason "$reason"; then
           log "watcher non-wake stdout, idling: $reason"
+          note_watcher_collision "$STATE" "$reason"
           WATCHER_PID=""
           sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi
+        clear_watcher_collision "$STATE"
         log "wake: $reason"
         if ! handle_durable_wakes "$reason" "$STATE"; then
           log "durable wake handling was not acknowledged; restarting for recovery"
@@ -1546,6 +1775,7 @@ fm_super_main() {
       fi
       start_watcher || continue
     fi
+    clear_watcher_collision_if_owned "$STATE" "${WATCHER_PID:-}" || true
 
     # --- one housekeeping tick (gated to HOUSEKEEPING_TICK), then poll -------
     # The watcher child runs on its own FM_POLL cadence internally; we only need

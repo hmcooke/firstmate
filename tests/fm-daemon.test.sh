@@ -1185,6 +1185,505 @@ test_max_defer_pending_composer_alarms_without_typing() {
   pass "max-defer on a pending composer alarms without typing"
 }
 
+# --- own-unsent recovery ----------------------------------------------------
+#
+# A swallowed Enter leaves OUR digest in the composer, and before recovery
+# existed that state was permanent: the composer guard read `pending` and
+# refused to type for as long as the text sat there. Recovery resubmits our own
+# envelope with Enter only. Pending text without that envelope is untouched.
+
+test_own_unsent_recovery_after_swallowed_enter_clears_buffer() {
+  local dir state fakebin sent attempts
+  dir=$(make_bordered_case own-unsent-recovers)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: PR https://x/y/pull/7"
+  afk_enter "$state"
+
+  # First flush: the Enter is swallowed, so our digest stays in the composer.
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+    FM_FAKE_PERSIST_SWALLOW=1 \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report the digest as delivered"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost after a swallowed Enter"
+  [ -s "$state/.subsuper-inject-unsent" ] || fail "the unsent digest was not recorded"
+  grep -F 'FIRSTMATE_OP' "$dir/composer" >/dev/null \
+    || fail "our digest should be sitting in the composer after a swallowed Enter"
+
+  # Second flush: the composer holds OUR envelope, so recovery submits it.
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "recovery failed to submit our own unsent digest"
+
+  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a successful recovery"
+  [ ! -e "$state/.subsuper-inject-unsent" ] || fail "unsent record survived a confirmed recovery"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "recovery RETYPED the digest instead of re-sending Enter only"
+  grep -F 'FIRSTMATE_OP' "$dir/composer" >/dev/null \
+    && fail "our digest is still in the composer after a confirmed recovery"
+  pass "a swallowed Enter then recovery submits our own digest with Enter only and clears the buffer"
+}
+
+test_recovery_recognises_an_envelope_prefix_soft_wrap() {
+  local dir state fakebin sent attempts msg first second
+  dir=$(make_bordered_case own-unsent-prefix-wrap)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  fm_operational_input_encode away-supervisor "done: recovered prefix wrap" msg \
+    || fail "could not encode the prefix-wrap recovery digest"
+  first=${msg%%supervisor:*}
+  second="supervisor:${msg#*supervisor:}"
+  [ "$first" != "$msg" ] || fail "could not split the envelope prefix fixture"
+  printf '❯ %s\n%s\n' "$first" "$second" > "$dir/composer"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_INJECT_CONFIRM_SLEEP=0.05 \
+    inject_recover_own_unsent firstmate:0 tmux "$state" "$msg" \
+    || fail "recovery rejected its own envelope when the prefix was soft-wrapped"
+
+  [ "$(grep -c 'ENTER-ATTEMPT' "$attempts" 2>/dev/null || true)" -eq 1 ] \
+    || fail "prefix-wrap recovery did not submit with exactly one Enter"
+  grep -F 'FIRSTMATE_OP' "$sent" >/dev/null \
+    && fail "prefix-wrap recovery retyped the digest"
+  grep -F 'FIRSTMATE_OP' "$dir/composer" >/dev/null \
+    && fail "prefix-wrap recovery left the digest in the composer"
+  pass "own-envelope recovery recognises a soft wrap inside its prefix"
+}
+
+test_mid_token_soft_wrap_recovers_once_without_duplicate_delivery() {
+  local dir state fakebin sent attempts pending first second
+  dir=$(make_bordered_case own-unsent-mid-token-wrap)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: midtokenvalue"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+    FM_FAKE_PERSIST_SWALLOW=1 FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report the mid-token digest delivered"
+  pending=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" \
+    fm_backend_composer_content tmux firstmate:0) \
+    || fail "could not read the swallowed mid-token digest"
+  first=${pending%%midtokenvalue*}mid
+  second="tokenvalue${pending#*midtokenvalue}"
+  [ "$first" != "${pending}mid" ] || fail "could not split the mid-token fixture"
+  printf '❯ %s\n%s\n' "$first" "$second" > "$dir/composer"
+  rm -f "$dir/.swallow"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "recovery rejected the same digest after a mid-token soft wrap"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "mid-token recovery did not clear the delivered digest buffer"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery retyped the digest"
+  [ "$(grep -c '^\[ENTER\]$' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery did not submit the pending digest exactly once"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "an empty post-recovery buffer should be a no-op"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery duplicated the delivered digest"
+  [ "$(grep -c '^\[ENTER\]$' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "mid-token recovery submitted the delivered digest more than once"
+  pass "a mid-token soft wrap recovers once without retyping or duplicate delivery"
+}
+
+test_recovery_of_different_own_envelope_keeps_buffer() {
+  local dir state fakebin sent other
+  dir=$(make_bordered_case own-unsent-different-envelope)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: original digest"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report the original digest as delivered"
+
+  fm_operational_input_encode away-supervisor "different digest" other \
+    || fail "could not encode the replacement away envelope"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT=/dev/null \
+    tmux send-keys -t firstmate:0 -l "$other" \
+    || fail "could not prepare the replacement away envelope"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "submitting a different own envelope must not report the requested digest delivered"
+  [ -s "$state/.subsuper-escalations" ] \
+    || fail "the requested digest buffer was cleared after a different envelope was submitted"
+  grep -F 'original digest' "$state/.subsuper-escalations" >/dev/null \
+    || fail "the requested digest disappeared after a different envelope was submitted"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "the requested digest was retyped during mismatched-envelope recovery"
+  pass "recovery submits an owned replacement but keeps the unmatched requested digest buffered"
+}
+
+test_recovery_accepts_tmux_idle_to_busy_confirmation() {
+  local dir state fakebin sent attempts working msg verdict
+  dir=$(make_bordered_case own-unsent-tmux-turn-start)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  working="$dir/working"; printf 'Working...\n' > "$working"
+  fm_operational_input_encode away-supervisor "done: recovered turn" msg \
+    || fail "could not encode the recovery digest"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT=/dev/null \
+    tmux send-keys -t firstmate:0 -l "$msg" \
+    || fail "could not prepare the recovery digest"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_POST_ENTER_COMPOSER="$working" \
+    FM_INJECT_CONFIRM_SLEEP=0.05 \
+    inject_recover_own_unsent firstmate:0 tmux "$state" "$msg" \
+    || fail "tmux recovery rejected a proven idle-to-busy turn start"
+  verdict=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" \
+    fm_backend_composer_state tmux firstmate:0)
+  [ "$verdict" = unknown ] \
+    || fail "the post-submit composer did not exercise the unknown verdict: $verdict"
+  [ "$(grep -c 'ENTER-ATTEMPT' "$attempts" 2>/dev/null || true)" -eq 1 ] \
+    || fail "recovery did not submit with exactly one Enter"
+  grep -F 'FIRSTMATE_OP' "$sent" >/dev/null \
+    && fail "recovery retyped text before the confirmed turn start"
+  pass "tmux recovery confirms an idle-to-busy turn when the post-Enter composer is unknown"
+}
+
+test_pending_human_draft_is_never_recovered() {
+  local dir state fakebin sent attempts
+  dir=$(make_bordered_case own-unsent-human-draft)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  printf '╭─────────────────╮\n│ > human draft   │\n╰─────────────────╯\n' > "$dir/composer"
+  escalate_add "$state" "needs-decision: pick B"
+  echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    housekeeping "$state"
+  [ ! -s "$attempts" ] || fail "recovery sent Enter on a composer holding a human's draft"
+  [ ! -s "$sent" ] || fail "max-defer typed into a pending composer"
+  grep -F 'human draft' "$dir/composer" >/dev/null || fail "the human's draft was altered"
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "a human-draft pending composer must still alarm"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost while a human draft was pending"
+  pass "a pending human draft is never recovered: no Enter, no typing, and the wedge alarm still fires"
+}
+
+test_own_unsent_recovery_is_bounded_and_still_alarms() {
+  local dir state fakebin sent attempts i n
+  dir=$(make_bordered_case own-unsent-bounded)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  escalate_add "$state" "needs-decision: captured esc to interrupt"
+  afk_enter "$state"
+
+  # Every Enter is swallowed from here on, so our digest can never land. Five
+  # ordinary per-cycle flushes; the max-defer escape is disabled so this counts
+  # only the recovery path's own re-sends.
+  i=0
+  while [ "$i" -lt 5 ]; do
+    PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+      FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+      FM_FAKE_PERSIST_SWALLOW=1 FM_INJECT_RECOVER_ATTEMPTS=2 \
+      FM_INJECT_CONFIRM_RETRIES=1 FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=99999 \
+      FM_INJECT_CONFIRM_SLEEP=0.05 housekeeping "$state"
+    i=$((i + 1))
+  done
+  n=$(grep -c 'ENTER-ATTEMPT' "$attempts" 2>/dev/null || true)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  # One Enter for the original type-and-submit, then at most two bounded
+  # recovery re-sends - never one per cycle for as long as the text sits there.
+  [ "$n" -ge 2 ] || fail "recovery never attempted a re-send ($n Enter attempts)"
+  [ "$n" -le 3 ] || fail "recovery kept re-sending Enter past its bound ($n Enter attempts)"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "the digest was retyped while recovery was bounded"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost while recovery was exhausted"
+
+  # The max-defer escape still alarms on a composer recovery could not clear.
+  echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+    FM_FAKE_PERSIST_SWALLOW=1 FM_INJECT_RECOVER_ATTEMPTS=2 \
+    FM_INJECT_CONFIRM_RETRIES=1 FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 housekeeping "$state"
+  [ -s "$state/.subsuper-inject-wedged" ] \
+    || fail "an unrecoverable composer must still raise the wedge alarm"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost after the wedge alarm"
+  pass "own-unsent recovery is bounded per digest and the max-defer wedge alarm still fires"
+}
+
+test_recovery_budget_resets_when_a_fresh_digest_is_typed() {
+  local dir state fakebin sent
+  dir=$(make_bordered_case own-unsent-budget-reset)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  # An earlier episode exhausted its recovery budget.
+  printf '9\n' > "$state/.subsuper-inject-recover-attempts"
+  escalate_add "$state" "done: PR https://x/y/pull/9"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_INJECT_RECOVER_ATTEMPTS=2 FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "an empty composer should still deliver normally"
+  [ ! -e "$state/.subsuper-inject-recover-attempts" ] \
+    || fail "an exhausted recovery budget survived a delivery into an empty composer"
+  pass "reaching an empty composer ends the unsent episode and restores the recovery budget"
+}
+
+test_recovery_requires_persisted_budget_transitions() {
+  local dir state msg enter_log send_log alarm_log
+  dir=$(make_supercase own-unsent-budget-write-failure)
+  state="$dir/state"
+  enter_log="$dir/enter.log"; : > "$enter_log"
+  send_log="$dir/send.log"; : > "$send_log"
+  alarm_log="$dir/alarm.log"; : > "$alarm_log"
+  fm_operational_input_encode away-supervisor "done: durable budget" msg \
+    || fail "could not encode the recovery-budget digest"
+
+  chmod 500 "$state"
+  (
+    fm_backend_composer_content() { printf '%s' "$msg"; }
+    [ "$(fm_backend_composer_content tmux firstmate:0)" = "$msg" ] \
+      || fail "recovery-budget composer stub did not return its digest"
+    fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
+    inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
+    if FM_INJECT_RECOVER_ATTEMPTS=2 \
+      inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
+      fail "recovery succeeded without persisting its attempt count"
+    fi
+  ) || fail "failed-counter recovery subshell failed"
+  chmod 700 "$state"
+  [ ! -s "$enter_log" ] || fail "recovery sent Enter after its attempt-count write failed"
+  [ ! -e "$state/.subsuper-inject-recover-attempts" ] \
+    || fail "a failed first attempt-count write left a usable counter"
+
+  printf '9\n' > "$state/.subsuper-inject-recover-attempts"
+  afk_enter "$state"
+  chmod 500 "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'empty'; }
+    inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
+    if FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
+      inject_msg "done: durable budget" "$state"; then
+      fail "a fresh digest started without clearing its stale recovery counter"
+    fi
+  ) || fail "failed-counter reset subshell failed"
+  chmod 700 "$state"
+  [ "$(cat "$state/.subsuper-inject-recover-attempts")" = 9 ] \
+    || fail "the stale recovery budget was silently reset after clear failure"
+  [ ! -s "$send_log" ] || fail "a fresh digest was typed after its budget reset failed"
+  [ "$(grep -c '^alarm$' "$alarm_log" 2>/dev/null || true)" -eq 2 ] \
+    || fail "failed recovery-budget transitions did not take the wedge-alarm path"
+  pass "recovery never submits or resets its budget without durable state"
+}
+
+test_recovery_rejects_invalid_budget_inputs() {
+  local dir state msg enter_log alarm_log
+  dir=$(make_supercase own-unsent-invalid-budget)
+  state="$dir/state"
+  enter_log="$dir/enter.log"; : > "$enter_log"
+  alarm_log="$dir/alarm.log"; : > "$alarm_log"
+  fm_operational_input_encode away-supervisor "done: bounded recovery" msg \
+    || fail "could not encode the invalid-budget digest"
+  printf 'not-a-count\n' > "$state/.subsuper-inject-recover-attempts"
+  (
+    fm_backend_composer_content() { printf '%s' "$msg"; }
+    [ "$(fm_backend_composer_content tmux firstmate:0)" = "$msg" ] \
+      || fail "malformed-budget composer stub did not return its digest"
+    fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
+    inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
+    if inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
+      fail "recovery accepted a malformed persisted attempt count"
+    fi
+  ) || fail "malformed recovery-budget subshell failed"
+  [ ! -s "$enter_log" ] || fail "a malformed recovery counter granted an Enter attempt"
+  [ "$(grep -c '^alarm$' "$alarm_log" 2>/dev/null || true)" -eq 1 ] \
+    || fail "a malformed recovery counter did not take the wedge-alarm path"
+
+  printf '%s\n' "$INJECT_RECOVER_ATTEMPTS_DEFAULT" > "$state/.subsuper-inject-recover-attempts"
+  (
+    fm_backend_composer_content() { printf '%s' "$msg"; }
+    [ "$(fm_backend_composer_content tmux firstmate:0)" = "$msg" ] \
+      || fail "invalid-maximum composer stub did not return its digest"
+    fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
+    if FM_INJECT_RECOVER_ATTEMPTS=not-a-number \
+      inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
+      fail "a nonnumeric configured maximum disabled the recovery bound"
+    fi
+  ) || fail "invalid configured recovery maximum subshell failed"
+  [ ! -s "$enter_log" ] || fail "a nonnumeric configured maximum granted an Enter past the default bound"
+  [ "$(cat "$state/.subsuper-inject-recover-attempts")" = "$INJECT_RECOVER_ATTEMPTS_DEFAULT" ] \
+    || fail "invalid configured maximum changed the exhausted recovery counter"
+  pass "recovery fails closed on malformed state and invalid limits"
+}
+
+test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
+  local dir state fakebin sent last
+  dir=$(make_bordered_case own-unsent-grown-buffer)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: item A"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 \
+    FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report delivery"
+
+  # A new escalation arrives while our older digest is still unsent.
+  escalate_add "$state" "done: item B"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "recovering an OLDER digest must not clear a buffer that has grown"
+  [ -s "$state/.subsuper-escalations" ] || fail "item B was dropped when the older digest was recovered"
+  grep -F 'item B' "$state/.subsuper-escalations" >/dev/null || fail "item B is missing from the buffer"
+
+  # The composer is unblocked, so the next flush delivers the full buffer.
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "the follow-up flush failed after recovery unblocked the composer"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared by the follow-up flush"
+  last=$(grep 'Supervisor escalate' "$sent" | tail -1)
+  case "$last" in
+    *"item A"*"item B"*) ;;
+    *) fail "the follow-up digest lost an item: '$last'" ;;
+  esac
+  pass "recovering an older digest keeps newly buffered items and delivers them next flush"
+}
+
+# --- watcher-ownership collision --------------------------------------------
+
+test_watcher_collision_is_silent_below_the_bound() {
+  local dir state
+  dir=$(make_supercase watcher-collision-quiet)
+  state="$dir/state"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  [ -e "$state/.subsuper-watcher-collision-since" ] \
+    || fail "the collision episode was not recorded"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a brief ownership collision must not escalate; it resolves on its own"
+  pass "a watcher-ownership collision below the bound is recorded but not escalated"
+}
+
+test_persistent_watcher_collision_escalates_once() {
+  local dir state n
+  dir=$(make_supercase watcher-collision-escalates)
+  state="$dir/state"
+  echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  grep -F 'away-mode triage deferred' "$state/.subsuper-escalations" >/dev/null \
+    || fail "a persistent ownership collision was never surfaced"
+  # A second and third tick must not re-escalate the same episode.
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  n=$(grep -c 'away-mode triage deferred' "$state/.subsuper-escalations" 2>/dev/null || true)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -eq 1 ] || fail "the collision episode escalated $n times; it must escalate once"
+  pass "a persistent watcher-ownership collision escalates exactly once per episode"
+}
+
+test_watcher_collision_episode_clears_on_verified_ownership() {
+  local dir state
+  dir=$(make_supercase watcher-collision-clears)
+  state="$dir/state"
+  echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  mkdir -p "$state/.watch.lock"
+  printf '77\n' > "$state/.watch.lock/pid"
+  clear_watcher_collision_if_owned "$state" 88 \
+    && fail "a different watcher owner cleared the collision episode"
+  [ -e "$state/.subsuper-watcher-collision-escalated" ] \
+    || fail "a mismatched watcher owner cleared the escalated marker"
+  clear_watcher_collision_if_owned "$state" 77 \
+    || fail "the verified watcher owner did not clear the collision episode"
+  [ ! -e "$state/.subsuper-watcher-collision-since" ] \
+    || fail "the collision episode survived verified watcher ownership"
+  [ ! -e "$state/.subsuper-watcher-collision-escalated" ] \
+    || fail "the escalated marker survived verified watcher ownership"
+  # A fresh episode is free to escalate again.
+  echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
+  : > "$state/.subsuper-escalations"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 77"
+  grep -F 'away-mode triage deferred' "$state/.subsuper-escalations" >/dev/null \
+    || fail "a new collision episode after verified ownership was not surfaced"
+  pass "verified watcher ownership ends the collision episode and re-arms it for the next one"
+}
+
+test_watcher_collision_partial_writes_remain_retryable() {
+  local dir state marker buf n status
+  dir=$(make_supercase watcher-collision-append-failure)
+  state="$dir/state"
+  marker="$state/.subsuper-watcher-collision-escalated"
+  buf="$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 900 ))" > "$state/.subsuper-watcher-collision-since"
+  (
+    escalate_add() { return 1; }
+    if FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+      note_watcher_collision "$state" "watcher: already running pid 4242"; then
+      fail "collision escalation succeeded after its buffer append failed"
+    fi
+  ) || fail "collision append-failure subshell failed"
+  [ ! -e "$marker" ] || fail "a failed collision append still marked the episode escalated"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242" \
+    || fail "collision escalation did not retry after its append failure"
+  [ -e "$marker" ] || fail "retried collision escalation did not mark its queued episode"
+
+  dir=$(make_supercase watcher-collision-marker-failure)
+  state="$dir/state"
+  marker="$state/.subsuper-watcher-collision-escalated"
+  buf="$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 900 ))" > "$state/.subsuper-watcher-collision-since"
+  : > "$buf"
+  : > "$buf.since"
+  chmod 500 "$state"
+  status=0
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242" || status=$?
+  chmod 700 "$state"
+  [ "$status" -ne 0 ] || fail "collision escalation succeeded after its marker write failed"
+  [ ! -e "$marker" ] || fail "an unwritable marker appeared after the failed publication"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242" \
+    || fail "collision marker publication did not retry"
+  n=$(grep -c 'watcher-collision-epoch=' "$buf" 2>/dev/null || true)
+  [ "$n" -eq 1 ] || fail "marker retry queued the collision notice $n times"
+  [ -e "$marker" ] || fail "marker retry did not complete the collision episode receipt"
+  pass "collision escalation retries both partial writes without silence or duplication"
+}
+
 test_normal_flush_clears_stale_wedge_marker() {
   local dir state fakebin sent
   dir=$(make_bordered_case normal-clears-wedge)
@@ -1691,6 +2190,34 @@ test_pane_is_busy_herdr_native_busy_state() {
   pass "pane_is_busy: herdr native busy_state='busy' short-circuits without a capture fallback"
 }
 
+test_native_idle_keeps_busy_text_in_an_unsent_digest_recoverable() {
+  local dir state pending enter_log
+  dir=$(make_supercase native-idle-own-unsent-busy-text)
+  state="$dir/state"; enter_log="$dir/enter.log"; : > "$enter_log"
+  afk_enter "$state"
+  fm_operational_input_encode away-supervisor \
+    "done: captured esc to interrupt while diagnosing" pending \
+    || fail "could not encode the native-idle recovery digest"
+  (
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf 'idle'; }
+    fm_backend_capture() { printf '%s\n' "$pending"; }
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_composer_content() { printf '%s' "$pending"; }
+    [ "$(fm_backend_composer_content herdr default:w1:p2)" = "$pending" ] \
+      || fail "native-idle composer stub did not return its digest"
+    fm_backend_submit_enter() { printf '[ENTER]\n' >> "$enter_log"; printf 'empty'; }
+    fm_backend_send_text_submit() { fail "native-idle recovery retyped the pending digest"; }
+    FM_DAEMON_PRIMARY_HARNESS=claude FM_SUPERVISOR_BACKEND=herdr \
+      FM_SUPERVISOR_TARGET="default:w1:p2" \
+      inject_msg "done: captured esc to interrupt while diagnosing" "$state" \
+      || fail "native idle did not keep recovery reachable for a digest containing busy text"
+  ) || fail "native-idle own-unsent recovery subshell failed"
+  [ "$(grep -c '^\[ENTER\]$' "$enter_log" 2>/dev/null || true)" -eq 1 ] \
+    || fail "native-idle recovery did not resubmit the pending digest exactly once"
+  pass "native idle keeps an own-unsent digest containing Claude busy text recoverable"
+}
+
 test_primary_busy_guard_is_harness_scoped() {
   (
     fm_backend_busy_state() { printf 'unknown'; }
@@ -1702,6 +2229,25 @@ test_primary_busy_guard_is_harness_scoped() {
       || fail "OpenCode's rendered signature should classify an OpenCode primary busy"
   ) || fail "harness-scoped primary busy guard subshell failed"
   pass "primary busy guard isolates rendered signatures by detected harness"
+}
+
+test_primary_busy_guard_preserves_full_capture_geometry() {
+  local harness token screen
+  (
+    fm_backend_busy_state() { printf 'unknown'; }
+    fm_backend_capture() { printf '%s' "$screen"; }
+    while IFS="$(printf '\t')" read -r harness token; do
+      [ -n "$harness" ] || continue
+      screen=$(fm_test_busy_token_inside_composer "$token")
+      if FM_DAEMON_PRIMARY_HARNESS="$harness" pane_is_busy firstmate:0 tmux; then
+        fail "$harness composer text established daemon busy"
+      fi
+      screen=$(fm_test_busy_footer_below_bare_composer "$token")
+      FM_DAEMON_PRIMARY_HARNESS="$harness" pane_is_busy firstmate:0 tmux \
+        || fail "$harness external footer stopped establishing daemon busy"
+    done < <(fm_test_delivery_busy_cases)
+  ) || fail "daemon full-capture busy matrix subshell failed"
+  pass "daemon busy fallback excludes composers before folding every harness capture"
 }
 
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted() {
@@ -1904,6 +2450,21 @@ test_max_defer_empty_swallow_types_once_and_alarms
 test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
 test_normal_flush_clears_stale_wedge_marker
+test_own_unsent_recovery_after_swallowed_enter_clears_buffer
+test_recovery_recognises_an_envelope_prefix_soft_wrap
+test_mid_token_soft_wrap_recovers_once_without_duplicate_delivery
+test_recovery_of_different_own_envelope_keeps_buffer
+test_recovery_accepts_tmux_idle_to_busy_confirmation
+test_pending_human_draft_is_never_recovered
+test_own_unsent_recovery_is_bounded_and_still_alarms
+test_own_unsent_recovery_with_grown_buffer_keeps_new_items
+test_recovery_budget_resets_when_a_fresh_digest_is_typed
+test_recovery_requires_persisted_budget_transitions
+test_recovery_rejects_invalid_budget_inputs
+test_watcher_collision_is_silent_below_the_bound
+test_persistent_watcher_collision_escalates_once
+test_watcher_collision_episode_clears_on_verified_ownership
+test_watcher_collision_partial_writes_remain_retryable
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard
@@ -1932,7 +2493,9 @@ test_fm_send_exits_nonzero_on_unproven_submit
 test_discover_supervisor_backend_precedence
 test_discover_supervisor_target_herdr
 test_pane_is_busy_herdr_native_busy_state
+test_native_idle_keeps_busy_text_in_an_unsent_digest_recoverable
 test_primary_busy_guard_is_harness_scoped
+test_primary_busy_guard_preserves_full_capture_geometry
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted
 test_pane_input_pending_herdr_dispatch
 test_inject_msg_herdr_busy_guard_defers

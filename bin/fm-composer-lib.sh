@@ -319,10 +319,7 @@ fm_composer_strip_ghost() {
 # exposes no stable ASCII busy token.
 # The harness-less default is the UNION of the per-harness tokens below, used
 # when a caller has no recorded harness for the pane (the submit cores read the
-# baseline and the post-Enter transition this way). cursor's `ctrl+c to stop` is
-# part of that union for the same reason the others are: without it a cursor
-# submit could never be acknowledged, because cursor parks its terminal cursor
-# outside its composer and the composer verdict is therefore always `unknown`.
+# baseline and the post-Enter transition this way).
 FM_DELIVERY_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel|ctrl\+c to stop'
 FM_DELIVERY_CLAUDE_BUSY_REGEX_DEFAULT='esc to interrupt|…[[:space:]]+\([0-9]+[smh]'
 FM_DELIVERY_CODEX_BUSY_REGEX_DEFAULT='esc to interrupt'
@@ -339,9 +336,16 @@ FM_DELIVERY_GROK_BUSY_REGEX_DEFAULT='Ctrl\+c:cancel'
 FM_DELIVERY_CURSOR_BUSY_REGEX_DEFAULT='ctrl\+c to stop'
 FM_DELIVERY_KIMI_BUSY_REGEX_DEFAULT='^[[:space:]]*(🌑|🌒|🌓|🌔|🌕|🌖|🌗|🌘)[[:space:]]+·[[:space:]]+'
 
-fm_busy_lines_match() {  # [harness]
-  local harness=${1:-} lines regex
+fm_busy_lines_match() {  # [harness] [nonblank-limit] [composer-mode]
+  local harness=${1:-} limit=${2:-12} composer_mode=${3:-include} lines regex
+  case "$limit" in ''|0|*[!0-9]*) return 1 ;; esac
   IFS= read -r -d '' lines || true
+  case "$composer_mode" in
+    exclude) lines=$(_fm_busy_lines_without_selected_composer "$lines") ;;
+    include) ;;
+    *) return 1 ;;
+  esac
+  lines=$(printf '%s' "$lines" | grep -v '^[[:space:]]*$' | tail "-$limit")
   if [ -n "${FM_BUSY_REGEX:-}" ]; then
     regex=$FM_BUSY_REGEX
   else
@@ -362,6 +366,25 @@ fm_busy_lines_match() {  # [harness]
     esac
   fi
   [ -n "$regex" ] && printf '%s' "$lines" | grep -qiE "$regex"
+}
+
+_fm_busy_lines_without_selected_composer() {  # <screen>
+  local screen=$1 plain row=0 raw
+  plain=$(printf '%s\n' "$screen" | fm_composer_strip_ansi)
+  _fm_composer_scan_screen "$plain" '' 1
+  if ! _fm_composer_select_cursorless "$plain"; then
+    printf '%s' "$screen"
+    return 0
+  fi
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    if [ "$row" -lt "$FM_COMPOSER_SELECTED_FIRST" ] \
+       || [ "$row" -gt "$FM_COMPOSER_SELECTED_LAST" ]; then
+      printf '%s\n' "$raw"
+    fi
+    row=$((row + 1))
+  done <<EOF
+$screen
+EOF
 }
 
 # The prompt glyphs, each declared exactly once (see THE SAFETY RULE above).
@@ -1315,7 +1338,8 @@ EOF
 # stays a loud refusal rather than a blind retry into an unreadable pane.
 # tmux keeps its own richer core (bin/fm-tmux-lib.sh: the busy-queued-Enter
 # and idle-baseline turn-started conversions its busy primitive enables), and
-# herdr confirms through native agent-state; both consume the same shared
+# herdr confirms through native agent-state with a rendered-footer fallback;
+# both consume the same shared
 # verdict, so no shape knowledge lives in any of the three loops.
 fm_composer_submit_retry_core() {  # <send-key-fn> <state-fn> <target> <retries> <enter-sleep> [expected-label]
   local send_key_fn=$1 state_fn=$2 target=$3 retries=$4 sleep_s=$5 expected_label=${6:-} i=0 state

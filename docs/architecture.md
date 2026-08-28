@@ -86,14 +86,15 @@ It leads with a prominent bordered tangle banner, while `bin/fm-guard.sh` owns t
 On every verified primary harness, tracked hook integration gives the lock-owning primary session a push-based backstop; [turnend-guard.md](turnend-guard.md) owns the session-owner and adapter-specific block or bounded-follow-up decisions.
 The guard covers the main primary and genuinely marked secondmate homes, exempts child crewmate/scout worktrees, is loop-safe per harness, and is documented in [turnend-guard.md](turnend-guard.md).
 
-A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill starts it through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
+A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill starts it through the tracked foreground helper `bin/fm-afk-start.sh`, after which the daemon takes over one-shot watcher cycles when the home-scoped singleton is available and self-handles routine wakes in bash.
+[`watcher-continuity.md`](watcher-continuity.md) owns the bounded transition when an earlier cycle still holds the singleton.
 The watcher and daemon share `bin/fm-classify-lib.sh` for captain-relevant status verbs, declared-external-wait vocabulary, and status-scan primitives.
 Terminal verbs remain captain-relevant, while a nonterminal progress verb cannot become terminal merely because its prose contains a legacy free-text token such as `merged`; bare legacy free-text lines remain compatible.
 The always-on watcher also uses that library's absorb classification on no-verb signals and first-sighting stale panes before status-log terminality is trusted, while the daemon maintains distinct wedge and declared-pause recheck cadences.
 In away mode, seen-status dedupe does not clear possible-wedge aging for nonterminal progress, so housekeeping still re-escalates an unchanged idle pane at the configured bound.
 The daemon escalates captain-relevant events, plus a bounded recheck for a declared pause that remains idle, as one batched, single-line digest using the canonical `away-supervisor` kind from `bin/fm-operational-input.sh` so firstmate can distinguish it structurally from real messages.
 Its supervisor injection path supports tmux and herdr panes, with `FM_SUPERVISOR_BACKEND` and `FM_SUPERVISOR_TARGET` resolved independently from the task-spawn backend.
-Pane existence, busy checks, composer checks, capture, and verified submit route through `bin/fm-backend.sh`: tmux keeps the same submit core used by the tmux send backend, while herdr uses native agent-state submit confirmation on idle baselines and a pre-Enter rendered-footer transition when that baseline is unavailable.
+Pane existence, busy checks, composer checks, capture, and verified submit route through `bin/fm-backend.sh`: tmux keeps the same submit core used by the tmux send backend, while the [Herdr backend contract](herdr-backend.md#current-transport-behavior) owns that adapter's confirmation signals, narrow composer exclusions, and active limits.
 The tmux submit core treats a busy pane plus retries-exhausted plus composer-still-pending as a queued Enter because OpenCode 1.18.4 accepts Enter mid-turn and queues it for after the turn, reported as `empty` so the daemon and `fm-send` do not re-send.
 An idle pane keeps the `pending` verdict as a genuine swallow.
 The same OpenCode busy-queue case is a known gap on the herdr adapter and is recorded in `docs/herdr-backend.md` rather than patched here.
@@ -102,7 +103,8 @@ Composer classification has one shared owner, `bin/fm-composer-lib.sh`: tmux, he
 The whitespace and glyph comparisons on verdict paths that normalize first are byte-exact, so those verdicts cannot depend on the ambient locale.
 The leading-glyph helpers (`fm_composer_leading_prompt_glyph_var` and its agent/shell variants) trim leading whitespace with an unnormalized `[[:space:]]`, so passing a leading non-ASCII space directly to those helpers is locale-dependent; this is harmless on the shipped paths because every caller normalizes first.
 One known and deliberately unfixed limitation is recorded in the owner's header: `${v#?}` removes a byte under `LC_ALL=C` and a character under UTF-8, so glyph strips remove the matched glyph as a literal byte sequence instead.
-The daemon injects only into an affirmatively `empty` composer, so every other or future verdict defers; positive container proof is required, and a blank unidentified row or bare dead-shell prompt cannot receive an escalation.
+The daemon types a new digest only into an affirmatively `empty` composer, so positive container proof is required and a blank unidentified row or bare dead-shell prompt cannot receive an escalation.
+The [Herdr backend contract](herdr-backend.md#own-unsent-recovery) owns the sole Enter-only recovery for a pending daemon-authored envelope; every other pending or future verdict defers.
 The current operator boundary is in [Composer and injection safety](herdr-backend.md#composer-and-injection-safety).
 Unsupported supervisor backends refuse at daemon startup.
 Stalled escalation delivery writes `state/.subsuper-inject-wedged` and attempts a configured backend-independent active alert after `FM_MAX_DEFER_SECS` instead of silently deferring forever.

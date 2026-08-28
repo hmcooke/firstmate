@@ -72,6 +72,17 @@ fm_tmux_composer_capture() {  # <target>
   tmux capture-pane -e -p -t "$1" -S 0 -E - 2>/dev/null
 }
 
+# fm_tmux_composer_content: the tmux arm of the shared composer-content read
+# (bin/fm-composer-lib.sh's fm_composer_extract_selected_content, the same owner
+# the zellij adapter's paste proof uses). Capture plus that call, with the SAME
+# capture and capability facts as fm_tmux_composer_state, so the verdict and the
+# text can never disagree about which rows are the composer.
+fm_tmux_composer_content() {  # <target> -> composer text on stdout
+  local target=$1 pane
+  pane=$(fm_tmux_composer_capture "$target") || return 1
+  fm_composer_extract_selected_content "$(fm_tmux_composer_caps)" "$pane"
+}
+
 # fm_tmux_composer_cursor_row: the pane's cursor row, zero-based, relative to
 # the visible pane - tmux's genuine primitive that no other backend has.
 fm_tmux_composer_cursor_row() {  # <target>
@@ -203,7 +214,7 @@ fm_pane_busy_state() {  # <target> [harness] -> busy|idle|unknown
     || { printf 'unknown'; return 0; }
   visible=$(printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12)
   [ -n "$visible" ] || { printf 'unknown'; return 0; }
-  if printf '%s' "$visible" | fm_busy_lines_match "$harness"; then
+  if printf '%s' "$tail40" | fm_busy_lines_match "$harness" 12; then
     printf 'busy'
   else
     printf 'idle'

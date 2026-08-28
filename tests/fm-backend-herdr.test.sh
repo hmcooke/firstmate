@@ -3429,6 +3429,22 @@ test_send_text_submit_detects_landed_send() {
   pass "fm_backend_herdr_send_text_submit: reports 'empty' once agent_status reports working after one Enter, without ever reading the composer"
 }
 
+test_submit_enter_detects_landed_send_without_typing() {
+  local dir log resp fb out enter_count
+  dir="$TMP_ROOT/submit-enter-ok"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/3.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_submit_enter default:w1:p2 3 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "submit_enter should report empty once native agent state reports working, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "submit_enter should send exactly one Enter after a confirmed turn start, sent $enter_count"
+  [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" 2>/dev/null || true)" -eq 0 ] \
+    || fail "submit_enter typed text instead of preserving the existing composer"
+  pass "fm_backend_herdr_submit_enter: confirms a native idle-to-working transition without typing"
+}
+
 test_send_text_submit_detects_swallowed_enter() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -3494,11 +3510,9 @@ test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
   # 3: pane read - the RENDERED footer baseline is still idle because the
   #    pre-existing turn has not rendered its token yet
   # 4: send-keys enter; 5: pane read - the composer still holds the message
-  # 6: pane read - the pre-existing turn's footer has become busy
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/2.out"
   printf '  ready\n' > "$resp/3.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/5.out"
-  printf '  thinking... esc to interrupt\n' > "$resp/6.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 1 0.01 0.01' "$ROOT" )
@@ -3506,7 +3520,7 @@ test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 1 ] || fail "preexisting-working swallowed Enter should use the configured retry count, sent $enter_count Enter(s)"
   read_count=$(grep -c $'\x1f''pane'$'\x1f''read' "$log")
-  [ "$read_count" -eq 2 ] || fail "preexisting-working confirmation should read one footer baseline and one composer verdict without accepting the later busy footer, made $read_count read(s)"
+  [ "$read_count" -eq 2 ] || fail "preexisting-working confirmation should read one footer baseline and one composer verdict, made $read_count read(s)"
   pass "fm_backend_herdr_send_text_submit: preexisting working is not accepted as submit proof when the composer still holds the message"
 }
 
@@ -3525,8 +3539,8 @@ herdr_cursor_idle_plain() {
   printf '%b' ' ▄▄▄▄▄▄▄▄▄▄\n  → Add a follow-up\n ▀▀▀▀▀▀▀▀▀▀\n  Cursor Grok 4.5 High · 7%%           Run Everything\n  ~/.treehouse/curhd-ae68cd/1/curhd · 39418af\n'
 }
 
-# The mid-turn capture, plain: the spinner verb rotates, the `ctrl+c to stop`
-# token does not, which is why the token is what the matcher keys on.
+# The mid-turn capture, plain: the spinner verb rotates, while the stable
+# `ctrl+c to stop` token shares the selected composer row.
 herdr_cursor_midturn_plain() {
   printf '%b' ' ⠘⠆ Running  59 tokens\n ▄▄▄▄▄▄▄▄▄▄\n  → Add a follow-up                   ctrl+c to stop\n ▀▀▀▀▀▀▀▀▀▀\n  1 task\n  Cursor Grok 4.5 High · 7%%           Run Everything\n  ~/.treehouse/curhd-ae68cd/1/curhd · 39418af\n'
 }
@@ -3555,7 +3569,7 @@ test_composer_state_cursor_midturn_row_reads_pending() {
   pass "fm_backend_herdr_composer_state: cursor's mid-turn placeholder-plus-busy-token row reads pending (why delivery needs a separate signal)"
 }
 
-test_rendered_busy_state_reads_the_cursor_busy_token() {
+test_pre_submit_busy_baseline_excludes_the_cursor_token_inside_composer() {
   local dir log resp fb idle_out busy_out fail_out
   dir="$TMP_ROOT/rendered-busy"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   herdr_cursor_idle_plain > "$resp/1.out"
@@ -3563,52 +3577,87 @@ test_rendered_busy_state_reads_the_cursor_busy_token() {
   printf '1\n' > "$resp/3.exit"
   fb=$(make_herdr_fakebin "$dir")
   idle_out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_rendered_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_rendered_busy_state default:w1:p2 "" exclude' "$ROOT" )
   busy_out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_rendered_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_rendered_busy_state default:w1:p2 "" exclude' "$ROOT" )
   fail_out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
-    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_rendered_busy_state default:w1:p2' "$ROOT" )
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_rendered_busy_state default:w1:p2 "" exclude' "$ROOT" )
   [ "$idle_out" = idle ] || fail "an idle cursor pane renders no busy token and must read idle, got '$idle_out'"
-  [ "$busy_out" = busy ] || fail "a mid-turn cursor pane renders 'ctrl+c to stop' and must read busy, got '$busy_out'"
+  [ "$busy_out" = idle ] || fail "a busy token inside cursor's selected composer must not establish busy, got '$busy_out'"
   [ "$fail_out" = unknown ] || fail "an unreadable pane must read unknown, never idle, got '$fail_out'"
-  pass "fm_backend_herdr_rendered_busy_state: busy/idle/unknown from the rendered footer, with an unreadable pane never reading idle"
+  pass "Herdr pre-submit busy baseline excludes composer text and keeps unreadable panes unknown"
 }
 
-test_send_text_submit_confirms_never_idle_native_state_via_footer_transition() {
+test_pre_submit_busy_baseline_preserves_full_capture_geometry() {
+  local harness token screen out
+  (
+    . "$ROOT/bin/backends/herdr.sh"
+    fm_backend_herdr_capture() { printf '%s' "$screen"; }
+    while IFS="$(printf '\t')" read -r harness token; do
+      [ -n "$harness" ] || continue
+      screen=$(fm_test_busy_token_inside_composer "$token")
+      out=$(fm_backend_herdr_rendered_busy_state default:w1:p2 "$harness" exclude)
+      [ "$out" = idle ] || fail "$harness composer text made Herdr rendered state '$out'"
+      screen=$(fm_test_busy_footer_below_bare_composer "$token")
+      out=$(fm_backend_herdr_rendered_busy_state default:w1:p2 "$harness" exclude)
+      [ "$out" = busy ] || fail "$harness external footer made Herdr rendered state '$out'"
+    done < <(fm_test_delivery_busy_cases)
+  ) || fail "Herdr full-capture busy matrix subshell failed"
+  pass "Herdr pre-submit busy baseline excludes composers before folding every harness capture"
+}
+
+test_send_text_submit_confirms_external_footer_transition() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-cursor-footer-transition"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   # 1: send-text
-  # 2: agent get - cursor is `blocked` even while idle, so the native
-  #    idle-baseline path is unreachable and the composer branch runs
+  # 2: agent get - the native idle-baseline path is unreachable
   # 3: pane read - rendered footer baseline: no busy token, so the pane was NOT
   #    mid-turn before our Enter
   # 4: send-keys enter
-  # 5: pane read - composer content mid-turn: placeholder plus busy token
-  # 6: pane read - rendered footer now busy: an idle-to-busy transition ACROSS
-  #    our Enter, which is the submission proof
+  # 5: pane read - the working screen has no selectable composer
+  # 6: pane read - the external rendered footer is now busy
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/2.out"
-  herdr_cursor_idle_plain > "$resp/3.out"
-  herdr_cursor_midturn_ansi > "$resp/5.out"
-  herdr_cursor_midturn_plain > "$resp/6.out"
+  printf '  ❯ hello captain\n' > "$resp/3.out"
+  printf '  Working... esc to interrupt\n' > "$resp/5.out"
+  printf '  Working... esc to interrupt\n' > "$resp/6.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 3 0.01 0.01' "$ROOT" )
   [ "$out" = empty ] || fail "an idle-to-busy rendered-footer transition must confirm the submit for a harness whose native state never goes idle, got '$out'"
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 1 ] || fail "a confirmed submit must not send a needless extra Enter, sent $enter_count Enter(s)"
-  pass "fm_backend_herdr_send_text_submit: a rendered-footer idle-to-busy transition confirms delivery when native agent-state never reports idle"
+  pass "fm_backend_herdr_send_text_submit: an external rendered-footer transition confirms delivery when native state is not idle"
 }
 
-test_send_text_submit_never_idle_native_state_keeps_pending_without_a_transition() {
+test_submit_enter_confirms_cursor_footer_after_excluding_digest_baseline() {
+  local dir log resp fb out enter_count digest
+  dir="$TMP_ROOT/submit-enter-own-digest-footer"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  digest=$(printf '%b' '\342\201\243FIRSTMATE_OP: v1 away-supervisor: done: captured ctrl+c to stop')
+  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/1.out"
+  printf 'transcript\n  → %s\n' "$digest" > "$resp/2.out"
+  herdr_cursor_midturn_ansi > "$resp/4.out"
+  herdr_cursor_midturn_plain > "$resp/5.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_submit_enter default:w1:p2 2 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "cursor's post-Enter composer-row footer did not confirm recovery after the pending digest was excluded from its baseline: $out"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "confirmed Enter-only recovery sent $enter_count Enter(s)"
+  [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" 2>/dev/null || true)" -eq 0 ] \
+    || fail "Enter-only recovery retyped the digest"
+  pass "fm_backend_herdr_submit_enter: cursor confirms from its whole-tail post-Enter signal without poisoning the excluded baseline"
+}
+
+test_send_text_submit_busy_baseline_keeps_pending_without_a_transition() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-cursor-no-transition"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   # The pane was ALREADY mid-turn before our Enter, so its busy footer is not
   # evidence about OUR message: the verdict must stay pending rather than
   # borrowing someone else's turn as proof of our delivery.
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/2.out"
-  herdr_cursor_midturn_plain > "$resp/3.out"
-  herdr_cursor_midturn_ansi > "$resp/5.out"
-  herdr_cursor_midturn_ansi > "$resp/7.out"
+  printf '  Working... esc to interrupt\n  ❯ hello captain\n' > "$resp/3.out"
+  printf '  Working... esc to interrupt\n  ❯ hello captain\n' > "$resp/5.out"
+  printf '  Working... esc to interrupt\n  ❯ hello captain\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
@@ -4456,14 +4505,17 @@ test_wait_for_working_returns_idle_when_never_busy_but_readable
 test_wait_for_working_returns_unknown_when_never_readable
 test_wait_for_working_treats_blocked_as_submit_active
 test_send_text_submit_detects_landed_send
+test_submit_enter_detects_landed_send_without_typing
 test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_text_submit_confirms_blocked_after_enter
 test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
 test_composer_state_cursor_midturn_row_reads_pending
-test_rendered_busy_state_reads_the_cursor_busy_token
-test_send_text_submit_confirms_never_idle_native_state_via_footer_transition
-test_send_text_submit_never_idle_native_state_keeps_pending_without_a_transition
+test_pre_submit_busy_baseline_excludes_the_cursor_token_inside_composer
+test_pre_submit_busy_baseline_preserves_full_capture_geometry
+test_send_text_submit_confirms_external_footer_transition
+test_submit_enter_confirms_cursor_footer_after_excluding_digest_baseline
+test_send_text_submit_busy_baseline_keeps_pending_without_a_transition
 test_send_text_submit_confirms_despite_codex_idle_tip_composer
 test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint
 test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change

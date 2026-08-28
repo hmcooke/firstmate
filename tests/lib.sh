@@ -50,6 +50,32 @@ pass() {
   printf 'ok - %s\n' "$1"
 }
 
+fm_test_delivery_busy_cases() {
+  printf '%s\t%s\n' \
+    claude 'esc to interrupt' \
+    codex 'esc to interrupt' \
+    opencode 'esc interrupt' \
+    pi 'Working...' \
+    pi-signed 'Working...' \
+    grok 'Ctrl+c:cancel' \
+    kimi '🌑 · thinking' \
+    cursor 'ctrl+c to stop'
+}
+
+fm_test_busy_token_inside_composer() {  # <token>
+  local text="pending text says $1" width border='' i=0
+  width=$((${#text} + 4))
+  while [ "$i" -lt "$width" ]; do
+    border="${border}─"
+    i=$((i + 1))
+  done
+  printf '╭%s╮\n│ > %s │\n╰%s╯\n\nordinary status\n' "$border" "$text" "$border"
+}
+
+fm_test_busy_footer_below_bare_composer() {  # <token>
+  printf '❯ ordinary pending text\n\n%s\n' "$1"
+}
+
 # --- self-cleaning temp root ------------------------------------------------
 #
 # fm_test_tmproot <prefix> echoes a fresh temp dir and registers it for removal

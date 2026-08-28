@@ -754,6 +754,76 @@ test_selected_content_is_composer_scoped_and_wrap_normalized() {
   pass "fm_composer_extract_selected_content: scopes user content and excludes furniture"
 }
 
+# --- composer CONTENT read as authorship evidence ---------------------------
+#
+# The away daemon may resubmit a pending composer ONLY when the text in it is
+# its own operational envelope (bin/fm-supervise-daemon.sh's own-unsent
+# recovery), so the read that proves authorship must see the composer and
+# nothing else. An already DELIVERED digest is echoed back into the transcript
+# above the composer, so a whole-screen search would find the same marker on a
+# pane whose composer actually holds a human's draft.
+
+FM_TEST_OP_PREFIX="$(printf '\342\201\243')FIRSTMATE_OP: v1 away-supervisor: "
+FM_TEST_CAPS_PLAIN=$(printf 'styled=0\ncursor=0\nidentity=1\nrows=20')
+
+test_composer_content_excludes_a_delivered_digest_above_it() {
+  local screen out
+  screen=$(printf '%s\n' \
+    "> ${FM_TEST_OP_PREFIX}an already delivered digest" \
+    'assistant replied to it' \
+    '╭──────────────────────╮' \
+    '│ > human draft        │' \
+    '╰──────────────────────╯')
+  out=$(fm_composer_extract_selected_content "$FM_TEST_CAPS_PLAIN" "$screen") \
+    || fail "composer content read refused a well-formed screen"
+  case "$out" in
+    *"$FM_TEST_OP_PREFIX"*) fail "composer content leaked a DELIVERED digest from the transcript: '$out'" ;;
+  esac
+  [ "$out" = "human draft" ] || fail "composer content should be the draft alone, got '$out'"
+  case "$out" in "$FM_TEST_OP_PREFIX"*) fail "a human draft must never read as our own envelope" ;; esac
+  pass "composer content read returns the composer only, never a delivered digest above it"
+}
+
+test_composer_content_anchors_our_unsent_envelope() {
+  local screen out
+  screen=$(printf '%s\n' \
+    'some earlier transcript row' \
+    '╭──────────────────────────────────────────────╮' \
+    "│ > ${FM_TEST_OP_PREFIX}item A | item B        │" \
+    '╰──────────────────────────────────────────────╯')
+  out=$(fm_composer_extract_selected_content "$FM_TEST_CAPS_PLAIN" "$screen") \
+    || fail "composer content read refused a pending composer"
+  case "$out" in
+    "$FM_TEST_OP_PREFIX"*) ;;
+    *) fail "an unsent envelope must start the extracted composer content, got '$out'" ;;
+  esac
+  pass "composer content read strips the prompt glyph so our unsent envelope anchors at the start"
+}
+
+test_composer_content_refuses_an_unselectable_screen() {
+  local screen
+  screen=$(printf '%s\n' 'just a transcript row' 'and another')
+  if fm_composer_extract_selected_content "$FM_TEST_CAPS_PLAIN" "$screen" >/dev/null 2>&1; then
+    fail "composer content read must refuse a screen with no composer shape"
+  fi
+  pass "composer content read refuses a screen with no selectable composer"
+}
+
+test_busy_matcher_excludes_composer_text_and_keeps_external_footers() {
+  local harness token inside outside
+  while IFS="$(printf '\t')" read -r harness token; do
+    [ -n "$harness" ] || continue
+    inside=$(fm_test_busy_token_inside_composer "$token")
+    if printf '%s' "$inside" | fm_busy_lines_match "$harness" 12 exclude; then
+      fail "$harness busy text inside the selected composer established busy"
+    fi
+    outside=$(fm_test_busy_footer_below_bare_composer "$token")
+    printf '%s' "$outside" | fm_busy_lines_match "$harness" 12 exclude \
+      || fail "$harness busy footer outside the selected composer stopped matching"
+  done < <(fm_test_delivery_busy_cases)
+  pass "the shared busy matcher excludes composer text and preserves every external harness footer"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
 test_bare_shell_prompt_with_command_is_not_empty
@@ -788,3 +858,7 @@ test_incomplete_lower_box_invalidates_stale_candidate
 test_titled_bottom_requires_matching_width
 test_cursor_on_proven_box_bottom_classifies_content
 test_selected_content_is_composer_scoped_and_wrap_normalized
+test_composer_content_excludes_a_delivered_digest_above_it
+test_composer_content_anchors_our_unsent_envelope
+test_composer_content_refuses_an_unselectable_screen
+test_busy_matcher_excludes_composer_text_and_keeps_external_footers

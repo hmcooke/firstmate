@@ -21,6 +21,12 @@ Only an exhausted failure with no verified watcher emits one last-resort notice 
 The Claude turn-end guard owns the monotonic failure progression, one-time attended fail-open, post-alarm continuation suppression, and positive recovery reset described in [`turnend-guard.md`](turnend-guard.md#harness-integrations).
 While supervision is still needed and away mode remains inactive, an actionable close wakes the idle session through exit 2.
 
+Away mode does not transfer watcher ownership.
+A cycle armed before `/afk` keeps the home-scoped singleton, and because the Claude Stop hook is inert under away mode nothing re-arms it, so that cycle can hold the lock until its own actionable close.
+The away daemon's watcher child then exits with `watcher: already running` instead of a wake and the daemon classifies nothing of its own until it wins the lock on a later tick.
+Wakes are still detected and queued durably by whichever cycle holds the lock, so this defers the daemon's triage rather than losing events.
+The daemon escalates once per collision episode after `FM_WATCHER_COLLISION_ESCALATE_SECS`, which defaults to 600 seconds, and owning the watcher again ends that episode.
+
 ## Actionable wake ordering
 
 After an actionable Pi or OpenCode child close, the adapter starts and verifies one singleton successor before it delivers the original wake.
@@ -84,6 +90,7 @@ The same suite covers ordinary same-process session replacement for `/new`, `/re
 `tests/fm-claude-stop-autoarm.test.sh` covers the auto-arm's scope, stale and live session owners, unchanged AFK and need boundaries, single-flight, bounded failure retries, benign live-watcher cycle ends, one-notice failure episodes, and exit-2 translation.
 `FM_CLAUDE_LIVE_E2E=1 tests/fm-claude-stop-autoarm-live-e2e.test.sh` starts with the reproduced stale-lock state, runs session start first, completes two tokenless cycles, and checks the competing-live-owner negative control.
 `tests/fm-turnend-guard.test.sh` covers the cooperative `--claude` guard, including monotonic failed-epoch progression, the integrated bounded fail-open, post-alarm continuation suppression, and positive recovery reset.
+`tests/fm-daemon.test.sh` covers the pre-away singleton collision bound, one escalation per episode, durable partial-write retries, and positive reset when the daemon owns the watcher again.
 
 ## Active limits and verification
 

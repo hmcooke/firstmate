@@ -721,6 +721,19 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
   esac
 }
 
+# fm_backend_submit_enter: submit text already present in the composer through
+# the confirmation owner for a supported away-mode supervisor backend.
+fm_backend_submit_enter() {  # <backend> <target> <retries> <enter-sleep>
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_submit_enter "$@" ;;
+    herdr) fm_backend_herdr_submit_enter "$@" ;;
+    *) echo "error: no confirmed Enter-only submit implementation for backend '$backend'" >&2; return 1 ;;
+  esac
+}
+
 # fm_backend_send_text_submit: type text once, then submit and verify,
 # retrying only the submission (never retyping). Echoes the backend's
 # proof-carrying verdict; callers require exact empty for confirmed delivery.
@@ -816,6 +829,26 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
     cmux) fm_backend_cmux_composer_state "$@" ;;
     zellij) fm_backend_zellij_composer_state "$@" ;;
     *) printf 'unknown' ;;
+  esac
+}
+
+# fm_backend_composer_content: the composer's CURRENT TEXT, one row per line.
+# Separate from fm_backend_composer_state because the verdict cannot tell a
+# human's half-typed draft from firstmate's own unsent operational envelope,
+# and only the second may ever be acted on (bin/fm-supervise-daemon.sh's
+# own-unsent recovery). Implemented only for the two backends that can host the
+# away-mode supervisor terminal (docs/herdr-backend.md "Away-mode supervisor
+# support"); every other backend has no caller and reports failure rather than
+# a guessed read, so an unsupported pane can never look like one holding our
+# own text.
+fm_backend_composer_content() {  # <backend> <target> -> composer text on stdout
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_tmux_composer_content "$@" ;;
+    herdr) fm_backend_herdr_composer_content "$@" ;;
+    *) return 1 ;;
   esac
 }
 
