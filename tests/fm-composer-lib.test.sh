@@ -814,11 +814,11 @@ test_busy_matcher_excludes_composer_text_and_keeps_external_footers() {
   while IFS="$(printf '\t')" read -r harness token; do
     [ -n "$harness" ] || continue
     inside=$(fm_test_busy_token_inside_composer "$token")
-    if printf '%s' "$inside" | fm_busy_lines_match "$harness"; then
+    if printf '%s' "$inside" | fm_busy_lines_match "$harness" 12 exclude; then
       fail "$harness busy text inside the selected composer established busy"
     fi
     outside=$(fm_test_busy_footer_below_bare_composer "$token")
-    printf '%s' "$outside" | fm_busy_lines_match "$harness" \
+    printf '%s' "$outside" | fm_busy_lines_match "$harness" 12 exclude \
       || fail "$harness busy footer outside the selected composer stopped matching"
   done < <(fm_test_delivery_busy_cases)
   pass "the shared busy matcher excludes composer text and preserves every external harness footer"
