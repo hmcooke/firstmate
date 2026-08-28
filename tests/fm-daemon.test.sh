@@ -1185,6 +1185,157 @@ test_max_defer_pending_composer_alarms_without_typing() {
   pass "max-defer on a pending composer alarms without typing"
 }
 
+# --- own-unsent recovery ----------------------------------------------------
+#
+# A swallowed Enter leaves OUR digest in the composer, and before recovery
+# existed that state was permanent: the composer guard read `pending` and
+# refused to type for as long as the text sat there (measured live 2026-08-27/28
+# as 5,545 consecutive deferrals over 22.9h). Recovery resubmits our own
+# envelope with Enter only. A human's draft is still never touched.
+
+test_own_unsent_recovery_after_swallowed_enter_clears_buffer() {
+  local dir state fakebin sent attempts
+  dir=$(make_bordered_case own-unsent-recovers)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: PR https://x/y/pull/7"
+  afk_enter "$state"
+
+  # First flush: the Enter is swallowed, so our digest stays in the composer.
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+    FM_FAKE_PERSIST_SWALLOW=1 \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report the digest as delivered"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost after a swallowed Enter"
+  [ -s "$state/.subsuper-inject-unsent" ] || fail "the unsent digest was not recorded"
+  grep -F 'FIRSTMATE_OP' "$dir/composer" >/dev/null \
+    || fail "our digest should be sitting in the composer after a swallowed Enter"
+
+  # Second flush: the composer holds OUR envelope, so recovery submits it.
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "recovery failed to submit our own unsent digest"
+
+  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a successful recovery"
+  [ ! -e "$state/.subsuper-inject-unsent" ] || fail "unsent record survived a confirmed recovery"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "recovery RETYPED the digest instead of re-sending Enter only"
+  grep -F 'FIRSTMATE_OP' "$dir/composer" >/dev/null \
+    && fail "our digest is still in the composer after a confirmed recovery"
+  pass "a swallowed Enter then recovery submits our own digest with Enter only and clears the buffer"
+}
+
+test_pending_human_draft_is_never_recovered() {
+  local dir state fakebin sent attempts
+  dir=$(make_bordered_case own-unsent-human-draft)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  printf '╭─────────────────╮\n│ > human draft   │\n╰─────────────────╯\n' > "$dir/composer"
+  escalate_add "$state" "needs-decision: pick B"
+  echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    housekeeping "$state"
+  [ ! -s "$attempts" ] || fail "recovery sent Enter on a composer holding a human's draft"
+  [ ! -s "$sent" ] || fail "max-defer typed into a pending composer"
+  grep -F 'human draft' "$dir/composer" >/dev/null || fail "the human's draft was altered"
+  [ -s "$state/.subsuper-inject-wedged" ] || fail "a human-draft pending composer must still alarm"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost while a human draft was pending"
+  pass "a pending human draft is never recovered: no Enter, no typing, and the wedge alarm still fires"
+}
+
+test_own_unsent_recovery_is_bounded_and_still_alarms() {
+  local dir state fakebin sent attempts i n
+  dir=$(make_bordered_case own-unsent-bounded)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  escalate_add "$state" "needs-decision: pick C"
+  afk_enter "$state"
+
+  # Every Enter is swallowed from here on, so our digest can never land. Five
+  # ordinary per-cycle flushes; the max-defer escape is disabled so this counts
+  # only the recovery path's own re-sends.
+  i=0
+  while [ "$i" -lt 5 ]; do
+    PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+      FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+      FM_FAKE_PERSIST_SWALLOW=1 FM_INJECT_RECOVER_ATTEMPTS=2 \
+      FM_INJECT_CONFIRM_RETRIES=1 FM_ESCALATE_BATCH_SECS=0 FM_MAX_DEFER_SECS=99999 \
+      FM_INJECT_CONFIRM_SLEEP=0.05 housekeeping "$state"
+    i=$((i + 1))
+  done
+  n=$(grep -c 'ENTER-ATTEMPT' "$attempts" 2>/dev/null || true)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  # One Enter for the original type-and-submit, then at most two bounded
+  # recovery re-sends - never one per cycle for as long as the text sits there.
+  [ "$n" -ge 2 ] || fail "recovery never attempted a re-send ($n Enter attempts)"
+  [ "$n" -le 3 ] || fail "recovery kept re-sending Enter past its bound ($n Enter attempts)"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "the digest was retyped while recovery was bounded"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost while recovery was exhausted"
+
+  # The max-defer escape still alarms on a composer recovery could not clear.
+  echo $(( $(date +%s) - 600 )) > "$state/.subsuper-escalations.since"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_SWALLOW="$dir/.swallow" \
+    FM_FAKE_PERSIST_SWALLOW=1 FM_INJECT_RECOVER_ATTEMPTS=2 \
+    FM_INJECT_CONFIRM_RETRIES=1 FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 housekeeping "$state"
+  [ -s "$state/.subsuper-inject-wedged" ] \
+    || fail "an unrecoverable composer must still raise the wedge alarm"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost after the wedge alarm"
+  pass "own-unsent recovery is bounded per digest and the max-defer wedge alarm still fires"
+}
+
+test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
+  local dir state fakebin sent last
+  dir=$(make_bordered_case own-unsent-grown-buffer)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: item A"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 \
+    FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report delivery"
+
+  # A new escalation arrives while our older digest is still unsent.
+  escalate_add "$state" "done: item B"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "recovering an OLDER digest must not clear a buffer that has grown"
+  [ -s "$state/.subsuper-escalations" ] || fail "item B was dropped when the older digest was recovered"
+  grep -F 'item B' "$state/.subsuper-escalations" >/dev/null || fail "item B is missing from the buffer"
+
+  # The composer is unblocked, so the next flush delivers the full buffer.
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "the follow-up flush failed after recovery unblocked the composer"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared by the follow-up flush"
+  last=$(grep 'Supervisor escalate' "$sent" | tail -1)
+  case "$last" in
+    *"item A"*"item B"*) ;;
+    *) fail "the follow-up digest lost an item: '$last'" ;;
+  esac
+  pass "recovering an older digest keeps newly buffered items and delivers them next flush"
+}
+
 test_normal_flush_clears_stale_wedge_marker() {
   local dir state fakebin sent
   dir=$(make_bordered_case normal-clears-wedge)
@@ -1904,6 +2055,10 @@ test_max_defer_empty_swallow_types_once_and_alarms
 test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
 test_normal_flush_clears_stale_wedge_marker
+test_own_unsent_recovery_after_swallowed_enter_clears_buffer
+test_pending_human_draft_is_never_recovered
+test_own_unsent_recovery_is_bounded_and_still_alarms
+test_own_unsent_recovery_with_grown_buffer_keeps_new_items
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard

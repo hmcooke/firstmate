@@ -210,6 +210,11 @@ WEDGE_ALARM_NOTIFIER_PID=
 INJECT_FAIL_SLEEP_DEFAULT=30
 INJECT_CONFIRM_RETRIES_DEFAULT=3
 INJECT_CONFIRM_SLEEP_DEFAULT=0.5
+# How many CYCLES may attempt own-unsent recovery for one buffered digest before
+# the daemon stops re-sending Enter and lets the wedge alarm own the stall. A
+# composer that keeps our envelope across this many attempts is not swallowing
+# one Enter, it is refusing input, and hammering it adds nothing.
+INJECT_RECOVER_ATTEMPTS_DEFAULT=3
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -1093,6 +1098,102 @@ window_for_task() {  # <task-key> [state]
   return 1
 }
 
+# --- own-unsent recovery ----------------------------------------------------
+#
+# One swallowed Enter used to end away-mode delivery permanently. inject_msg
+# types the digest ONCE and deliberately leaves it in the composer when the
+# submit cannot be confirmed; from the next cycle the composer guard reads
+# `pending` and refuses to type, forever. Measured on the live fleet
+# (2026-08-27/28): 5,545 consecutive `composer not confirmed-empty
+# (state=pending)` deferrals over 22.9h, ended only by a human touching the
+# pane, with the wedge alarm firing into an empty room the whole time.
+#
+# Recovery is permitted for EXACTLY one thing: our OWN away-supervisor envelope
+# still sitting unsent in the composer. That envelope is authorship evidence -
+# a human draft cannot begin with the U+2063 FIRSTMATE_OP header - so
+# re-sending Enter submits our own message and can never submit, alter, or
+# destroy someone else's input. Every other pending composer keeps deferring
+# and alarming exactly as before, which is the captain-draft guarantee pinned
+# by tests/fm-daemon.test.sh.
+#
+# Enter ONLY, never a retype: the text is already there, and retyping would
+# concatenate two sentinel-prefixed digests into one corrupted turn.
+
+# The exact header a digest WE typed carries. bin/fm-operational-input.sh owns
+# the bytes; this composes the away-supervisor form in one place.
+_inject_own_envelope_prefix() {
+  printf '%s%s: ' "$FM_OPERATIONAL_HEADER_PREFIX" away-supervisor
+}
+
+# 0 when the supervisor composer currently holds OUR OWN unsent digest. An
+# unreadable composer, an unsupported backend, and an empty read all return 1:
+# recovery needs positive proof of authorship, never an absence of evidence.
+# The composer's extracted user content already has the harness's prompt glyph
+# and furniture removed, so a digest WE typed begins the content exactly at its
+# envelope. Anchoring at the start is what makes this authorship evidence
+# rather than a substring search: a human quoting the marker mid-draft does not
+# match, and neither does an already-delivered digest echoed in the transcript,
+# which the extractor never returns.
+inject_composer_holds_own_unsent() {  # <target> <backend>
+  local target=$1 backend=$2 content prefix
+  content=$(fm_backend_composer_content "$backend" "$target" 2>/dev/null) || return 1
+  [ -n "$content" ] || return 1
+  prefix=$(_inject_own_envelope_prefix)
+  case "$content" in "$prefix"*) return 0 ;; esac
+  return 1
+}
+
+# The backend the recovery submit loop is bound to. A global rather than a
+# closure so the two seam functions below stay top-level and independently
+# testable.
+FM_INJECT_RECOVER_BACKEND=
+_inject_recover_send_key() { fm_backend_send_key "$FM_INJECT_RECOVER_BACKEND" "$1" "$2" "${3:-}"; }
+_inject_recover_state() { fm_backend_composer_state "$FM_INJECT_RECOVER_BACKEND" "$1"; }
+
+_inject_recover_attempts() {  # <state>
+  local n
+  n=$(cat "$1/.subsuper-inject-recover-attempts" 2>/dev/null || printf 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# inject_recover_own_unsent: submit our own unsent digest with Enter only.
+#
+# Returns 0 ONLY when the submit was confirmed AND the recovered text is the
+# same digest this call was asked to deliver, because the caller clears the
+# escalation buffer on 0. When the buffer has grown since we typed, the
+# composer held an older, smaller digest: recovery still submits it (the pane
+# is unblocked) but returns 1, so the newer items are delivered in full on the
+# next cycle instead of being dropped as already-sent.
+inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
+  local target=$1 backend=$2 state=$3 msg=$4 attempts max verdict unsent
+  inject_composer_holds_own_unsent "$target" "$backend" || return 1
+  max=${FM_INJECT_RECOVER_ATTEMPTS:-$INJECT_RECOVER_ATTEMPTS_DEFAULT}
+  attempts=$(_inject_recover_attempts "$state")
+  if [ "$attempts" -ge "$max" ]; then
+    log "inject recovery exhausted after $attempts attempts; our own unsent digest is still in the supervisor composer"
+    return 1
+  fi
+  printf '%s\n' "$((attempts + 1))" > "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
+  FM_INJECT_RECOVER_BACKEND=$backend
+  verdict=$(fm_composer_submit_retry_core _inject_recover_send_key _inject_recover_state \
+    "$target" "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
+    "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}")
+  if [ "$verdict" != empty ]; then
+    log "inject recovery: our own unsent digest is still unsubmitted (verdict=$verdict); deferring"
+    return 1
+  fi
+  rm -f "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
+  unsent=$(cat "$state/.subsuper-inject-unsent" 2>/dev/null || true)
+  rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
+  if [ -n "$unsent" ] && [ "$unsent" = "$msg" ]; then
+    log "inject recovery: submitted our own unsent digest with Enter only; delivery confirmed"
+    return 0
+  fi
+  log "inject recovery: cleared our own unsent digest from the composer; the current digest delivers next cycle"
+  return 1
+}
+
 # --- injection --------------------------------------------------------------
 # inject_msg: send one escalation digest to the supervisor pane.
 # Returns 0 on successful inject (or empty buffer), non-zero if the pane is
@@ -1112,7 +1213,9 @@ window_for_task() {  # <task-key> [state]
 #   - COMPOSER GUARD before typing: if the cursor line already has real content
 #     after dim/faint ghost text and borders are ignored (a human's half-typed
 #     line, or a previous injection's unsent text), defer entirely - injecting
-#     would merge with the human's text.
+#     would merge with the human's text. The one exception is our OWN unsent
+#     envelope, which inject_recover_own_unsent above resubmits with Enter only
+#     so a single swallowed Enter cannot end away-mode delivery permanently.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded
   state="${2:-$(_state_root)}"
@@ -1151,6 +1254,17 @@ inject_msg() {  # <message> [state]
   #      stays buffered for the next cycle or the catch-up flush.
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
+    #   c) Own-unsent recovery: a pending composer holding OUR OWN envelope is
+    #      a swallowed Enter, not someone else's input, so resubmit it with
+    #      Enter only instead of deferring on it forever. Anything else pending
+    #      falls straight through to the deferral below, untouched.
+    case "$composer" in
+      pending|pending-unproven)
+        if inject_recover_own_unsent "$target" "$backend" "$state" "$msg"; then
+          return 0
+        fi
+        ;;
+    esac
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
@@ -1165,8 +1279,15 @@ inject_msg() {  # <message> [state]
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
   verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
   if [ "$verdict" = empty ]; then
+    # Delivered: no unsent text of ours remains, so drop any recovery state a
+    # previous swallowed Enter left behind.
+    rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
     return 0  # Backend confirmed the submit.
   fi
+  # Our text is now sitting unsent in the composer. Record it verbatim so the
+  # next cycle can tell a full recovery (same digest, buffer clearable) from a
+  # partial one (buffer has grown since), and so recovery attempts stay bounded.
+  printf '%s' "$msg" > "$state/.subsuper-inject-unsent" 2>/dev/null || true
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1
 }

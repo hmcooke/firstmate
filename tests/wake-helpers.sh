@@ -272,6 +272,9 @@ case "${1:-}" in
       shift
     done
     if [ "$is_enter" = 1 ]; then
+      # Every Enter ATTEMPT, swallowed or not. FM_FAKE_SENT only records Enters
+      # that actually submitted, so a bounded-retry assertion needs this.
+      [ -n "${FM_FAKE_ENTER_ATTEMPTS:-}" ] && printf '[ENTER-ATTEMPT]\n' >> "$FM_FAKE_ENTER_ATTEMPTS"
       if [ -n "${FM_FAKE_SWALLOW:-}" ] && [ -f "$FM_FAKE_SWALLOW" ]; then
         [ "${FM_FAKE_PERSIST_SWALLOW:-0}" = 1 ] || rm -f "$FM_FAKE_SWALLOW"
       else

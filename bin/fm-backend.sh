@@ -819,6 +819,26 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
   esac
 }
 
+# fm_backend_composer_content: the composer's CURRENT TEXT, one row per line.
+# Separate from fm_backend_composer_state because the verdict cannot tell a
+# human's half-typed draft from firstmate's own unsent operational envelope,
+# and only the second may ever be acted on (bin/fm-supervise-daemon.sh's
+# own-unsent recovery). Implemented only for the two backends that can host the
+# away-mode supervisor terminal (docs/herdr-backend.md "Away-mode supervisor
+# support"); every other backend has no caller and reports failure rather than
+# a guessed read, so an unsupported pane can never look like one holding our
+# own text.
+fm_backend_composer_content() {  # <backend> <target> -> composer text on stdout
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_tmux_composer_content "$@" ;;
+    herdr) fm_backend_herdr_composer_content "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- endpoint presence (the tri-state absence contract) ---------------------
 #
 # fm_backend_target_presence: the single READ-ONLY endpoint-presence contract.

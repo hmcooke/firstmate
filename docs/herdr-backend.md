@@ -294,6 +294,20 @@ It refuses Zellij, Orca, and cmux as supervisor backends rather than applying th
 For Herdr, target existence, native state, capture, composer state, and verified submit all route through the shared backend dispatcher and the explicit named-session CLI owner.
 The pane-independent max-defer alert is configured in [`wedge-alarm.md`](wedge-alarm.md).
 
+Herdr's native agent state and the shared classifiers are accurate for a Claude supervisor pane in both directions: an idle pane reports `done` or `idle` with an empty composer and is injectable, and a mid-turn pane reports `working` and is not.
+Delivery starvation therefore comes from what is sitting in the composer, not from a misread verdict, and no harness-specific busy fallback is warranted.
+
+### Own-unsent recovery
+
+The daemon types a digest once and never retypes it, so an Enter that does not confirm leaves that digest in the supervisor composer.
+Without recovery the composer guard then reads `pending` on every later cycle and refuses to type for as long as the text sits there, which turns one swallowed Enter into an indefinite away-mode delivery outage that only a human clearing the pane can end.
+
+The daemon may therefore resubmit a pending composer with Enter alone, and only when the extracted composer content begins with its own away-supervisor envelope (`bin/fm-operational-input.sh`).
+That envelope is authorship evidence, so the recovery can never submit or alter text somebody else typed: any other pending content keeps deferring and alarming exactly as before.
+Recovery reads the composer through `fm_backend_composer_content`, which returns the composer region only, so a digest already delivered and echoed into the transcript above cannot be mistaken for unsent text.
+Re-sends are bounded per buffered digest, and an unrecoverable composer still raises the max-defer wedge alarm.
+When the buffer has grown since the digest was typed, the recovered submit does not clear it and the newer items are delivered by the next flush.
+
 Harnesses with native tracked background execution can run the daemon in their terminal.
 Pi has no such mechanism.
 `bin/fm-afk-launch.sh` therefore creates a dedicated unfocused Herdr workspace, runs the daemon there with an explicit supervisor target and backend, records the exact daemon pane, and closes only that pane on stop.
