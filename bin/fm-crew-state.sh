@@ -53,12 +53,12 @@
 #      or closed, including the checks-green and no-CI readiness promotion,
 #      when its latest recognized CI marker affirmatively reports waiting or
 #      ready - and is then reported as paused · run-step+status-log with the
-#      declared reason and readiness facts, so an idle pane waiting on a
-#      captain's merge is not escalated as a possible wedge. An unreadable or
-#      unrecognized CI log, active repair, a running or fixing step, a gate
-#      awaiting the crew's response, and a coarse runs-list verdict with no
-#      visible phase all keep the run-step's own state: a crew cannot declare
-#      itself paused out of work it must drive.
+#      declared reason and readiness facts, so the always-on watcher does not
+#      escalate an idle pane waiting on a captain's merge as a possible wedge. An
+#      unreadable or unrecognized CI log, active repair, a running or fixing
+#      step, a gate awaiting the crew's response, and a coarse runs-list verdict
+#      with no visible phase all keep the run-step's own state: a crew cannot
+#      declare itself paused out of work it must drive.
 #      Separately, if the log's last line says needs-decision/blocked but the
 #      run-step shows the run moved on, the log is deterministically stale and is
 #      flagged superseded. A genuinely parked run plus a needs-decision log agree,
@@ -586,9 +586,11 @@ if [ "$HAVE_RUN" = 1 ]; then
   # pipeline sits in its CI monitor phase it holds the PR open until that PR is
   # merged or closed, so the crew has nothing left to drive and its own
   # `paused: <reason>` line is the more specific account of why the pane is idle.
-  # Reporting that as working made the supervisors' shared absorb class
+  # Reporting that as working made the always-on watcher's absorb class
   # (fm-classify-lib.sh's crew_absorb_class) treat a captain-owned merge wait as a
-  # possible wedge and escalate it every wedge window for hours.
+  # possible wedge and escalate it every wedge window for hours. The away-mode
+  # daemon deliberately retains its pre-existing direct status_is_paused
+  # classification and does not consume this verdict.
   # The run-step stays authoritative everywhere else, because a crew cannot
   # declare itself paused out of work it is supposed to be driving: a running or
   # fixing step, a gate awaiting its response, and a coarse runs-list verdict that

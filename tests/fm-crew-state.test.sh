@@ -28,7 +28,7 @@
 #   (l) declared pause vs a WAITING run-step: a crew that declared an external
 #       wait while the run MONITORS ci, including after checks-green or no-CI
 #       readiness, reports paused (run-step+status-log) and classes `paused` for
-#       the supervisors' shared absorb predicate, while running/fixing/gated/
+#       the always-on watcher's absorb predicate, while running/fixing/gated/
 #       coarse phases keep the run-step's own state.
 set -u
 
@@ -747,11 +747,12 @@ test_ci_monitoring_unavailable_log_declared_pause_stays_working() {
   pass "an unavailable CI log cannot hide an active run"
 }
 
-# The same declared wait during CI monitoring is what the supervisors' shared
-# absorb predicate must see: crew_absorb_class classes it `paused`, so the
-# watcher and the away-mode daemon both use the bounded re-surface cadence
-# instead of the wedge timer. Exercised over the REAL helper, not a canned
-# fm-crew-state verdict, so the two owners cannot drift apart.
+# The same declared wait during CI monitoring is what the always-on watcher's
+# absorb predicate must see: crew_absorb_class classes it `paused`, so that path
+# uses the bounded re-surface cadence instead of the wedge timer. The away-mode
+# daemon deliberately retains its pre-existing direct status_is_paused
+# classification. Exercised over the REAL helper, not a canned fm-crew-state
+# verdict, so the reader and the watcher predicate cannot drift apart.
 test_ci_monitoring_declared_pause_absorb_class() {
   reset_fakes
   local d; d=$(new_case ci-monitor-paused-absorb)
@@ -1128,9 +1129,9 @@ test_no_run_idle_pane_uses_keyed_log() {
   pass "no run + idle pane parses keyed status syntax"
 }
 
-# (g') no run + idle pane on a DECLARED external-wait pause -> state: paused, so a
-# supervisor reading the crew sees a distinct pause (and its reason) rather than a
-# wedge-suspect idle. This is the reader half the watcher/daemon build on.
+# (g') no run + idle pane on a DECLARED external-wait pause -> state: paused, so
+# the always-on watcher sees a distinct pause (and its reason) rather than a
+# wedge-suspect idle. The away-mode daemon reads the raw status line directly.
 test_no_run_idle_pane_paused() {
   reset_fakes
   local d; d=$(new_case paused)

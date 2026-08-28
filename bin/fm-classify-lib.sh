@@ -121,9 +121,9 @@ status_is_captain_relevant() {
 }
 
 # 0 if a status line's leading verb is the pause verb (paused: <reason>). A pure
-# read of the line itself, so callers can identify a candidate before consulting
-# the shared current-state predicate. Matches only the verb before the first colon,
-# so a reason mentioning "paused" elsewhere does not false-match.
+# read of the line itself, so the daemon's classify_stale can reuse the last line
+# it already read without a fm-crew-state.sh call. Matches only the verb before the
+# first colon, so a reason mentioning "paused" elsewhere does not false-match.
 status_is_paused() {  # <status-line>
   local line=$1 verb
   [ -n "$line" ] || return 1
@@ -1095,12 +1095,12 @@ signal_reason_is_actionable() {  # <file> ...
 #             pause (paused:), which is EXPECTED to idle;
 #   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
 #             torn-down/unknown crew, or an unreadable verdict).
-# One fm-crew-state.sh read serves BOTH absorb reasons at once, and that reader is
-# the single owner of how a run-step and a declared pause rank against each other
-# (see its header): a crew that appended paused: but then started a run it must
-# drive reports working, while one whose run is merely monitoring CI reports its
-# declared pause. Reading the state rather than the status log is what keeps that
-# one owner in force here.
+# For the always-on watcher, one fm-crew-state.sh read serves BOTH absorb reasons
+# at once, and that reader is the single owner of how a run-step and a declared
+# pause rank on that path (see its header). The away-mode daemon deliberately
+# retains its pre-existing direct status_is_paused classification and never calls
+# this predicate; consolidation is deferred to
+# fork-afk-supervision-marker-consolidation.
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
