@@ -215,6 +215,13 @@ INJECT_CONFIRM_SLEEP_DEFAULT=0.5
 # composer that keeps our envelope across this many attempts is not swallowing
 # one Enter, it is refusing input, and hammering it adds nothing.
 INJECT_RECOVER_ATTEMPTS_DEFAULT=3
+# How long another watcher cycle may own supervision before the daemon says so.
+# While a pre-existing cycle holds the home-scoped singleton, the daemon's own
+# watcher child exits with a status line instead of a wake, so the daemon
+# performs no triage of its own until that cycle closes. Wakes are still
+# detected and queued durably by the cycle that holds the lock, so this is a
+# deferral rather than a loss - but a long one must not be silent.
+WATCHER_COLLISION_ESCALATE_SECS_DEFAULT=600
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -1320,6 +1327,49 @@ is_wake_reason() {  # <reason>
   return 1
 }
 
+# --- watcher-ownership collision --------------------------------------------
+#
+# `watcher: already running pid N` on the daemon's watcher child means a cycle
+# armed before away mode still owns this home's singleton. The daemon retries
+# each tick and takes over when that cycle closes, so ownership does resolve -
+# but until it does the daemon classifies nothing, and before this it recorded
+# that only in its own log. A cycle armed just before /afk can hold the lock for
+# hours (the Claude Stop hook is inert under away mode, so nothing re-arms it),
+# and away mode is exactly when nobody is reading the log.
+#
+# Adopting the live cycle outright belongs to the arm layer
+# (bin/fm-watch-arm.sh, docs/watcher-continuity.md), which already owns attach
+# and successor-following; routing the daemon's child through it is a larger
+# change than this one and is tracked separately. What is fixed here is the
+# silence: a collision that persists past the bound is escalated once, so the
+# captain learns that away-mode triage is deferred instead of assuming it is
+# running.
+note_watcher_collision() {  # <state> <reason>
+  local state=$1 reason=$2 since marker bound age epoch
+  since="$state/.subsuper-watcher-collision-since"
+  marker="$state/.subsuper-watcher-collision-escalated"
+  [ -e "$since" ] || _now > "$since"
+  bound=${FM_WATCHER_COLLISION_ESCALATE_SECS:-$WATCHER_COLLISION_ESCALATE_SECS_DEFAULT}
+  [ "$bound" -gt 0 ] || return 0
+  [ -e "$marker" ] && return 0
+  # Epoch-in-content, the same sidecar convention _oldest_line_age reads, so the
+  # episode survives a touch of the file. A corrupt sidecar restarts the clock
+  # rather than escalating off a garbage age.
+  epoch=$(cat "$since" 2>/dev/null || true)
+  case "$epoch" in
+    ''|*[!0-9]*) _now > "$since"; return 0 ;;
+  esac
+  age=$(( $(_now) - epoch ))
+  [ "$age" -ge "$bound" ] || return 0
+  : > "$marker"
+  escalate_add "$state" "blocked: away-mode triage deferred ${age}s - another watcher cycle owns supervision for this home (${reason}); wakes are still queued durably and are handled when it closes"
+}
+
+# A real wake proves this daemon owns the watcher again, so the episode ends.
+clear_watcher_collision() {  # <state>
+  rm -f "$1/.subsuper-watcher-collision-since" "$1/.subsuper-watcher-collision-escalated" 2>/dev/null || true
+}
+
 # --- dispatch one wake reason to self-handle or escalate --------------------
 # Side effects: logging, marker records, escalation buffer appends.
 handle_wake() {  # <reason> <state>
@@ -1655,10 +1705,12 @@ fm_super_main() {
         # skipped (rc=0, this is normal idle, not a crash).
         if ! is_wake_reason "$reason"; then
           log "watcher non-wake stdout, idling: $reason"
+          note_watcher_collision "$STATE" "$reason"
           WATCHER_PID=""
           sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi
+        clear_watcher_collision "$STATE"
         log "wake: $reason"
         if ! handle_durable_wakes "$reason" "$STATE"; then
           log "durable wake handling was not acknowledged; restarting for recovery"

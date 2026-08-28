@@ -1336,6 +1336,63 @@ test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
   pass "recovering an older digest keeps newly buffered items and delivers them next flush"
 }
 
+# --- watcher-ownership collision --------------------------------------------
+
+test_watcher_collision_is_silent_below_the_bound() {
+  local dir state
+  dir=$(make_supercase watcher-collision-quiet)
+  state="$dir/state"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  [ -e "$state/.subsuper-watcher-collision-since" ] \
+    || fail "the collision episode was not recorded"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a brief ownership collision must not escalate; it resolves on its own"
+  pass "a watcher-ownership collision below the bound is recorded but not escalated"
+}
+
+test_persistent_watcher_collision_escalates_once() {
+  local dir state n
+  dir=$(make_supercase watcher-collision-escalates)
+  state="$dir/state"
+  echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  grep -F 'away-mode triage deferred' "$state/.subsuper-escalations" >/dev/null \
+    || fail "a persistent ownership collision was never surfaced"
+  # A second and third tick must not re-escalate the same episode.
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  n=$(grep -c 'away-mode triage deferred' "$state/.subsuper-escalations" 2>/dev/null || true)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -eq 1 ] || fail "the collision episode escalated $n times; it must escalate once"
+  pass "a persistent watcher-ownership collision escalates exactly once per episode"
+}
+
+test_watcher_collision_episode_clears_on_a_real_wake() {
+  local dir state
+  dir=$(make_supercase watcher-collision-clears)
+  state="$dir/state"
+  echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242"
+  clear_watcher_collision "$state"
+  [ ! -e "$state/.subsuper-watcher-collision-since" ] \
+    || fail "the collision episode survived a real wake"
+  [ ! -e "$state/.subsuper-watcher-collision-escalated" ] \
+    || fail "the escalated marker survived a real wake, so a later episode would stay silent"
+  # A fresh episode is free to escalate again.
+  echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
+  : > "$state/.subsuper-escalations"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 77"
+  grep -F 'away-mode triage deferred' "$state/.subsuper-escalations" >/dev/null \
+    || fail "a new collision episode after a real wake was not surfaced"
+  pass "owning the watcher again ends the collision episode and re-arms it for the next one"
+}
+
 test_normal_flush_clears_stale_wedge_marker() {
   local dir state fakebin sent
   dir=$(make_bordered_case normal-clears-wedge)
@@ -2059,6 +2116,9 @@ test_own_unsent_recovery_after_swallowed_enter_clears_buffer
 test_pending_human_draft_is_never_recovered
 test_own_unsent_recovery_is_bounded_and_still_alarms
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items
+test_watcher_collision_is_silent_below_the_bound
+test_persistent_watcher_collision_escalates_once
+test_watcher_collision_episode_clears_on_a_real_wake
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard

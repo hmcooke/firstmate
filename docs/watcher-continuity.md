@@ -21,6 +21,11 @@ Only an exhausted failure with no verified watcher emits one last-resort notice 
 The Claude turn-end guard owns the monotonic failure progression, one-time attended fail-open, post-alarm continuation suppression, and positive recovery reset described in [`turnend-guard.md`](turnend-guard.md#harness-integrations).
 While supervision is still needed and away mode remains inactive, an actionable close wakes the idle session through exit 2.
 
+Away mode does not transfer watcher ownership.
+A cycle armed before `/afk` keeps the home-scoped singleton, and because the Claude Stop hook is inert under away mode nothing re-arms it, so that cycle can hold the lock until its own actionable close.
+The away daemon's watcher child then exits with `watcher: already running` instead of a wake and the daemon classifies nothing of its own until it wins the lock on a later tick.
+Wakes are still detected and queued durably by whichever cycle holds the lock, so this defers the daemon's triage rather than losing events, and the daemon escalates once when a collision persists past its bound rather than idling silently.
+
 ## Actionable wake ordering
 
 After an actionable Pi or OpenCode child close, the adapter starts and verifies one singleton successor before it delivers the original wake.
