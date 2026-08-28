@@ -1334,7 +1334,8 @@ EOF
 # stays a loud refusal rather than a blind retry into an unreadable pane.
 # tmux keeps its own richer core (bin/fm-tmux-lib.sh: the busy-queued-Enter
 # and idle-baseline turn-started conversions its busy primitive enables), and
-# herdr confirms through native agent-state; both consume the same shared
+# herdr confirms through native agent-state with affirmative clearance after a
+# missed transition; both consume the same shared
 # verdict, so no shape knowledge lives in any of the three loops.
 fm_composer_submit_retry_core() {  # <send-key-fn> <state-fn> <target> <retries> <enter-sleep> [expected-label]
   local send_key_fn=$1 state_fn=$2 target=$3 retries=$4 sleep_s=$5 expected_label=${6:-} i=0 state

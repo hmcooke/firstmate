@@ -2725,8 +2725,8 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 
 # fm_backend_herdr_send_text_submit types <text> into <target> once, while
 # fm_backend_herdr_submit_enter starts from text already in the composer.
-# Both submit with a named Enter key, retried until herdr's NATIVE agent-state
-# confirms a real turn started. Verified hazard (herdr-verification-p2.md
+# Both submit with a named Enter key, retrying only while native state and
+# affirmative composer clearance cannot confirm it landed. Verified hazard (herdr-verification-p2.md
 # "slash/$ autocomplete popup"): a `/`- or `$`-prefixed send opens a
 # completion popup within ~0.1s, exactly like tmux's claude/codex popups, so
 # the caller's <settle> before the first Enter matters here the same way it
@@ -2735,23 +2735,22 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 # Confirmation signal (rewritten for the 2026-07-07 incident below;
 # superseded a composer-content read that itself replaced a delta-based check
 # for the 2026-07-03 incident): when the target is legibly idle before Enter,
-# submission is confirmed by fm_backend_herdr_wait_for_working observing a
-# submit-active agent_status after Enter, NOT by reading the composer's own
-# row. This makes the normal confirmation path cross-agent: it is the same
-# semantic signal regardless of what text a harness's idle composer happens
-# to display.
+# submission is confirmed first by fm_backend_herdr_wait_for_working observing
+# a submit-active agent_status after Enter. Only a missed transition reaches
+# affirmative composer clearance, so native state remains the primary
+# cross-agent signal regardless of what text a harness's idle composer displays.
 #
 # Incident (2026-07-07, followed up on 2026-07-08): a redelivery loop in the
 # away-mode daemon. Root cause: composer-content submit confirmation was too
 # sensitive to harness rendering details. Real claude/codex use bare prompt
 # rows, and real codex adds dynamic idle suggestions after `›`; the later
 # ANSI-aware composer classifier now handles the pre-injection guard for that
-# Codex shape, but idle-baseline submit confirmation deliberately stays on
-# native agent-state so delivery does not depend on composer text. Composer
-# content is retained for other callers (the away-mode daemon's PRE-injection
-# empty-box guard, still dispatched via fm_backend_composer_state /
-# fm_backend_herdr_composer_state) and for submit attempts whose pre-Enter
-# agent-state baseline is not legibly idle.
+# Codex shape, but idle-baseline submit confirmation prioritizes native
+# agent-state and consults composer clearance only after the polling window
+# misses a transition. Composer content is also retained for the away-mode
+# daemon's PRE-injection empty-box guard, still dispatched via
+# fm_backend_composer_state / fm_backend_herdr_composer_state, and for submit
+# attempts whose pre-Enter agent-state baseline is not legibly idle.
 #
 # This also still correctly handles the earlier 2026-07-03 incident (a
 # slash-command popup selection/placeholder-fill on the FIRST Enter is not a
@@ -2772,14 +2771,9 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 #     polls): unavoidable in the absolute, but bounded by how tightly polls
 #     are packed into the budget; real claude/codex measured first-working
 #     at 90-490ms, comfortably inside a several-hundred-ms, multiply-sampled
-#     window, so this has not been observed in practice. On the (unobserved)
-#     residual chance it happens, the verdict is "pending" and the caller
-#     never retypes - only re-sends Enter, which lands on an already-empty
-#     composer and is a no-op, not a duplicate delivery of <text> (see
-#     fm-send.sh/fm-supervise-daemon.sh: retyping only happens if a caller
-#     re-invokes this function from scratch with the same text after seeing
-#     an error, which is a human/escalation decision, not an automatic
-#     retry).
+#     window. If every native sample misses that transition, an affirmatively
+#     empty composer confirms that Enter landed, while pending text still earns
+#     only another Enter retry.
 # Fallback path, for a harness whose native agent-state is not legibly idle:
 # an idle-to-busy rendered-footer transition ACROSS our Enter proves the
 # harness accepted the submission. The shared matcher excludes the selected
@@ -2805,6 +2799,7 @@ fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
     if [ "$baseline" = idle ]; then
       verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
         "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
+      [ "$verdict" != idle ] || verdict=$(fm_backend_herdr_composer_state "$target")
     else
       sleep "$sleep_s"
       verdict=$(fm_backend_herdr_composer_state "$target")

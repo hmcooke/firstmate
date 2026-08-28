@@ -3400,9 +3400,8 @@ test_wait_for_working_treats_blocked_as_submit_active() {
 
 # --- send_text_submit: native agent-state (agent get) verify-and-retry ------
 # Rewritten for the 2026-07-07 incident (docs/herdr-backend.md): confirmation
-# no longer reads composer content in the normal idle-baseline path, so a
-# harness whose IDLE composer shows dynamic tip text (real codex) can no
-# longer misread as "pending" and block/mis-confirm a send.
+# prioritizes native state in the normal idle-baseline path, so a harness whose
+# IDLE composer shows dynamic tip text (real codex) cannot block a native proof.
 # FM_BACKEND_HERDR_SUBMIT_POLLS=1 pins most tests
 # below to exactly one agent-get sample per Enter attempt for simple,
 # deterministic call-count assertions; the multi-sample behavior itself is
@@ -3445,6 +3444,23 @@ test_submit_enter_detects_landed_send_without_typing() {
   pass "fm_backend_herdr_submit_enter: confirms a native idle-to-working transition without typing"
 }
 
+test_submit_enter_confirms_an_instant_round_trip_from_empty_composer() {
+  local dir log resp fb out enter_count
+  dir="$TMP_ROOT/submit-enter-instant-round-trip"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/3.out"
+  printf '  ❯\n' > "$resp/4.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_submit_enter default:w1:p2 3 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "an affirmatively empty composer did not confirm a native transition missed after Enter: $out"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "instant-round-trip confirmation sent $enter_count Enter(s)"
+  [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" 2>/dev/null || true)" -eq 0 ] \
+    || fail "instant-round-trip Enter-only recovery retyped the digest"
+  pass "Herdr confirms an instant round trip from positive composer clearance"
+}
+
 test_send_text_submit_detects_swallowed_enter() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -3452,7 +3468,9 @@ test_send_text_submit_detects_swallowed_enter() {
   # started a turn (swallowed), so wait_for_working never observes "busy".
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
+  printf '  ❯ hello captain\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/7.out"
+  printf '  ❯ hello captain\n' > "$resp/8.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
@@ -3475,9 +3493,11 @@ test_send_text_submit_popup_autocomplete_requires_second_enter() {
   # 4: agent get -> idle (not submitted yet)
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
-  # 5: send-keys enter (#2) - actually submits
-  # 6: agent get -> working (submitted)
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/6.out"
+  # 5: pane read -> the placeholder fill is still pending
+  # 6: send-keys enter (#2) - actually submits
+  # 7: agent get -> working (submitted)
+  printf '  ❯ /compact target\n' > "$resp/5.out"
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "/compact" 3 0.01 1.2' "$ROOT" )
@@ -4509,6 +4529,7 @@ test_wait_for_working_returns_unknown_when_never_readable
 test_wait_for_working_treats_blocked_as_submit_active
 test_send_text_submit_detects_landed_send
 test_submit_enter_detects_landed_send_without_typing
+test_submit_enter_confirms_an_instant_round_trip_from_empty_composer
 test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_text_submit_confirms_blocked_after_enter

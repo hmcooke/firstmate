@@ -1156,9 +1156,13 @@ inject_composer_own_unsent_content() {  # <target> <backend>
 }
 
 _inject_recover_attempts() {  # <state>
-  local n
-  n=$(cat "$1/.subsuper-inject-recover-attempts" 2>/dev/null || printf 0)
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  local counter="$1/.subsuper-inject-recover-attempts" n
+  if [ ! -e "$counter" ]; then
+    printf '0'
+    return 0
+  fi
+  n=$(cat "$counter" 2>/dev/null) || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s' "$n"
 }
 
@@ -1191,7 +1195,17 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
   fm_composer_normalize_spaces_var requested
   requested=${requested//[$' \t\r\n\v\f']/}
   max=${FM_INJECT_RECOVER_ATTEMPTS:-$INJECT_RECOVER_ATTEMPTS_DEFAULT}
-  attempts=$(_inject_recover_attempts "$state")
+  case "$max" in
+    ''|*[!0-9]*)
+      log "inject recovery: invalid attempt limit '$max'; using $INJECT_RECOVER_ATTEMPTS_DEFAULT"
+      max=$INJECT_RECOVER_ATTEMPTS_DEFAULT
+      ;;
+  esac
+  if ! attempts=$(_inject_recover_attempts "$state"); then
+    log "inject recovery exhausted: recovery budget state is invalid or unreadable"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
   if [ "$attempts" -ge "$max" ]; then
     log "inject recovery exhausted after $attempts attempts; our own unsent digest is still in the supervisor composer"
     return 1
@@ -1231,7 +1245,8 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
 #     sentinel-prefixed digests into one corrupted turn.
 #   - SUBMIT ACK = the backend submit primitive reports `empty` after Enter.
 #     For tmux that means a cleared composer; for herdr's normal idle-baseline
-#     path it means native agent-state observed a real turn start.
+#     path it means native agent-state observed a real turn start or the
+#     post-poll composer was affirmatively empty.
 #     Pending means Enter was swallowed; unknown is treated as undelivered by
 #     this strict daemon path.
 #   - COMPOSER GUARD before typing: if the cursor line already has real content
@@ -1370,7 +1385,7 @@ is_wake_reason() {  # <reason>
 # captain learns that away-mode triage is deferred instead of assuming it is
 # running.
 note_watcher_collision() {  # <state> <reason>
-  local state=$1 reason=$2 since marker bound age epoch
+  local state=$1 reason=$2 since marker bound age epoch key notice buf
   since="$state/.subsuper-watcher-collision-since"
   marker="$state/.subsuper-watcher-collision-escalated"
   [ -e "$since" ] || _now > "$since"
@@ -1386,8 +1401,16 @@ note_watcher_collision() {  # <state> <reason>
   esac
   age=$(( $(_now) - epoch ))
   [ "$age" -ge "$bound" ] || return 0
-  : > "$marker"
-  escalate_add "$state" "blocked: away-mode triage deferred ${age}s - another watcher cycle owns supervision for this home (${reason}); wakes are still queued durably and are handled when it closes"
+  key="[watcher-collision-epoch=$epoch]"
+  notice="blocked: away-mode triage deferred ${age}s - another watcher cycle owns supervision for this home (${reason}); wakes are still queued durably and are handled when it closes $key"
+  buf="$state/.subsuper-escalations"
+  if ! grep -Fq -- "$key" "$buf" 2>/dev/null; then
+    escalate_add "$state" "$notice" || { log "watcher collision escalation could not be queued"; return 1; }
+  fi
+  if ! : > "$marker" 2>/dev/null; then
+    log "watcher collision escalation was queued but its episode marker could not be written"
+    return 1
+  fi
 }
 
 # A real wake or verified child ownership ends the collision episode.

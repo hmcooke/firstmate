@@ -212,7 +212,7 @@ Enter, Escape, and Ctrl-C are supported.
 Slash and dollar-prefixed input uses the shared harness-aware settle before the first Enter so a completion popup cannot consume it.
 Text is typed once; only Enter is retried.
 
-On an idle or done native baseline, submit confirmation waits for `working` or `blocked` across a bounded polling window.
+On an idle or done native baseline, submit confirmation first waits for `working` or `blocked` across a bounded polling window, then accepts only a positively empty composer if the transition was missed.
 On an already active or unreadable baseline, it falls back to conservative composer clearance.
 A fully unreadable target stops retrying and reports unknown.
 
@@ -222,7 +222,7 @@ The shared rendered-busy matcher excludes the selected composer region, so pendi
 An idle-to-busy footer transition outside the composer still confirms the submit when native state is unavailable and the post-Enter composer is pending or unknown.
 It is the same semantic signal the native path uses and the same one the tmux submit core reads, so a pane already mid-turn before the text was typed still reports `pending` rather than borrowing another turn as proof of this delivery.
 Cursor's right-aligned status token shares its composer row, so a Cursor steer on Herdr lands but reports delivery unconfirmed rather than treating indistinguishable pending input as proof.
-The poll density bounds the residual possibility of an extremely fast complete turn; a missed transition can cause only a redundant Enter on an empty composer, never duplicate message text.
+The affirmative empty-composer fallback closes the residual possibility of an extremely fast complete turn without reporting its landed Enter as pending or permitting duplicate message text.
 
 `pane read --lines N` can return empty output when N is below the viewport height.
 The capture owner requests at least 200 lines from Herdr and trims locally to the caller's bound.

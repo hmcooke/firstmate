@@ -1498,6 +1498,42 @@ test_recovery_requires_persisted_budget_transitions() {
   pass "recovery never submits or resets its budget without durable state"
 }
 
+test_recovery_rejects_invalid_budget_inputs() {
+  local dir state msg enter_log alarm_log
+  dir=$(make_supercase own-unsent-invalid-budget)
+  state="$dir/state"
+  enter_log="$dir/enter.log"; : > "$enter_log"
+  alarm_log="$dir/alarm.log"; : > "$alarm_log"
+  fm_operational_input_encode away-supervisor "done: bounded recovery" msg \
+    || fail "could not encode the invalid-budget digest"
+  printf 'not-a-count\n' > "$state/.subsuper-inject-recover-attempts"
+  (
+    fm_backend_composer_content() { printf '%s' "$msg"; }
+    fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
+    inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
+    if inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
+      fail "recovery accepted a malformed persisted attempt count"
+    fi
+  ) || fail "malformed recovery-budget subshell failed"
+  [ ! -s "$enter_log" ] || fail "a malformed recovery counter granted an Enter attempt"
+  [ "$(grep -c '^alarm$' "$alarm_log" 2>/dev/null || true)" -eq 1 ] \
+    || fail "a malformed recovery counter did not take the wedge-alarm path"
+
+  printf '%s\n' "$INJECT_RECOVER_ATTEMPTS_DEFAULT" > "$state/.subsuper-inject-recover-attempts"
+  (
+    fm_backend_composer_content() { printf '%s' "$msg"; }
+    fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
+    if FM_INJECT_RECOVER_ATTEMPTS=not-a-number \
+      inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
+      fail "a nonnumeric configured maximum disabled the recovery bound"
+    fi
+  ) || fail "invalid configured recovery maximum subshell failed"
+  [ ! -s "$enter_log" ] || fail "a nonnumeric configured maximum granted an Enter past the default bound"
+  [ "$(cat "$state/.subsuper-inject-recover-attempts")" = "$INJECT_RECOVER_ATTEMPTS_DEFAULT" ] \
+    || fail "invalid configured maximum changed the exhausted recovery counter"
+  pass "recovery fails closed on malformed state and invalid limits"
+}
+
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
   local dir state fakebin sent last
   dir=$(make_bordered_case own-unsent-grown-buffer)
@@ -1598,6 +1634,49 @@ test_watcher_collision_episode_clears_on_verified_ownership() {
   grep -F 'away-mode triage deferred' "$state/.subsuper-escalations" >/dev/null \
     || fail "a new collision episode after verified ownership was not surfaced"
   pass "verified watcher ownership ends the collision episode and re-arms it for the next one"
+}
+
+test_watcher_collision_partial_writes_remain_retryable() {
+  local dir state marker buf n status
+  dir=$(make_supercase watcher-collision-append-failure)
+  state="$dir/state"
+  marker="$state/.subsuper-watcher-collision-escalated"
+  buf="$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 900 ))" > "$state/.subsuper-watcher-collision-since"
+  (
+    escalate_add() { return 1; }
+    if FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+      note_watcher_collision "$state" "watcher: already running pid 4242"; then
+      fail "collision escalation succeeded after its buffer append failed"
+    fi
+  ) || fail "collision append-failure subshell failed"
+  [ ! -e "$marker" ] || fail "a failed collision append still marked the episode escalated"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242" \
+    || fail "collision escalation did not retry after its append failure"
+  [ -e "$marker" ] || fail "retried collision escalation did not mark its queued episode"
+
+  dir=$(make_supercase watcher-collision-marker-failure)
+  state="$dir/state"
+  marker="$state/.subsuper-watcher-collision-escalated"
+  buf="$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 900 ))" > "$state/.subsuper-watcher-collision-since"
+  : > "$buf"
+  : > "$buf.since"
+  chmod 500 "$state"
+  status=0
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242" || status=$?
+  chmod 700 "$state"
+  [ "$status" -ne 0 ] || fail "collision escalation succeeded after its marker write failed"
+  [ ! -e "$marker" ] || fail "an unwritable marker appeared after the failed publication"
+  FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
+    note_watcher_collision "$state" "watcher: already running pid 4242" \
+    || fail "collision marker publication did not retry"
+  n=$(grep -c 'watcher-collision-epoch=' "$buf" 2>/dev/null || true)
+  [ "$n" -eq 1 ] || fail "marker retry queued the collision notice $n times"
+  [ -e "$marker" ] || fail "marker retry did not complete the collision episode receipt"
+  pass "collision escalation retries both partial writes without silence or duplication"
 }
 
 test_normal_flush_clears_stale_wedge_marker() {
@@ -2374,9 +2453,11 @@ test_own_unsent_recovery_is_bounded_and_still_alarms
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items
 test_recovery_budget_resets_when_a_fresh_digest_is_typed
 test_recovery_requires_persisted_budget_transitions
+test_recovery_rejects_invalid_budget_inputs
 test_watcher_collision_is_silent_below_the_bound
 test_persistent_watcher_collision_escalates_once
 test_watcher_collision_episode_clears_on_verified_ownership
+test_watcher_collision_partial_writes_remain_retryable
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard
