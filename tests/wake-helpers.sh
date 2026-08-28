@@ -279,7 +279,11 @@ case "${1:-}" in
         [ "${FM_FAKE_PERSIST_SWALLOW:-0}" = 1 ] || rm -f "$FM_FAKE_SWALLOW"
       else
         [ -n "${FM_FAKE_SENT:-}" ] && printf '[ENTER]\n' >> "$FM_FAKE_SENT"
-        write_composer ""
+        if [ -n "${FM_FAKE_POST_ENTER_COMPOSER:-}" ]; then
+          cp "$FM_FAKE_POST_ENTER_COMPOSER" "$COMPOSER"
+        else
+          write_composer ""
+        fi
       fi
     elif [ "$lit" = 1 ]; then
       [ "${FM_FAKE_SEND_FAIL:-0}" = 1 ] && exit 1

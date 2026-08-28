@@ -2723,9 +2723,9 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
   fi
 }
 
-# fm_backend_herdr_send_text_submit: type <text> into <target> once (raw,
-# unsubmitted, via send_literal), then submit with a named Enter key, retried
-# (Enter only, never retyped) until herdr's NATIVE agent-state (agent get)
+# fm_backend_herdr_send_text_submit types <text> into <target> once, while
+# fm_backend_herdr_submit_enter starts from text already in the composer.
+# Both submit with a named Enter key, retried until herdr's NATIVE agent-state
 # confirms a real turn started. Verified hazard (herdr-verification-p2.md
 # "slash/$ autocomplete popup"): a `/`- or `$`-prefixed send opens a
 # completion popup within ~0.1s, exactly like tmux's claude/codex popups, so
@@ -2801,12 +2801,10 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 # submit vocabulary. Empty means confirmed submitted for every backend; how
 # each backend confirms it is an internal decision, and herdr's is no longer
 # literally "the composer read empty".
-fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
-  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 i=0 verdict baseline confirm_sleep
+fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
+  local target=$1 retries=$2 sleep_s=$3 i=0 verdict baseline confirm_sleep
   local raw_status footer_baseline=''
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
-  fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
-  sleep "$settle"
   raw_status=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
   baseline=$(fm_backend_herdr_classify_submit_agent_status "$raw_status")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
@@ -2835,6 +2833,14 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
   done
+}
+
+fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle>
+  local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5
+  fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+  fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
+  sleep "$settle"
+  fm_backend_herdr_submit_enter "$target" "$retries" "$sleep_s"
 }
 
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors

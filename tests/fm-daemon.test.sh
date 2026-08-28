@@ -1230,6 +1230,66 @@ test_own_unsent_recovery_after_swallowed_enter_clears_buffer() {
   pass "a swallowed Enter then recovery submits our own digest with Enter only and clears the buffer"
 }
 
+test_recovery_of_different_own_envelope_keeps_buffer() {
+  local dir state fakebin sent other
+  dir=$(make_bordered_case own-unsent-different-envelope)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  touch "$dir/.swallow"
+  escalate_add "$state" "done: original digest"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "a swallowed Enter must not report the original digest as delivered"
+
+  fm_operational_input_encode away-supervisor "different digest" other \
+    || fail "could not encode the replacement away envelope"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT=/dev/null \
+    tmux send-keys -t firstmate:0 -l "$other" \
+    || fail "could not prepare the replacement away envelope"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=0 FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    && fail "submitting a different own envelope must not report the requested digest delivered"
+  [ -s "$state/.subsuper-escalations" ] \
+    || fail "the requested digest buffer was cleared after a different envelope was submitted"
+  grep -F 'original digest' "$state/.subsuper-escalations" >/dev/null \
+    || fail "the requested digest disappeared after a different envelope was submitted"
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null || true)" -eq 1 ] \
+    || fail "the requested digest was retyped during mismatched-envelope recovery"
+  pass "recovery submits an owned replacement but keeps the unmatched requested digest buffered"
+}
+
+test_recovery_accepts_tmux_idle_to_busy_confirmation() {
+  local dir state fakebin sent attempts working msg verdict
+  dir=$(make_bordered_case own-unsent-tmux-turn-start)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  attempts="$dir/enter.log"; : > "$attempts"
+  working="$dir/working"; printf 'Working...\n' > "$working"
+  fm_operational_input_encode away-supervisor "done: recovered turn" msg \
+    || fail "could not encode the recovery digest"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT=/dev/null \
+    tmux send-keys -t firstmate:0 -l "$msg" \
+    || fail "could not prepare the recovery digest"
+
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_ENTER_ATTEMPTS="$attempts" FM_FAKE_POST_ENTER_COMPOSER="$working" \
+    FM_INJECT_CONFIRM_SLEEP=0.05 \
+    inject_recover_own_unsent firstmate:0 tmux "$state" "$msg" \
+    || fail "tmux recovery rejected a proven idle-to-busy turn start"
+  verdict=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" \
+    fm_backend_composer_state tmux firstmate:0)
+  [ "$verdict" = unknown ] \
+    || fail "the post-submit composer did not exercise the unknown verdict: $verdict"
+  [ "$(grep -c 'ENTER-ATTEMPT' "$attempts" 2>/dev/null || true)" -eq 1 ] \
+    || fail "recovery did not submit with exactly one Enter"
+  grep -F 'FIRSTMATE_OP' "$sent" >/dev/null \
+    && fail "recovery retyped text before the confirmed turn start"
+  pass "tmux recovery confirms an idle-to-busy turn when the post-Enter composer is unknown"
+}
+
 test_pending_human_draft_is_never_recovered() {
   local dir state fakebin sent attempts
   dir=$(make_bordered_case own-unsent-human-draft)
@@ -1390,26 +1450,33 @@ test_persistent_watcher_collision_escalates_once() {
   pass "a persistent watcher-ownership collision escalates exactly once per episode"
 }
 
-test_watcher_collision_episode_clears_on_a_real_wake() {
+test_watcher_collision_episode_clears_on_verified_ownership() {
   local dir state
   dir=$(make_supercase watcher-collision-clears)
   state="$dir/state"
   echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
   FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
     note_watcher_collision "$state" "watcher: already running pid 4242"
-  clear_watcher_collision "$state"
+  mkdir -p "$state/.watch.lock"
+  printf '77\n' > "$state/.watch.lock/pid"
+  clear_watcher_collision_if_owned "$state" 88 \
+    && fail "a different watcher owner cleared the collision episode"
+  [ -e "$state/.subsuper-watcher-collision-escalated" ] \
+    || fail "a mismatched watcher owner cleared the escalated marker"
+  clear_watcher_collision_if_owned "$state" 77 \
+    || fail "the verified watcher owner did not clear the collision episode"
   [ ! -e "$state/.subsuper-watcher-collision-since" ] \
-    || fail "the collision episode survived a real wake"
+    || fail "the collision episode survived verified watcher ownership"
   [ ! -e "$state/.subsuper-watcher-collision-escalated" ] \
-    || fail "the escalated marker survived a real wake, so a later episode would stay silent"
+    || fail "the escalated marker survived verified watcher ownership"
   # A fresh episode is free to escalate again.
   echo $(( $(date +%s) - 900 )) > "$state/.subsuper-watcher-collision-since"
   : > "$state/.subsuper-escalations"
   FM_WATCHER_COLLISION_ESCALATE_SECS=600 \
     note_watcher_collision "$state" "watcher: already running pid 77"
   grep -F 'away-mode triage deferred' "$state/.subsuper-escalations" >/dev/null \
-    || fail "a new collision episode after a real wake was not surfaced"
-  pass "owning the watcher again ends the collision episode and re-arms it for the next one"
+    || fail "a new collision episode after verified ownership was not surfaced"
+  pass "verified watcher ownership ends the collision episode and re-arms it for the next one"
 }
 
 test_normal_flush_clears_stale_wedge_marker() {
@@ -2132,13 +2199,15 @@ test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
 test_normal_flush_clears_stale_wedge_marker
 test_own_unsent_recovery_after_swallowed_enter_clears_buffer
+test_recovery_of_different_own_envelope_keeps_buffer
+test_recovery_accepts_tmux_idle_to_busy_confirmation
 test_pending_human_draft_is_never_recovered
 test_own_unsent_recovery_is_bounded_and_still_alarms
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items
 test_recovery_budget_resets_when_a_fresh_digest_is_typed
 test_watcher_collision_is_silent_below_the_bound
 test_persistent_watcher_collision_escalates_once
-test_watcher_collision_episode_clears_on_a_real_wake
+test_watcher_collision_episode_clears_on_verified_ownership
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm
 test_wedge_alarm_library_mode_defaults_to_discard

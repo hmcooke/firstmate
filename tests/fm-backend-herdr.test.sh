@@ -3429,6 +3429,22 @@ test_send_text_submit_detects_landed_send() {
   pass "fm_backend_herdr_send_text_submit: reports 'empty' once agent_status reports working after one Enter, without ever reading the composer"
 }
 
+test_submit_enter_detects_landed_send_without_typing() {
+  local dir log resp fb out enter_count
+  dir="$TMP_ROOT/submit-enter-ok"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/3.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_submit_enter default:w1:p2 3 0.01' "$ROOT" )
+  [ "$out" = empty ] || fail "submit_enter should report empty once native agent state reports working, got '$out'"
+  enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
+  [ "$enter_count" -eq 1 ] || fail "submit_enter should send exactly one Enter after a confirmed turn start, sent $enter_count"
+  [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" 2>/dev/null || true)" -eq 0 ] \
+    || fail "submit_enter typed text instead of preserving the existing composer"
+  pass "fm_backend_herdr_submit_enter: confirms a native idle-to-working transition without typing"
+}
+
 test_send_text_submit_detects_swallowed_enter() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -4456,6 +4472,7 @@ test_wait_for_working_returns_idle_when_never_busy_but_readable
 test_wait_for_working_returns_unknown_when_never_readable
 test_wait_for_working_treats_blocked_as_submit_active
 test_send_text_submit_detects_landed_send
+test_submit_enter_detects_landed_send_without_typing
 test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_text_submit_confirms_blocked_after_enter

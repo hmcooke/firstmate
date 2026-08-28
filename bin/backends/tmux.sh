@@ -50,6 +50,15 @@ fm_backend_tmux_send_key() {  # <target> <key>
   tmux send-keys -t "$1" "$2"
 }
 
+# fm_backend_tmux_submit_enter: submit text already present in the composer
+# with the tmux core's busy-queue and idle-to-busy confirmation semantics.
+fm_backend_tmux_submit_enter() {  # <target> <retries> <enter-sleep>
+  local target=$1 retries=$2 sleep_s=$3 baseline_idle='' baseline_state
+  baseline_state=$(fm_pane_busy_state "$target")
+  [ "$baseline_state" = idle ] && baseline_idle=1
+  fm_tmux_submit_enter_core "$target" "$retries" "$sleep_s" "$baseline_idle"
+}
+
 # fm_backend_tmux_send_text_submit: type <text> into <target> once, then
 # submit with Enter, retried (Enter only, never retyped) until the composer
 # clears. Re-exports fm_tmux_submit_core (bin/fm-tmux-lib.sh) verbatim; see

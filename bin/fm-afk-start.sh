@@ -38,6 +38,15 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
 FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
+FM_AFK_STALE_ARTIFACTS=(
+  .subsuper-escalations
+  .subsuper-escalations.since
+  .subsuper-inject-wedged
+  .subsuper-inject-unsent
+  .subsuper-inject-recover-attempts
+  .subsuper-watcher-collision-since
+  .subsuper-watcher-collision-escalated
+)
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
@@ -60,10 +69,11 @@ fm_afk_start_usage() {
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
-  local state=$1
-  rm -f "$state/.subsuper-escalations" \
-        "$state/.subsuper-escalations.since" \
-        "$state/.subsuper-inject-wedged" 2>/dev/null
+  local state=$1 artifact result=0
+  for artifact in "${FM_AFK_STALE_ARTIFACTS[@]}"; do
+    rm -f "$state/$artifact" 2>/dev/null || result=1
+  done
+  return "$result"
 }
 
 daemon_lock_owner() {

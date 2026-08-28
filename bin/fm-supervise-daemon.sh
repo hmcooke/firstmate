@@ -1132,8 +1132,9 @@ _inject_own_envelope_prefix() {
   printf '%s%s: ' "$FM_OPERATIONAL_HEADER_PREFIX" away-supervisor
 }
 
-# 0 when the supervisor composer currently holds OUR OWN unsent digest. An
-# unreadable composer, an unsupported backend, and an empty read all return 1:
+# Prints the supervisor composer's own-unsent content and returns 0 when it
+# begins with our envelope. An unreadable composer, an unsupported backend,
+# and an empty read all return 1:
 # recovery needs positive proof of authorship, never an absence of evidence.
 # The composer's extracted user content already has the harness's prompt glyph
 # and furniture removed, so a digest WE typed begins the content exactly at its
@@ -1141,21 +1142,14 @@ _inject_own_envelope_prefix() {
 # rather than a substring search: a human quoting the marker mid-draft does not
 # match, and neither does an already-delivered digest echoed in the transcript,
 # which the extractor never returns.
-inject_composer_holds_own_unsent() {  # <target> <backend>
+inject_composer_own_unsent_content() {  # <target> <backend>
   local target=$1 backend=$2 content prefix
   content=$(fm_backend_composer_content "$backend" "$target" 2>/dev/null) || return 1
   [ -n "$content" ] || return 1
   prefix=$(_inject_own_envelope_prefix)
-  case "$content" in "$prefix"*) return 0 ;; esac
+  case "$content" in "$prefix"*) printf '%s' "$content"; return 0 ;; esac
   return 1
 }
-
-# The backend the recovery submit loop is bound to. A global rather than a
-# closure so the two seam functions below stay top-level and independently
-# testable.
-FM_INJECT_RECOVER_BACKEND=
-_inject_recover_send_key() { fm_backend_send_key "$FM_INJECT_RECOVER_BACKEND" "$1" "$2" "${3:-}"; }
-_inject_recover_state() { fm_backend_composer_state "$FM_INJECT_RECOVER_BACKEND" "$1"; }
 
 _inject_recover_attempts() {  # <state>
   local n
@@ -1173,8 +1167,8 @@ _inject_recover_attempts() {  # <state>
 # is unblocked) but returns 1, so the newer items are delivered in full on the
 # next cycle instead of being dropped as already-sent.
 inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
-  local target=$1 backend=$2 state=$3 msg=$4 attempts max verdict unsent
-  inject_composer_holds_own_unsent "$target" "$backend" || return 1
+  local target=$1 backend=$2 state=$3 msg=$4 attempts max verdict recovered
+  recovered=$(inject_composer_own_unsent_content "$target" "$backend") || return 1
   max=${FM_INJECT_RECOVER_ATTEMPTS:-$INJECT_RECOVER_ATTEMPTS_DEFAULT}
   attempts=$(_inject_recover_attempts "$state")
   if [ "$attempts" -ge "$max" ]; then
@@ -1182,18 +1176,16 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
     return 1
   fi
   printf '%s\n' "$((attempts + 1))" > "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
-  FM_INJECT_RECOVER_BACKEND=$backend
-  verdict=$(fm_composer_submit_retry_core _inject_recover_send_key _inject_recover_state \
-    "$target" "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
+  verdict=$(fm_backend_submit_enter "$backend" "$target" \
+    "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
     "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}")
   if [ "$verdict" != empty ]; then
     log "inject recovery: our own unsent digest is still unsubmitted (verdict=$verdict); deferring"
     return 1
   fi
   rm -f "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
-  unsent=$(cat "$state/.subsuper-inject-unsent" 2>/dev/null || true)
   rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
-  if [ -n "$unsent" ] && [ "$unsent" = "$msg" ]; then
+  if [ "$recovered" = "$msg" ]; then
     log "inject recovery: submitted our own unsent digest with Enter only; delivery confirmed"
     return 0
   fi
@@ -1369,9 +1361,16 @@ note_watcher_collision() {  # <state> <reason>
   escalate_add "$state" "blocked: away-mode triage deferred ${age}s - another watcher cycle owns supervision for this home (${reason}); wakes are still queued durably and are handled when it closes"
 }
 
-# A real wake proves this daemon owns the watcher again, so the episode ends.
+# A real wake or verified child ownership ends the collision episode.
 clear_watcher_collision() {  # <state>
   rm -f "$1/.subsuper-watcher-collision-since" "$1/.subsuper-watcher-collision-escalated" 2>/dev/null || true
+}
+
+clear_watcher_collision_if_owned() {  # <state> <watcher-pid>
+  local state=$1 watcher_pid=$2 owner
+  owner=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$watcher_pid" ] && [ "$owner" = "$watcher_pid" ] || return 1
+  clear_watcher_collision "$state"
 }
 
 # --- dispatch one wake reason to self-handle or escalate --------------------
@@ -1723,6 +1722,7 @@ fm_super_main() {
       fi
       start_watcher || continue
     fi
+    clear_watcher_collision_if_owned "$STATE" "${WATCHER_PID:-}" || true
 
     # --- one housekeeping tick (gated to HOUSEKEEPING_TICK), then poll -------
     # The watcher child runs on its own FM_POLL cadence internally; we only need
