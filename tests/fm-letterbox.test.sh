@@ -224,6 +224,16 @@ if [ -n "\${LB_MKTEMP_FAIL_TEXT:-}" ]; then
     case "\$a" in *fm-letterbox-text*) exit 1 ;; esac
   done
 fi
+if [ -n "\${LB_MKTEMP_FAIL_CLAIM_IF_EXISTS:-}" ] && [ -e "\$LB_MKTEMP_FAIL_CLAIM_IF_EXISTS" ]; then
+  for a in "\$@"; do
+    case "\$a" in *fm-letterbox-claim*) exit 1 ;; esac
+  done
+fi
+if [ -n "\${LB_MKTEMP_FAIL_POLL_DIR:-}" ]; then
+  for a in "\$@"; do
+    case "\$a" in *fm-letterbox-poll*) exit 1 ;; esac
+  done
+fi
 exec $(command -v mktemp) "\$@"
 SH
   chmod +x "$fakebin/mktemp"
@@ -2857,6 +2867,94 @@ test_a_retried_corrected_notice_is_sent_exactly_once() {
 }
 
 
+test_a_reply_whose_record_fails_after_the_post_is_never_posted_twice() {
+  local home store fakebin out rc number id
+  read -r home store fakebin <<< "$(fixture reply-replay | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  number=$(inject_letter "$store" "$id" fact-lookup "q" "please answer")
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  printf 'The answer.\n' > "$home/reply.txt"
+  # The forge comment lands, and every claim write AFTER it fails: the crash
+  # window between the post and the local record.
+  out=$(LB_MKTEMP_FAIL_CLAIM_IF_EXISTS="$store/comments-$number.json" \
+    run_lb "$home" "$store" "$fakebin" reply "$id" --status answered --file "$home/reply.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a reply whose record cannot be completed must fail loudly (got: $out)"
+  [ "$(jq 'length' "$store/comments-$number.json")" = 1 ] || fail "the first attempt must have posted exactly once"
+  [ "$(jq -r '.replied // ""' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "the interrupted attempt must not be recorded as complete"
+  # The replayed wake: the announcement is at-least-once, so the same reply is
+  # attempted again. It must complete the record from the comment that already
+  # landed, not post a second terminal reply to the peer.
+  out=$(run_lb "$home" "$store" "$fakebin" reply "$id" --status answered --file "$home/reply.txt" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "the replay must complete the interrupted reply: $out"
+  [ "$(jq 'length' "$store/comments-$number.json")" = 1 ] \
+    || fail "a replay must never post a second terminal reply (found $(jq 'length' "$store/comments-$number.json") comments)"
+  [ "$(jq -r '.replied' "$home/state/letterbox/claims/$id.json")" = answered ] \
+    || fail "the replay must complete the record"
+  [ "$(jq -r '.reply_id' "$home/state/letterbox/claims/$id.json")" = "$(jq -r '.[0].body' "$store/comments-$number.json" | sed -n 's/^id: //p')" ] \
+    || fail "the record must name the reply that actually landed"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "REPLIED: $id fact-lookup answered" \
+    "status must expose completed handling so a replayed wake can see the work was done"
+  out=$(run_lb "$home" "$store" "$fakebin" reply "$id" --status answered --file "$home/reply.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a third invocation after completion must be refused, not posted"
+  assert_contains "$out" "already answered" "the refusal must say the letter is answered"
+  [ "$(jq 'length' "$store/comments-$number.json")" = 1 ] || fail "still exactly one terminal reply"
+  pass "a reply interrupted between the post and its record is completed on replay without a second post"
+}
+
+test_a_failed_poll_workdir_still_raises_the_durable_alarm() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture workdir-alarm | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  printf 'false\n' > "$store/private"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" >/dev/null 2>&1 \
+    && fail "a write into a public channel must be refused"
+  [ "$(head -n1 "$home/state/letterbox/write-error")" = visibility ] || fail "the alarm must be recorded"
+  printf 'true\n' > "$store/private"
+  out=$(run_poll "$home" "$store" "$fakebin" LB_MKTEMP_FAIL_POLL_DIR=1); rc=$?
+  expect_code 0 "$rc" "a poll that cannot allocate its work directory still exits 0"
+  assert_contains "$out" "is not private" \
+    "an unwritable temporary directory must not suppress a confirmed-public alarm"
+  assert_contains "$out" "work directory" "the local fault must be named alongside the alarm"
+  out=$(run_poll "$home" "$store" "$fakebin" LB_MKTEMP_FAIL_POLL_DIR=1)
+  [ -z "$out" ] || fail "the combined diagnostic must be rate-limited (got: $out)"
+  pass "a failed poll work directory still raises the durable write alarm"
+}
+
+test_the_same_resend_invocation_completes_its_own_interrupted_receipt() {
+  local home store fakebin out rc id number new_id count
+  read -r home store fakebin <<< "$(fixture resend-same-retry | tr '\n' ' ')"
+  printf 'notice\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  inject_reply "$store" "$number" archie-20260824T141902Z-3b71c40d "$id" unable "not acceptable"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
+  printf 'fixed\n' > "$home/fixed.txt"
+  install_receipt_crashing_mv "$fakebin"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  rm -f "$fakebin/mv"
+  [ "$rc" -ne 0 ] || fail "the send must fail when its receipt cannot be published (got: $out)"
+  new_id=$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")
+  [ -n "$new_id" ] && [ "$new_id" != null ] || fail "resent_as must already be recorded"
+  assert_absent "$home/state/letterbox/sent/$new_id.receipt" "the crash left no receipt"
+  # The natural retry is the SAME invocation the operator just saw fail.
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "rerunning the interrupted invocation must complete it, not be rejected: $out"
+  assert_contains "$out" "adopted existing letter $new_id" "the retry must adopt the corrected notice"
+  assert_present "$home/state/letterbox/sent/$new_id.receipt" "the retry must complete the receipt"
+  count=$(jq -r --arg t "[letterbox] notice " '[.[] | select(.title | startswith($t))] | length' "$store/issues.json")
+  [ "$count" = 2 ] || fail "the retry must not create a second corrected notice (found $((count - 1)))"
+  [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "$new_id" ] \
+    || fail "resent_as must still point at the corrected notice"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_not_contains "$out" "UNSENT" "nothing must remain unsent"
+  pass "the same send --resends invocation completes its own interrupted receipt"
+}
+
 # ---------------------------------------------------------------------------
 
 if [ -n "${FM_LETTERBOX_TEST_ONLY:-}" ]; then
@@ -2972,3 +3070,6 @@ test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record
 test_a_visibility_alarm_is_never_downgraded_by_a_later_transport_failure
 test_a_durable_alarm_is_raised_on_every_diagnostic_early_exit
 test_a_retried_corrected_notice_is_sent_exactly_once
+test_a_reply_whose_record_fails_after_the_post_is_never_posted_twice
+test_a_failed_poll_workdir_still_raises_the_durable_alarm
+test_the_same_resend_invocation_completes_its_own_interrupted_receipt

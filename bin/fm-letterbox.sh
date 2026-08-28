@@ -37,7 +37,11 @@
 #       An earlier outbox record that can no longer pass the scan or the grammar
 #       is reported as UNSENDABLE and left in place; it never blocks a new send.
 #   fm-letterbox.sh reply <id> --status <s> --file <f>
-#       Reply to a received letter. The responder NEVER closes the issue.
+#       Reply to a received letter. The responder NEVER closes the issue. The
+#       attempt is recorded on the claim BEFORE the comment is posted, so a
+#       replayed wake completes an interrupted reply from the comment that
+#       already landed instead of posting a second one; an answered letter is
+#       refused, and status lists it as REPLIED.
 #   fm-letterbox.sh link <id> --task <task-id>
 #       Record the ordinary firstmate task that now owns a received letter's
 #       obligation, so the stale backstop stops re-surfacing it while that task
@@ -80,6 +84,7 @@ LB_SCRIPT_DIR=$SCRIPT_DIR
 . "$SCRIPT_DIR/fm-letterbox-lib.sh"
 
 WORK=
+reply_note=
 # Cleanup failure cannot change the command result after private work is done.
 trap '[ -z "$WORK" ] || rm -rf -- "$WORK" || true' EXIT HUP INT TERM
 
@@ -89,7 +94,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,64{s/^# \{0,1\}//;p;}' "$0"
+  sed -n '2,69{s/^# \{0,1\}//;p;}' "$0"
   exit "${1:-0}"
 }
 
@@ -454,7 +459,7 @@ cmd_status() {
     printf '  poll: not armed; run: fm-letterbox.sh arm\n'
   fi
   local id claim reason fields sep cclass cfrom crefusal cresend cresent cconsumed creplied ctask marker
-  local owed=0 sent_open=0 unsent=0 resend=0 unanswerable=0 unreadable=0 task_suffix
+  local owed=0 sent_open=0 unsent=0 resend=0 unanswerable=0 unreadable=0 replied=0 task_suffix creply_id
   sep=$(printf '\037')
   workdir
   for id in $(unsent_ids); do
@@ -501,15 +506,20 @@ cmd_status() {
       [ "$cconsumed" -eq 0 ] || continue
       sent_open=$((sent_open + 1))
     else
-      [ -z "$creplied" ] || continue
+      if [ -n "$creplied" ]; then
+        replied=$((replied + 1))
+        creply_id=$(lb_claim_field "$STATE" "$id" reply_id) || creply_id='?'
+        printf '  REPLIED: %s %s %s as %s (done; the peer closes it)\n' "$id" "$cclass" "$creplied" "${creply_id:-?}"
+        continue
+      fi
       owed=$((owed + 1))
       task_suffix=
       [ -z "$ctask" ] || task_suffix=" -> task $ctask"
       printf '  OWED: %s %s%s\n' "$id" "$cclass" "$task_suffix"
     fi
   done
-  printf '  %s letter(s) awaiting a reply from this estate, %s sent and awaiting a reply from the peer, %s unsent, %s requiring resend, %s unanswerable, %s unreadable\n' \
-    "$owed" "$sent_open" "$unsent" "$resend" "$unanswerable" "$unreadable"
+  printf '  %s letter(s) awaiting a reply from this estate, %s replied, %s sent and awaiting a reply from the peer, %s unsent, %s requiring resend, %s unanswerable, %s unreadable\n' \
+    "$owed" "$replied" "$sent_open" "$unsent" "$resend" "$unanswerable" "$unreadable"
 }
 
 cmd_list() {
@@ -645,6 +655,20 @@ record_receipt() {
 # The notice a corrected notice replaces must be one this estate sent, must be
 # a notice, and must actually carry the resend obligation, so --resends can
 # never silently clear something else.
+# The corrected notice recorded as resent_as whose receipt was never published:
+# the interrupted invocation's own retry must be allowed through reconciliation
+# to complete it, rather than refused as "already re-sent".
+resend_in_flight() {
+  local notice=$1 corrected record
+  corrected=$(lb_claim_field "$STATE" "$notice" resent_as) || return 1
+  [ -n "$corrected" ] || return 1
+  lb_id_valid "$corrected" || return 1
+  record="$(lb_dir "$STATE" outbox)/$corrected.json"
+  [ -f "$record" ] && [ ! -e "$(lb_dir "$STATE" sent)/$corrected.receipt" ] || return 1
+  [ "$(jq -r '.resends // ""' "$record" 2>/dev/null)" = "$notice" ] || return 1
+  printf '%s\n' "$corrected"
+}
+
 require_resend_target() {
   local notice=$1 class=$2
   [ "$class" = notice ] || die "--resends is only valid for a notice; the corrected letter must be class notice"
@@ -661,7 +685,7 @@ require_resend_target() {
 }
 
 cmd_send() {
-  local class='' subject='' file='' expires='' resends='' id title out number url body card
+  local class='' subject='' file='' expires='' resends='' id title out number url body card in_flight=''
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --class) need_value "$@"; class=$2; shift 2 ;;
@@ -675,7 +699,14 @@ cmd_send() {
   require_active
   lb_class_allowed "$class" \
     || die "class ${class:-<none>} is not in the v1 allowlist (ping, notice, fact-lookup, capability-query, work-proposal)"
-  [ -z "$resends" ] || require_resend_target "$resends" "$class"
+  if [ -n "$resends" ]; then
+    if in_flight=$(resend_in_flight "$resends"); then
+      [ "$class" = notice ] || die "--resends is only valid for a notice; the corrected letter must be class notice"
+    else
+      in_flight=''
+      require_resend_target "$resends" "$class"
+    fi
+  fi
   [ -n "$subject" ] || die "send needs --subject"
   [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || die "send needs a readable --file"
   if [ -n "$expires" ]; then
@@ -699,7 +730,15 @@ cmd_send() {
   # Reconciliation can discharge the very obligation this send names: a
   # corrected notice that failed at the transport is retried or adopted above
   # and recorded as resent_as, so the target is checked AGAIN before a new id
-  # exists, or one transport failure would yield two corrected notices.
+  # exists, or one transport failure would yield two corrected notices. When
+  # the invocation is itself the retry of an interrupted corrected notice, the
+  # receipt reconciliation just completed IS the whole job.
+  if [ -n "$in_flight" ]; then
+    [ -e "$(lb_dir "$STATE" sent)/$in_flight.receipt" ] \
+      || die "the corrected notice $in_flight for $resends is still unsent; run status"
+    printf 'completed the corrected notice %s for %s; nothing new was sent\n' "$in_flight" "$resends"
+    return 0
+  fi
   [ -z "$resends" ] || require_resend_target "$resends" "$class"
 
   id=$(lb_id_new) || die "cannot generate a letter id"
@@ -755,8 +794,33 @@ cmd_link() {
   printf 'linked %s -> task %s\n' "$id" "$task"
 }
 
+# Does a comment on this issue already carry the reply card with this id? Used
+# only when a recorded attempt has no completion, to decide between completing
+# the record and re-posting. A read failure is a refusal: posting on an unknown
+# answer is exactly the duplicate this check exists to prevent.
+reply_landed() {
+  local number=$1 reply_id=$2 comments
+  workdir
+  comments="$WORK/comments.$number.json"
+  lb_transport comments "$number" > "$comments" 2>/dev/null \
+    || die "cannot read the comments on issue $number to check whether reply $reply_id already landed; refusing to post it twice"
+  jq -e --arg id "$reply_id" \
+    'type == "array" and any(.[]; (.body // "") | contains("\nid: " + $id + "\n"))' \
+    "$comments" >/dev/null 2>&1
+}
+
+# ORDER, and why it is the OPPOSITE of close. close acts first and records
+# second because closing an issue is idempotent: a crash re-closes harmlessly.
+# Posting a comment is NOT idempotent - a second post is a second visible
+# terminal reply to the peer - so reply records the attempt FIRST, keyed by the
+# reply id it is about to post, posts that same id, and completes the record
+# last. The rule is not "always record first" or "always act first"; it is
+# decided by whether the external operation can be safely repeated. A replay
+# that finds an attempt without a completion looks for that reply id on the
+# issue and completes the record WITHOUT posting when it is already there.
 cmd_reply() {
   local id=${1-} status='' file='' number reply_id class sender stash body
+  local replied attempt attempt_status
   if [ "$#" -gt 0 ]; then shift; fi
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -797,6 +861,22 @@ cmd_reply() {
   lb_claim_exists "$STATE" "$id" \
     || lb_claim_create "$STATE" "$id" "$class" "$sender" "$number" >/dev/null 2>&1 \
     || die "cannot record a claim for $id"
+  replied=$(lb_claim_field "$STATE" "$id" replied) || die "cannot read the claim for $id"
+  [ -z "$replied" ] || die "$id was already answered $replied as $(lb_claim_field "$STATE" "$id" reply_id); a replayed wake needs no second reply"
+  attempt=$(lb_claim_field "$STATE" "$id" reply_attempt) || die "cannot read the claim for $id"
+  attempt_status=$(lb_claim_field "$STATE" "$id" reply_attempt_status) || die "cannot read the claim for $id"
+  if [ -n "$attempt" ]; then
+    lb_id_valid "$attempt" || die "the recorded reply attempt on $id is not a reply id: $attempt"
+    [ "$attempt_status" = "$status" ] \
+      || die "a $attempt_status reply to $id is already in flight as $attempt; finish it with --status $attempt_status"
+    if reply_landed "$number" "$attempt"; then
+      complete_reply_record "$id" "$class" "$status" "$attempt"
+      printf 'reply %s to %s had already landed; completed its record without posting again\n' "$attempt" "$id"
+      [ -z "$reply_note" ] || printf '%s\n' "$reply_note"
+      return 0
+    fi
+    reply_id=$attempt
+  fi
   workdir
   # Read once, validate the snapshot, serialise from the snapshot: the same
   # discipline as send, for the same reason.
@@ -805,23 +885,40 @@ cmd_reply() {
   require_sendable "reply to $id" "$body"
   ensure_dirs
 
-  reply_id=$(lb_id_new) || die "cannot generate a reply id"
+  if [ -z "$attempt" ]; then
+    reply_id=$(lb_id_new) || die "cannot generate a reply id"
+  fi
   lb_card_reply_write "$WORK/reply.md" "$reply_id" "$id" "$status" "$(lb_now_iso)" "$body" \
     || die "cannot serialize the reply card"
   require_card_sendable "$WORK/reply.md" reply "$reply_id" "$status" "$id"
   require_clean "$WORK/reply.md"
+  if [ -z "$attempt" ]; then
+    lb_claim_set_many "$STATE" "$id" reply_attempt "$reply_id" reply_attempt_status "$status" \
+      || die "cannot record the reply attempt for $id; nothing was posted"
+  fi
   require_private_channel
   transport_write comment "$number" --body-file "$WORK/reply.md" >/dev/null \
-    || die "the transport refused the reply"
-  # The responder NEVER closes: the requester closes when it consumes this.
+    || die "the transport refused the reply; the attempt $reply_id stays recorded and is completed or re-posted by the next reply"
+  complete_reply_record "$id" "$class" "$status" "$reply_id"
+  [ -z "$reply_note" ] || printf '%s\n' "$reply_note"
+}
+
+# The responder NEVER closes: the requester closes when it consumes this. A
+# terminal reply is recorded as replied plus reply_id in ONE rewrite together
+# with clearing the attempt: replied is what stops the stale backstop raising
+# this letter, so it must never be recorded without the reply id that explains
+# it. Sets reply_note for the caller to print.
+complete_reply_record() {
+  local id=$1 class=$2 status=$3 reply_id=$4
   if lb_status_terminal "$status" "$class"; then
-    # One rewrite: replied is what stops the stale backstop raising this letter,
-    # so it must never be recorded without the reply id that explains it.
     lb_claim_set_many "$STATE" "$id" replied "$status" reply_id "$reply_id" \
-      || die "the reply landed, but its local record failed; the letter remains visible for recovery"
-    printf 'replied %s to %s; the requester closes the letter when it consumes this\n' "$status" "$id"
+      reply_attempt "" reply_attempt_status "" \
+      || die "reply $reply_id landed, but its local record failed; rerun reply $id --status $status to complete it without posting again"
+    reply_note="replied $status to $id; the requester closes the letter when it consumes this"
   else
-    printf 'acknowledged %s (non-terminal); a terminal reply is still owed\n' "$id"
+    lb_claim_set_many "$STATE" "$id" reply_attempt "" reply_attempt_status "" \
+      || die "reply $reply_id landed, but its local record failed; rerun reply $id --status $status to complete it without posting again"
+    reply_note="acknowledged $id (non-terminal); a terminal reply is still owed"
   fi
 }
 

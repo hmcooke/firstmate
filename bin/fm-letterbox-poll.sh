@@ -170,15 +170,13 @@ diagnostic_exit() {
 command -v jq >/dev/null 2>&1 || diagnostic_exit "missing jq"
 lb_transport_dependencies || diagnostic_exit "$LB_TRANSPORT_DIAGNOSTIC"
 
-WORK=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-letterbox-poll.XXXXXX") || exit 0
-# Cleanup failure cannot change the poll result after private work is done.
-trap 'rm -rf -- "$WORK" || true' EXIT HUP INT TERM
-
-OPEN_JSON="$WORK/open.json"
-if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
-  || ! jq -e 'type == "array"' "$OPEN_JSON" >/dev/null 2>&1; then
-  # The read failed, so nothing below can run this cycle; a pending write-error
-  # is still raised rather than waiting on a transport that may stay down.
+# A transport READ failure is silent by contract - the next cycle retries, so a
+# flaky network never spends a turn - but silent about the read only: a pending
+# write alarm is still raised rather than waiting on a transport that may stay
+# down. Every early return after the alarm was loaded goes through this or
+# through diagnostic_exit; the only return that bypasses both is the final
+# announcement print itself failing, which by definition cannot print.
+read_failure_exit() {
   if [ -n "$PENDING_ERROR" ]; then
     if printf 'letterbox error: %s\n' "$PENDING_ERROR"; then
       if ! mark_error_raised "$PENDING_ERROR"; then
@@ -188,6 +186,18 @@ if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
     fi
   fi
   exit 0
+}
+
+if ! WORK=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-letterbox-poll.XXXXXX"); then
+  diagnostic_exit "cannot create a private work directory under ${TMPDIR:-/tmp}"
+fi
+# Cleanup failure cannot change the poll result after private work is done.
+trap 'rm -rf -- "$WORK" || true' EXIT HUP INT TERM
+
+OPEN_JSON="$WORK/open.json"
+if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
+  || ! jq -e 'type == "array"' "$OPEN_JSON" >/dev/null 2>&1; then
+  read_failure_exit
 fi
 # A successful read does NOT retire a write-error of either class, and this is a
 # deliberate reversal of the earlier rule that a successful list-open cleared a
@@ -329,7 +339,7 @@ EOF
   fi
 }
 
-OPEN_NUMBERS=$(jq -r '.[].number' "$OPEN_JSON" 2>/dev/null) || exit 0
+OPEN_NUMBERS=$(jq -r '.[].number' "$OPEN_JSON" 2>/dev/null) || read_failure_exit
 OPEN_NUMBERS=" ${OPEN_NUMBERS//$'\n'/ } "
 
 # --- inbound letters --------------------------------------------------------
