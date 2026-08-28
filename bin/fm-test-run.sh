@@ -428,8 +428,8 @@ tests/fm-herdr-session-cleanup.test.sh 6700
 tests/fm-herdr-version-floor-live-e2e.test.sh 17
 tests/fm-inactive-reconcile.test.sh 40478
 tests/fm-kimi-harness.test.sh 13770
-tests/fm-letterbox-grammar.test.sh 333
-tests/fm-letterbox.test.sh 8385
+tests/fm-letterbox-grammar.test.sh 576
+tests/fm-letterbox.test.sh 17454
 tests/fm-lint-workflows.test.sh 807
 tests/fm-muse-harness.test.sh 25369
 tests/fm-muse-signals-live-e2e.test.sh 18

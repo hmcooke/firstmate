@@ -135,6 +135,18 @@ require_clean() {
   fi
 }
 
+# Whole-card enforcement for bytes that were not assembled in this process, such
+# as a card recovered from the outbox for a retry. The field-level gate below
+# covers a fresh send, where subject and body are still separate.
+require_card_sendable() {
+  local file=$1 size
+  size=$(wc -c < "$file" | tr -d ' ')
+  [ "$size" -le 65536 ] || die "the recovered card is implausibly large; refusing to transmit it"
+  lb_has_host_path "$(cat "$file")" \
+    && die "the recovered card names an absolute host path; refusing to transmit it"
+  return 0
+}
+
 # Sender-side grammar enforcement. The same refusals the receiver applies, so a
 # card that this estate could not accept is never emitted either.
 require_sendable() {
@@ -314,6 +326,12 @@ reconcile_unsent() {
     else
       workdir
       jq -r '.card' "$(lb_dir "$STATE" outbox)/$id.json" > "$WORK/resend.md" 2>/dev/null || continue
+      # The outbox is durable local state, not immutable and not hash-bound, so
+      # the scan that ran before the original transport call is NOT a scan
+      # immediately before THIS one. Both gates run again on the exact recovered
+      # bytes, because a server-side rejection would already be too late.
+      require_clean "$WORK/resend.md"
+      require_card_sendable "$WORK/resend.md"
       require_private_channel
       out=$(lb_transport create --title "$title" --body-file "$WORK/resend.md" \
         --label "to:${LB_PEER%%.*}") || die "the transport refused the retried letter $id"
@@ -325,12 +343,23 @@ reconcile_unsent() {
   done
 }
 
+# ORDER: the sent claim is published BEFORE the receipt. The receipt is what
+# makes unsent_ids stop offering this letter for reconciliation, and the claim is
+# what makes status, close and the sent-letter backstop able to see it at all.
+# Writing the receipt first leaves a window where a death strands the obligation
+# permanently: reconciliation skips it (receipt present) and every claim-driven
+# path is blind to it (claim absent). With this order a death between the two
+# leaves the letter in unsent_ids, where the next send adopts it by title and
+# completes the receipt, so the obligation is always visible to something.
 record_receipt() {
-  local id=$1 number=$2 url=$3 class=$4
+  local id=$1 number=$2 url=$3 class=$4 rc
+  lb_claim_create "$STATE" "$id" "$class" "$LB_SELF" "$number" >/dev/null 2>&1
+  rc=$?
+  # 0 = created here, 1 = already claimed by an earlier attempt; both are fine.
+  [ "$rc" -le 1 ] || die "cannot record the sent claim for $id"
   printf '%s\n%s\n%s\n' "$number" "$url" "$(date -u +%s)" \
     | fmx_private_artifact_publish_stdin "$(lb_dir "$STATE" sent)" "$id.receipt" 600 \
     || die "cannot record the receipt for $id"
-  lb_claim_create "$STATE" "$id" "$class" "$LB_SELF" "$number" >/dev/null 2>&1 || true
   clear_write_error
 }
 
@@ -421,6 +450,10 @@ cmd_reply() {
   [ "$sender" = "$LB_PEER" ] \
     || die "$id was sent by this estate, not received; there is nothing here to reply to"
   [ "$class" != reply ] || die "$id is a reply, not a letter; replies are not themselves answered"
+  # The class decides which statuses are legal, so this estate can never emit a
+  # combination the protocol forbids - an "answered" notice, for instance.
+  lb_status_allowed_for_class "$status" "$class" \
+    || die "status $status is not a legal reply to a $class letter"
   case "$number" in ''|*[!0-9]*) die "the record for $id names no issue" ;; esac
   lb_claim_exists "$STATE" "$id" \
     || lb_claim_create "$STATE" "$id" "$class" "$sender" "$number" >/dev/null 2>&1 \
@@ -447,7 +480,7 @@ cmd_reply() {
 }
 
 cmd_close() {
-  local id=${1-} number reply file replies='' found=0
+  local id=${1-} number reply file winner replies='' found=0
   require_active
   lb_id_valid "$id" || die "not a letter id: ${id:-<none>}"
   lb_claim_exists "$STATE" "$id" || die "no claimed letter $id in this home"
@@ -456,15 +489,25 @@ cmd_close() {
   number=$(lb_claim_field "$STATE" "$id" issue)
   case "$number" in ''|*[!0-9]*) die "the claim for $id records no issue" ;; esac
 
-  for file in "$(lb_dir "$STATE" inbox)"/*.json; do
-    [ -e "$file" ] || continue
-    reply=$(jq -r --arg id "$id" \
-      'select(.kind == "reply" and ."in-reply-to" == $id) | .id' "$file" 2>/dev/null)
-    [ -n "$reply" ] || continue
+  # FIRST TERMINAL REPLY WINS. The poll records the winner on the sent claim, so
+  # close consumes exactly that one; any later reply on the same letter is
+  # ignored rather than folded in as a second answer.
+  winner=$(lb_claim_field "$STATE" "$id" first_reply)
+  if [ -n "$winner" ]; then
     found=1
-    lb_claim_consumed "$STATE" "$id" "$reply" && continue
-    replies="$replies $reply"
-  done
+    lb_claim_consumed "$STATE" "$id" "$winner" || replies=" $winner"
+  else
+    for file in "$(lb_dir "$STATE" inbox)"/*.json; do
+      [ -e "$file" ] || continue
+      reply=$(jq -r --arg id "$id" \
+        'select(.kind == "reply" and ."in-reply-to" == $id) | .id' "$file" 2>/dev/null)
+      [ -n "$reply" ] || continue
+      found=1
+      lb_claim_consumed "$STATE" "$id" "$reply" && continue
+      replies="$replies $reply"
+      break
+    done
+  fi
   [ "$found" -eq 1 ] \
     || die "no terminal reply to $id has been received; an open letter means somebody still owes something"
 

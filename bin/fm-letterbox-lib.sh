@@ -17,6 +17,8 @@
 #   lb_id_new / lb_id_valid     - card identity generation and shape validation
 #   lb_class_allowed <class>    - the v1 request-class allowlist
 #   lb_status_allowed <status>  - the reply-status set, terminal and not
+#   lb_status_allowed_for_class <status> <class> - the per-class allowlist the
+#                                 v1 grammar defines; notice takes ack only
 #   lb_status_terminal <status> [class] - whether a reply status ends the
 #                                 exchange; ack is terminal for class notice
 #   lb_card_parse <file>        - parse AND validate one card; 0 accepted,
@@ -175,6 +177,32 @@ lb_status_allowed() {
   return 1
 }
 
+# The per-class reply-status allowlist from the v1 grammar. The union above is
+# not sufficient on its own: it would let a notice be "answered" or a ping be
+# "declined", both of which the protocol forbids, and it would make the
+# notice-ack correction merely one terminal choice among several instead of the
+# required one. Both the sender and the requester validate through this.
+#
+# ack is the universal non-terminal "received, working" status, except on notice
+# where it is the single legal - and terminal - reply. expired is a lifecycle
+# outcome rather than an answer, so any class may end that way.
+lb_status_allowed_for_class() {
+  local status=${1-} class=${2-}
+  lb_status_allowed "$status" || return 1
+  [ "$status" != expired ] || return 0
+  case "$class" in
+    notice) [ "$status" = ack ] ;;
+    ping) case "$status" in ack|answered) return 0 ;; esac; return 1 ;;
+    fact-lookup|capability-query)
+      case "$status" in ack|answered|unable|declined) return 0 ;; esac; return 1 ;;
+    work-proposal)
+      case "$status" in ack|accepted-for-review|declined|unable) return 0 ;; esac; return 1 ;;
+    # An unknown or unrecorded class cannot be validated against the table, so
+    # only the universal statuses are accepted rather than the whole union.
+    *) case "$status" in ack) return 0 ;; esac; return 1 ;;
+  esac
+}
+
 # Terminality is class-dependent, because "notice" is one-way: its ack IS the
 # terminal reply and it is required, not optional, so the requester has something
 # to consume and can close the issue. For every other class ack means "received,
@@ -243,9 +271,25 @@ lb_card_seen() {
 # An absolute host path must never cross the channel: it is how one estate's
 # filesystem shape leaks into the other's records, and on the peer estate a bare
 # path in prose can itself be a delivery instruction. Cards refer to files by
-# role. A scheme-relative or absolute URL is not a host path and stays legal.
+# role.
+#
+# The rule is "a slash that begins a path", which is deliberately wider than
+# "two components separated by whitespace". It catches a root-level path (/etc),
+# a file URI (file:///home/x), and a label-prefixed path (path:/Users/x), all of
+# which an earlier narrower detector accepted and transmitted.
+#
+# http and https URLs are removed BEFORE the test rather than exempted inside it.
+# A network URL is not a host path and stays legal, but its own path component
+# would otherwise look exactly like one. Every other scheme, file: included, is
+# left in place and therefore refused, which is correct: a file URI IS an
+# absolute host path wearing a scheme.
+#
+# A relative path stays legal because the slash must not follow an alphanumeric:
+# docs/letterbox, and/or and 24/7 are all accepted.
 lb_has_host_path() {
-  printf '%s' "$1" | grep -qE '(^|[^A-Za-z0-9._~:+/-])/[A-Za-z0-9._-]+/'
+  printf '%s' "$1" \
+    | sed -E 's#[Hh][Tt][Tt][Pp][Ss]?://[^[:space:]]*# #g' \
+    | grep -qE '(^|[^A-Za-z0-9._~+-])/[A-Za-z0-9._-]'
 }
 
 lb_iso_valid() {
@@ -261,7 +305,12 @@ lb_card_parse() {
   local file=$1 now=${2-} line key val content fences
   lb_card_reset
   [ -f "$file" ] && [ ! -L "$file" ] || return 2
-  fences=$(grep -c "^$LB_CARD_FENCE$(printf '\r')\{0,1\}\$" -- "$file" 2>/dev/null || printf '0')
+  # grep -c prints 0 and EXITS 1 when there is no match, so a "|| printf 0"
+  # fallback appends a SECOND count and makes a card-free document look like
+  # several cards. Ordinary prose on a letterbox issue must be ignored, not
+  # refused: keep grep's own count and discard only its exit status.
+  fences=$(grep -c "^$LB_CARD_FENCE$(printf '\r')\{0,1\}\$" -- "$file" 2>/dev/null || true)
+  case "$fences" in ''|*[!0-9]*) fences=0 ;; esac
   case "$fences" in
     0) return 2 ;;
     1) : ;;
@@ -335,6 +384,10 @@ lb_card_validate() {
   # Addressing is decided first and on the raw value, because a card that is not
   # ours is ignored rather than refused, and refusing it would answer a letter
   # that was never sent to this estate.
+  # A fence was recognised, so this document IS a card and an unreadable kind is
+  # a fault to name, never something to ignore. Ignore code 2 is reserved for no
+  # card at all and for a well-formed card addressed to another estate; using it
+  # here left a malformed card with no refusal, no wake and no backstop state.
   case "$LB_F_KIND" in
     request)
       [ "$LB_F_TO" = "$LB_SELF" ] || return 2
@@ -342,7 +395,7 @@ lb_card_validate() {
     reply)
       [ "$LB_F_FROM" = "$LB_PEER" ] || return 2
       ;;
-    *) return 2 ;;
+    *) lb_refuse bad-kind; return 1 ;;
   esac
 
   # A higher v is refused by name and never silently downgraded, because a v2

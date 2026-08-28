@@ -323,6 +323,76 @@ SH
   pass "the class allowlist is exactly the v1 set and nothing that acts unilaterally"
 }
 
+test_a_document_with_no_card_is_ignored_not_refused() {
+  local dir rc
+  dir="$TMP_ROOT/no-card"; mkdir -p "$dir"
+  printf 'Just an ordinary human comment on the issue.\nNo fence anywhere.\n' > "$dir/prose.md"
+  cat > "$dir/snippet.sh" <<'SH'
+lb_card_parse "$1" "$NOW"
+SH
+  lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/prose.md" >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "a document with no card must be ignored, never refused"
+  printf '' > "$dir/empty.md"
+  lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/empty.md" >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "an empty document must be ignored too"
+  pass "ordinary prose with no card is ignored, so a human comment never becomes a refusal"
+}
+
+test_unknown_or_missing_kind_is_a_named_refusal() {
+  local dir
+  dir="$TMP_ROOT/bad-kind"; mkdir -p "$dir"
+  write_request "$dir/card.md"
+  sed 's/^kind: request$/kind: dispatch/' "$dir/card.md" > "$dir/unknown.md"
+  refusal_case "a card with an unknown kind" bad-kind "$dir/unknown.md"
+  sed '/^kind: request$/d' "$dir/card.md" > "$dir/missing.md"
+  refusal_case "a card with no kind at all" bad-kind "$dir/missing.md"
+  pass "a fenced card with an unknown or missing kind is refused by name, never ignored"
+}
+
+test_every_absolute_host_path_form_is_refused() {
+  local dir out
+  dir="$TMP_ROOT/host-forms"; mkdir -p "$dir"
+  cat > "$dir/snippet.sh" <<'SH'
+while IFS= read -r value; do
+  [ -n "$value" ] || continue
+  if lb_has_host_path "$value"; then printf 'REFUSED %s
+' "$value"; else printf 'accepted %s
+' "$value"; fi
+done < "$1"
+SH
+  {
+    printf '/etc
+'
+    printf 'file:///home/captain/secret
+'
+    printf 'path:/Users/captain/secret
+'
+    printf '/home/captain/secret
+'
+    printf 'the file is at /var/log/thing
+'
+  } > "$dir/refuse.txt"
+  out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/refuse.txt") || fail "harness: $out"
+  assert_not_contains "$out" "accepted" "every absolute host path form must be refused"$'
+'"$out"
+  {
+    printf 'See https://example.test/releases/v2 and the docs/letterbox page.
+'
+    printf 'run bin/fm-letterbox.sh status
+'
+    printf 'and/or
+'
+    printf '24/7
+'
+    printf 'n/a
+'
+  } > "$dir/accept.txt"
+  out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/accept.txt") || fail "harness: $out"
+  assert_not_contains "$out" "REFUSED" "a URL and a relative path are not host paths"$'
+'"$out"
+  pass "root-level, file-URI and label-prefixed paths are refused; URLs and relative paths are not"
+}
+
 # ---------------------------------------------------------------------------
 # the credential-refusal scanner, control by control
 
@@ -515,6 +585,9 @@ test_future_issued_card_is_refused
 test_structural_refusals
 test_notice_ack_is_terminal_and_other_acks_are_not
 test_class_allowlist_is_exactly_v1
+test_a_document_with_no_card_is_ignored_not_refused
+test_unknown_or_missing_kind_is_a_named_refusal
+test_every_absolute_host_path_form_is_refused
 test_scanner_negative_controls
 test_scanner_refusal_never_echoes_the_value
 test_scanner_honesty_control_n7_records_the_measured_limit

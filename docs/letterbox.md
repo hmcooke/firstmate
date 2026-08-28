@@ -131,6 +131,13 @@ A reply is a comment on the same issue and correlates through `in-reply-to`, whi
 | `capability-query` | The receiver's own current state or capability on a named topic. | `answered`, `unable`, `declined` |
 | `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined`, `unable` |
 
+The status column is an **allowlist, not a suggestion**: both the sender and the requester refuse a status its letter's class does not permit, so a `notice` cannot be "answered" and a `work-proposal` cannot be "answered" either.
+`ack` is the universal non-terminal "received, working" status everywhere except `notice`, where it is the single legal and terminal reply.
+`expired` is a lifecycle outcome and is legal for any class.
+
+Multiple replies are legal on the wire, and the **first terminal reply wins**.
+The poll records the winner on the sent letter's claim and ignores every later reply, so a handling turn is never given two conflicting answers.
+
 There is no class that merges, spends, deletes, dispatches, publishes or grants, and there is no `done` reply status.
 
 ### What the grammar can never carry
@@ -140,11 +147,14 @@ Each of these is refused at parse, on both the sending and the receiving side, r
 - A class outside the v1 allowlist.
 - A card version above `1`, refused by name and never silently downgraded.
 - Credential-shaped content in any field.
-- An absolute host path such as `/home/...` or `/Users/...`; cards refer to files by role.
-  An ordinary URL is not a host path and stays legal.
+- An absolute host path, in **every** form: a root-level path (`/etc`), a file URI (`file:///home/...`), and a label-prefixed path (`path:/Users/...`), not only a two-component path surrounded by whitespace.
+  Cards refer to files by role.
+  An http or https URL is not a host path and stays legal, as does a relative path such as `docs/letterbox`.
 - Any `decision-key`, answer-to-a-hold, approval or captain-attribution field.
   The letterbox is never bound as a keyed-answer source, so such a field would close nothing even if it were accepted.
 - A body over 8 KiB, which is **refused, not truncated**.
+- A fenced card whose `kind` is unknown or missing, refused by name as `bad-kind`.
+  A document with no card at all is a different thing entirely and is simply ignored, so ordinary human prose on a letterbox issue never becomes a refusal.
 - A card issued more than 24 hours in the future, which is the clock-skew guard.
 
 A refused card is named in the wake by its fault class and its content is never stashed as an accepted letter.
@@ -173,7 +183,12 @@ Two limits, stated here and in the scanner's own header rather than discovered l
 Immediately before **every** write, the transport verifies through the API that the channel repository is still private, and refuses the write if it is not.
 
 That converts "the repository was accidentally made public" from a silent, ongoing exposure into a hard stop plus an alarm.
-The refusal is recorded durably under `state/letterbox/write-error`, so the poll raises it as a wake even if the turn that hit it was lost, and it clears on the next write that lands.
+The refusal is recorded durably under `state/letterbox/write-error`, so the poll raises it as a wake even if the turn that hit it was lost, and it re-alarms once per `FM_LETTERBOX_STALE_SECS` window until a write lands.
+
+A refused write never stops the read path: intake, reply detection and the backstops all continue.
+A successful read does **not** retire the record, for either error class.
+A read proves the transport is back; it proves nothing about whether the alarm was ever delivered, and the watcher appends the durable wake only after the poll exits, so a death in that gap would otherwise let a retiring read erase the last evidence that a write was refused.
+The one acknowledgement this side can observe is a write that lands, which proves both that the condition cleared and that someone acted on it.
 
 A refused write never disables reads: the poll keeps taking in letters, detecting replies and running the backstop with the record in place.
 The record's first line is its class, so the poll decides structurally rather than by reading the prose.
@@ -232,7 +247,9 @@ Process death is safe on both sides of every boundary.
 | After the wake append, before acknowledgement | The wake is durable and re-presented on the next drain. |
 | After acknowledgement, before the reply | The obligation is an ordinary task, so it is in the session-start inventory and in the supervision predicate. |
 | After the forge close, before the consumed record | Closing is idempotent: re-running `close` closes again harmlessly and completes the record. |
-| After a refused write, before anyone notices | The refusal is durable under `state/letterbox/write-error` and the next poll raises it as a wake while reads continue. A `transport` record clears on the first successful read; a `visibility` record is re-raised once per window until a write lands. |
+| After a refused write, before anyone notices | The refusal is durable under `state/letterbox/write-error` and the next poll raises it as a wake while reads continue. Neither class is retired by a successful read: both re-alarm once per window until a write lands. |
+| After the alarm is printed, before the watcher appends its wake | The write-error record survives, so the next window raises it again. A read never consumes the evidence, because a read proves the transport is back and proves nothing about whether the alarm was delivered. |
+| After the sent claim, before its receipt | The letter stays in the unsent set, so the next send adopts it by title and completes the receipt. The claim is written first precisely so no window leaves the obligation invisible to both reconciliation and the backstops. |
 | The peer's terminal reply is refused by the credential scan | The reply is never stashed; the wake names both the refused reply and the sent letter. The sent letter stays open, the `unanswered` backstop keeps raising it once per window, and the requester sends a `notice` naming the refused id and class so the peer can answer cleanly. |
 
 ### The stale backstop
@@ -244,6 +261,13 @@ That covers a reply that was refused by the credential scan, and one that never 
 
 This is the part that does not depend on anyone remembering, on either side of an exchange.
 It costs nothing extra, because the open-issue set is already in hand from the poll's single read.
+
+## Read pagination
+
+`list-open` and `comments` are paginated.
+Both are correctness-critical: the open-issue set is the poll's whole outstanding-obligation view and the stale backstop's input, and a terminal reply can sit past the first page of comments while the cursor still advances over it.
+`find-title` is deliberately not paginated, because a retry looks for an issue created moments earlier and one page bounds that read.
+The watcher's per-check timeout is what bounds a paginated read on a pathological repository.
 
 ## Cost shape
 

@@ -142,10 +142,14 @@ if fmx_private_artifact_file_valid "$ROOT" "write-error" 600; then
   WRITE_ERROR_CLASS=$(head -n1 "$WRITE_ERROR_FILE" 2>/dev/null || true)
   WRITE_ERROR_MSG=$(sed '1d' "$WRITE_ERROR_FILE" 2>/dev/null || true)
   case "$WRITE_ERROR_CLASS" in
-    visibility) WRITE_ERROR_WINDOW=$LB_STALE_SECS ;;
+    visibility) : ;;
     transport) : ;;
     *) WRITE_ERROR_CLASS=transport ;;
   esac
+  # BOTH classes re-alarm once per window until a write lands. A one-shot alarm
+  # is lost outright if the watcher dies between this poll producing its line
+  # and durably appending the wake, and this poll cannot observe that append.
+  WRITE_ERROR_WINDOW=$LB_STALE_SECS
 fi
 PENDING_ERROR=
 if [ -n "$WRITE_ERROR_MSG" ] && ! error_raised_within "$WRITE_ERROR_MSG" "$WRITE_ERROR_WINDOW"; then
@@ -166,13 +170,23 @@ if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
   fi
   exit 0
 fi
-# A successful read clears a transport-class write-error: the check that failed
-# was the transport itself, and it is demonstrably back. A visibility-class
-# record is untouched, because a readable repository says nothing about whether
-# it is private; only a write that lands clears that.
-if [ "$WRITE_ERROR_CLASS" != visibility ]; then
+# A successful read does NOT retire a write-error of either class, and this is a
+# deliberate reversal of the earlier rule that a successful list-open cleared a
+# transport-class record.
+#
+# A read proves the transport is back; it proves nothing about whether the alarm
+# was ever delivered. The watcher appends the durable wake only after this
+# process exits and its output has been captured, so a death in that gap loses
+# the announcement, and a retiring read on the next cycle would then erase the
+# only remaining evidence that a write was refused. The alarm would be gone for
+# good.
+#
+# The one acknowledgement this side can actually observe is a WRITE that lands:
+# it proves both that the condition cleared and that someone acted on it.
+# fm-letterbox.sh clears the record there. Until then the alarm re-surfaces once
+# per window, which is at-least-once for exactly the reason the letter intake is.
+if [ -z "$WRITE_ERROR_CLASS" ]; then
   clear_error
-  [ -z "$WRITE_ERROR_CLASS" ] || rm -f "$WRITE_ERROR_FILE" 2>/dev/null || true
 fi
 
 # Announcements accumulate here and are printed as ONE line at the end, so a
@@ -194,6 +208,7 @@ announce() {
 # claim-before-announce ordering that can lose a letter.
 PENDING_CLAIMS=
 PENDING_RESURFACE=
+PENDING_FIRST_REPLY=
 PENDING_CURSOR=
 
 queue_claim() {
@@ -203,6 +218,11 @@ queue_claim() {
 
 queue_resurface() {
   PENDING_RESURFACE="$PENDING_RESURFACE$1
+"
+}
+
+queue_first_reply() {
+  PENDING_FIRST_REPLY="$PENDING_FIRST_REPLY$1	$2
 "
 }
 
@@ -223,6 +243,13 @@ EOF
     lb_claim_set_number "$STATE" "$cid" resurfaced "$(date -u +%s)" >/dev/null 2>&1 || true
   done <<EOF
 $PENDING_RESURFACE
+EOF
+  local sid rid
+  while IFS="	" read -r sid rid; do
+    [ -n "$sid" ] && [ -n "$rid" ] || continue
+    lb_claim_set "$STATE" "$sid" first_reply "$rid" >/dev/null 2>&1 || true
+  done <<EOF
+$PENDING_FIRST_REPLY
 EOF
   # The cursor suppresses future comment fetches, so an early advance could hide
   # a reply whose announcement was lost. It lands with the other suppressions.
@@ -355,13 +382,43 @@ for receipt in "$SENT"/*.receipt; do
 
   CN=$(jq -r 'length' "$COMMENTS" 2>/dev/null) || CN=0
   case "$CN" in ''|*[!0-9]*) CN=0 ;; esac
+  SENT_CLASS=$(lb_claim_field "$STATE" "$SENT_ID" class)
+  # FIRST TERMINAL REPLY WINS. Multiple replies are legal on the wire, so the
+  # requester must pick one deterministic answer rather than stashing every one
+  # and leaving the handling turn with two conflicting answers. Comments arrive
+  # oldest first, so the first terminal reply in this scan is the winner, and
+  # once one is recorded on the sent claim no later reply is ever consumed.
+  FIRST_REPLY=$(lb_claim_field "$STATE" "$SENT_ID" first_reply)
   j=0
   while [ "$j" -lt "$CN" ]; do
+    [ -z "$FIRST_REPLY" ] || break
     CRAW="$WORK/comment.$SENT_NUMBER.$j"
     jq -r --argjson j "$j" '.[$j].body' "$COMMENTS" > "$CRAW" 2>/dev/null || { j=$((j + 1)); continue; }
-    if lb_card_parse "$CRAW"; then
-      if [ "$LB_F_KIND" = reply ] && [ "$LB_F_IN_REPLY_TO" = "$SENT_ID" ] \
-        && lb_status_terminal "$LB_F_STATUS" "$(lb_claim_field "$STATE" "$SENT_ID" class)" \
+    lb_card_parse "$CRAW"
+    CRC=$?
+    if [ "$CRC" -eq 1 ]; then
+      # A reply refused at parse gets the SAME refusal item, refusal claim and
+      # notice/backstop path as a scanner refusal. Without this the reason was
+      # announced nowhere and the cursor then advanced past it forever.
+      CKEY=$LB_F_ID
+      lb_id_valid "$CKEY" || CKEY="issue-$SENT_NUMBER-c$j"
+      if ! lb_claim_exists "$STATE" "$CKEY"; then
+        announce "refused $CKEY $LB_REFUSAL for $SENT_ID"
+        queue_claim "$CKEY" reply "$LB_PEER" "$SENT_NUMBER" "$LB_REFUSAL"
+      fi
+      j=$((j + 1)); continue
+    fi
+    if [ "$CRC" -eq 0 ] && [ "$LB_F_KIND" = reply ] && [ "$LB_F_IN_REPLY_TO" = "$SENT_ID" ]; then
+      # A status the sent letter's class cannot carry is a protocol fault, named
+      # like any other refusal rather than silently consumed as an answer.
+      if ! lb_status_allowed_for_class "$LB_F_STATUS" "$SENT_CLASS"; then
+        if ! lb_claim_exists "$STATE" "$LB_F_ID"; then
+          announce "refused $LB_F_ID status-not-valid-for-class for $SENT_ID"
+          queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" status-not-valid-for-class
+        fi
+        j=$((j + 1)); continue
+      fi
+      if lb_status_terminal "$LB_F_STATUS" "$SENT_CLASS" \
         && ! lb_claim_consumed "$STATE" "$SENT_ID" "$LB_F_ID" \
         && ! lb_claim_exists "$STATE" "$LB_F_ID"; then
         if ! lb_scan_refuses "$CRAW"; then
@@ -374,6 +431,8 @@ for receipt in "$SENT"/*.receipt; do
             | fmx_private_artifact_publish_stdin "$INBOX" "$LB_F_ID.json" 600; then
             announce "reply $SENT_ID $LB_F_STATUS"
             queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" ""
+            queue_first_reply "$SENT_ID" "$LB_F_ID"
+            FIRST_REPLY=$LB_F_ID
           fi
         else
           # The wake names the SENT letter too: a refused reply cannot be

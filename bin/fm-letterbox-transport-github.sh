@@ -42,6 +42,10 @@
 # repository was accidentally made public" from a silent ongoing exposure into a
 # hard stop on the next write. It is one API call and it is not optional.
 #
+# list-open and comments are PAGINATED; find-title deliberately is not, because a
+# retry looks for an issue created moments earlier and one page bounds that read.
+# The watcher's per-check timeout bounds a paginated read on a pathological repo.
+#
 # The GitHub search API is NEVER used: its measured limit is 30 requests/minute
 # against core's 5,000/hour, so it would be the first thing to break under
 # polling. find-title reads the most recent 100 issues in one call instead,
@@ -102,18 +106,26 @@ case "$VERB" in
   list-open)
     # One call. Pull requests can never appear in the channel repository, but
     # they are filtered anyway so a shared repository cannot inject one.
-    gh api "repos/$REPO/issues?state=open&per_page=100" \
-      --jq '[.[] | select(has("pull_request") | not)
-             | {number, title, body: (.body // ""), author: (.user.login // ""), updated: (.updated_at // "")}]' \
-      2>/dev/null || exit 1
+    # PAGINATED. The open-issue set is the poll's whole outstanding-obligation
+    # view and the stale backstop's input, so an unrecorded 100-item cap would
+    # silently drop letters out of both. --jq emits one object per line per page
+    # and jq -s reassembles the pages into the single array the caller expects.
+    gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+      --jq '.[] | select(has("pull_request") | not)
+             | {number, title, body: (.body // ""), author: (.user.login // ""), updated: (.updated_at // "")}' \
+      2>/dev/null | jq -s '.' 2>/dev/null || exit 1
     ;;
 
   comments)
     NUMBER=${1-}
     case "$NUMBER" in ''|*[!0-9]*) die "letterbox transport: bad issue number" ;; esac
-    gh api "repos/$REPO/issues/$NUMBER/comments?per_page=100" \
-      --jq '[.[] | {id: (.id | tostring), body: (.body // ""), author: (.user.login // ""), created: (.created_at // "")}]' \
-      2>/dev/null || exit 1
+    # PAGINATED for the same reason: a terminal reply on page two would never be
+    # seen, while the cursor would still advance past the issue's updated_at and
+    # suppress the refetch. Comments stay in oldest-first order across pages,
+    # which is what "first terminal reply wins" depends on.
+    gh api --paginate "repos/$REPO/issues/$NUMBER/comments?per_page=100" \
+      --jq '.[] | {id: (.id | tostring), body: (.body // ""), author: (.user.login // ""), created: (.created_at // "")}' \
+      2>/dev/null | jq -s '.' 2>/dev/null || exit 1
     ;;
 
   find-title)
