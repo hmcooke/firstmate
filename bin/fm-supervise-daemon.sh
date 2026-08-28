@@ -485,7 +485,9 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
       pause_marker_record "$win" "$state"
     else
       rm -f "$marker" "$state/.paused-$watcher_key" \
-        "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key"
+        "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
+        "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" \
+        "$state/.wedge-escalations-$watcher_key"
     fi
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"

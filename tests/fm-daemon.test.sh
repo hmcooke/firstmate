@@ -302,6 +302,56 @@ test_daemon_paused_uses_shared_state_with_inherited_marker() {
   pass "away supervision starts wedge aging only after an idle observation"
 }
 
+test_daemon_invalidated_pause_releases_watcher_stale_suppressor() {
+  local dir state fakebin key watcher_key win pane pane_text pane_hash
+  dir=$(make_supercase invalidated-pause-stale-suppressor)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  make_fake_crew_state "$fakebin" >/dev/null
+  win="sess:fm-inherited-idle-w10"
+  pane="$dir/pane.txt"
+  pane_text='idle prompt $'
+  printf '%s\n' "$pane_text" > "$pane"
+  fm_write_meta "$state/inherited-idle-w10.meta" "window=$win" "kind=ship" "backend=tmux"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$state/inherited-idle-w10.status"
+  key=$(printf '%s' "inherited-idle-w10" | tr ':/.' '___')
+  watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
+  pane_hash=$(_hash_text "$pane_text")
+  : > "$state/.paused-$watcher_key"
+  printf '%s' "$pane_hash" > "$state/.stale-$watcher_key"
+  printf '%s' "$pane_hash" > "$state/.hash-$watcher_key"
+  printf '2\n' > "$state/.count-$watcher_key"
+  date +%s > "$state/.stale-since-$watcher_key"
+  printf '3\n' > "$state/.wedge-escalations-$watcher_key"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    FM_PAUSE_RESURFACE_SECS=999999 housekeeping "$state"
+  [ ! -e "$state/.paused-$watcher_key" ] \
+    || fail "the shared working verdict retained the inherited pause marker"
+  [ ! -e "$state/.stale-$watcher_key" ] \
+    || fail "the shared working verdict retained the paired watcher stale suppressor"
+  [ ! -e "$state/.stale-since-$watcher_key" ] \
+    || fail "the shared working verdict retained watcher stale aging"
+  [ ! -e "$state/.wedge-escalations-$watcher_key" ] \
+    || fail "the shared working verdict retained watcher wedge escalation state"
+  [ ! -e "$state/.subsuper-stale-$key" ] \
+    || fail "pause invalidation counted as an idle observation"
+  [ "$(cat "$state/.hash-$watcher_key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "pause invalidation changed the watcher's current pane baseline"
+  [ "$(_hash_text "$(cat "$pane")")" = "$pane_hash" ] \
+    || fail "the idle pane changed during pause invalidation"
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    handle_wake "stale: $win" "$state"
+  [ -e "$state/.subsuper-stale-$key" ] \
+    || fail "the next unchanged idle observation did not start ordinary wedge aging"
+  pass "away supervision releases inherited stale suppression before idle aging"
+}
+
 test_handle_wake_paused_signal_records_pause_marker() {
   local dir state fakebin key win
   dir=$(make_supercase handle-paused-signal)
@@ -1943,6 +1993,7 @@ test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker
 test_daemon_paused_uses_shared_state_with_inherited_marker
+test_daemon_invalidated_pause_releases_watcher_stale_suppressor
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
 test_housekeeping_migrates_watcher_pause_marker
