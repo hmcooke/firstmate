@@ -31,15 +31,15 @@
 #       CONTINUE: a refused write never disables intake. Neither the "transport"
 #       class nor the "visibility" class is cleared by a read; both re-alarm once
 #       per FM_LETTERBOX_STALE_SECS window until a write lands
-#   a new peer letter                   -> secret-scan the body, stash the card
-#       to state/letterbox/inbox/<id>.json, atomically claim
-#       state/letterbox/claims/<id>.json, and name it on the one output line
-#   a card that fails the grammar       -> claim it once and name the refusal, so
+#   a new peer letter                   -> secret-scan the whole issue body, stash the card,
+#       name it on the one output line, then atomically claim it under
+#       state/letterbox/claims/<id>.json
+#   a card that fails the grammar       -> name the refusal, then claim it once, so
 #       the handling turn can answer "unable" naming the fault class
 #   a terminal peer reply to a letter
-#   this estate sent                    -> stash and claim it once, and name it
+#   this estate sent                    -> stash it, name it, then claim it once
 #   a terminal peer reply refused by
-#   the credential scan                 -> claim it once and name the refusal
+#   the credential scan                 -> name the refusal, then claim it once
 #       together with the SENT letter it answers, which is the id the requester
 #       can act on: the sent letter stays open, and the resolution is an
 #       ordinary class=notice letter naming the refused id and the reason
@@ -502,7 +502,7 @@ PENDING_CURSOR=$CURSOR_JSON
 # exchange, and it is free: the open-issue set is already in hand.
 #
 #   "stale": a claimed letter this estate RECEIVED whose issue is still open,
-#   which has neither a terminal reply from this estate nor a linked live task.
+#   which has neither a terminal reply from this estate nor linked task metadata.
 #   It is the answer to "what if the obligation was dropped between the claim
 #   and the task".
 #

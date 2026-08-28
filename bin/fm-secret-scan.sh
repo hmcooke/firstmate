@@ -14,9 +14,10 @@
 #
 # It REFUSES; it never redacts. A redacted secret is still a secret that reached
 # the pipeline, so the only safe outcome is that the content is not sent, not
-# stashed and not logged. Callers run it BEFORE the transport call, BEFORE the
-# local outbox write on the send path, and BEFORE the inbox stash on the receive
-# path, because a server-side rejection would already be too late.
+# stashed and not logged. Callers run it BEFORE each transport call that carries
+# card bytes, BEFORE the local outbox write on the send path, and BEFORE the
+# inbox stash on the receive path, because a server-side rejection would already
+# be too late.
 #
 # HONESTY, and this belongs here rather than being discovered later:
 #   - This is DEFENCE IN DEPTH, NOT A BOUNDARY. It reduces the chance that a
@@ -25,8 +26,8 @@
 #     property in the letterbox design is allowed to rest on it.
 #   - It will NOT catch a secret that has been split across lines, encoded,
 #     compressed, or otherwise transformed. That limit is measured rather than
-#     assumed: control N7 of the letterbox measurement plan (docs/letterbox.md)
-#     exercises exactly that case and records the result as a stated limit.
+#     assumed: the N7 honesty control in tests/fm-letterbox-grammar.test.sh
+#     exercises exactly that case and pins the result as a stated limit.
 #
 # Detection classes, each with a named negative control in the test suite:
 #   provider-key-prefix   ghp_ / gho_ / ghs_ / ghu_ / ghr_ / github_pat_ /

@@ -10,7 +10,7 @@ This page owns operator setup, activation, the home-local state layout and the c
 ## What it is, and what it is not
 
 The letterbox carries small structured **cards** between two estates: a question, a one-way notice, a capability query, or a suggestion.
-Both estates dial out to the same private repository, so the channel introduces no listening port, no tunnel, no SSH key and no bearer secret that reaches a shell.
+Both estates dial out to the same private repository, so the channel introduces no listening port, tunnel, SSH key, or new credential and instead uses Firstmate's existing GitHub authentication.
 
 It is not a remote-control channel.
 No card class can cause anything irreversible on the receiving estate, no card can carry captain authority, and a letter is treated as input rather than instruction on both sides.
@@ -99,7 +99,7 @@ bin/fm-letterbox.sh link <letter-id> --task <task-id>
 bin/fm-letterbox.sh send --class notice --subject "corrected" --file notice.md --resends <notice-id>
 ```
 
-The **responder never closes**; the **requester** closes once it has consumed a terminal reply.
+The **responder never closes**; the **requester** consumes a terminal reply by closing the issue first and then recording the consumed reply id.
 That gives one invariant readable from the channel by either estate and by a human:
 
 > An open issue means somebody still owes something.
@@ -109,7 +109,7 @@ So `is:issue is:open` is the complete outstanding-obligation set for the whole c
 ## The card
 
 Every letter and every reply is one fenced block with a `letterbox/v1` info string, in the issue body or a comment body.
-Everything outside the fence is prose for a human reader and is never parsed.
+Everything outside the fence is prose for a human reader and is never interpreted as card fields, although the whole document is still credential-scanned before transmission or stash.
 
 ````text
 ```letterbox/v1
@@ -140,28 +140,11 @@ A reply is a comment on the same issue and correlates through `in-reply-to`, whi
 
 ### Classes
 
-| Class | Asks for | Understood answer statuses |
-|---|---|---|
-| `ping` | Liveness only; carries no content. | `answered` |
-| `notice` | One-way information. | `ack`, which is terminal for this class and required when the notice was understood |
-| `fact-lookup` | An answer from what the receiver already knows or can read without changing anything. | `answered`, `declined` |
-| `capability-query` | The receiver's own current state or capability on a named topic. | `answered`, `declined` |
-| `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined` |
-
-The understood-answer column is an **allowlist, not a suggestion**: both the sender and the requester refuse an answer status its letter's class does not permit, so a `notice` cannot be "answered" and a `work-proposal` cannot be "answered" either.
-`ack` is the universal non-terminal "received, working" status everywhere except `notice`, where it is the understood and terminal answer.
-`expired` is a lifecycle outcome and is legal for any class.
-`unable` is a protocol-level refusal rather than an answer and is therefore legal for every class, including a card whose class could not be parsed.
-An `unable` reply to a notice is terminal, so the requester consumes it and closes the letter, but it does not acknowledge the notice and the sender must send a corrected notice under a new id.
-
-Multiple replies are legal on the wire, and the **first terminal reply wins**.
-The poll records the winner on the sent letter's claim and ignores every later reply, so a handling turn is never given two conflicting answers.
-
-There is no class that merges, spends, deletes, dispatches, publishes or grants, and there is no `done` reply status.
+The [letterbox-correspondence skill](../.agents/skills/letterbox-correspondence/SKILL.md) owns class meanings, legal per-class reply statuses, terminal-reply selection and the handling rule that a letter is input rather than authority.
 
 ### What the grammar can never carry
 
-Each of these is refused at parse, on both the sending and the receiving side, rather than sanitised:
+Each of these is refused on both the sending and receiving side before transmission or stash rather than sanitised; structural cases fail the grammar and credential-shaped content fails the separate whole-card scan:
 
 - A class outside the v1 allowlist.
 - A card version above `1`, refused by name and never silently downgraded.
@@ -189,7 +172,7 @@ A body authored through the forge's web editor arrives with CRLF line endings; a
 
 ## Credential refusal
 
-`bin/fm-secret-scan.sh` runs before every transport call, before the local outbox write on the send path, and before the inbox stash on the receive path.
+`bin/fm-secret-scan.sh` runs before every transport call that carries card bytes, before the local outbox write on the send path, and before the inbox stash on the receive path.
 A server-side rejection would already be too late.
 
 It **refuses; it never redacts**, because a redacted secret is still a secret that reached the pipeline.
@@ -232,29 +215,18 @@ state/letterbox/poll-error         rate-limited diagnostic dedupe marker
 state/letterbox/write-error        a durable refused write, raised by the next poll
 ```
 
-Every directory is mode 0700 and every file mode 0600.
+`state/letterbox/` and every child directory are mode 0700, while every file there is mode 0600; the executable shim is mode 0700 and its adjacent trust record is mode 0600 as listed above.
 
 There is deliberately **no local ledger of record**.
 Under the forge transport the forge holds the record and these files are a cache plus the idempotency markers.
 
-An inbound letter that cannot be answered within the wake turn becomes an **ordinary firstmate task**, with an ordinary backlog entry and `state/<id>.meta`, linked from the claim as `task=<task-id>`.
-There is no parallel store for peer obligations, which is what stops an acknowledged-but-unfinished promise from going invisible: an ordinary task is already inventoried at every session start and already makes supervision required at every turn boundary.
+An inbound letter that cannot be answered within the wake turn becomes an **ordinary firstmate task**, with an ordinary backlog entry plus `state/<id>.meta` when a worker is dispatched, linked from the claim as `task=<task-id>`.
+There is no parallel store for peer obligations, which stops an acknowledged-but-unfinished promise from going invisible: the backlog task is inventoried at every session start, while the armed letterbox independently keeps supervision required at every turn boundary.
 
 ## The ordering contract
 
-> **The durable state transition precedes wake acknowledgement.**
-
-Before a handling turn acknowledges a letterbox wake, one of these exists for every letter in it: a posted terminal reply, a created backlog item with its task metadata, or a posted `unable`/`declined` reply.
-If none exists the acknowledgement does not run, and the wake stays durable for idempotent re-handling.
-
-Inside the poll, the receiver's completion boundary is **claim-last**: stash the card, announce it, then take the claim.
-The claim is the only marker that suppresses a future announcement, so it must not exist until the announcement it suppresses has been made; the resurface stamp and the transport cursor land after the announcement for the same reason.
-
-The consequence is deliberate: **announcement is at-least-once**.
-A crash between printing the line and taking the claim makes the next poll announce the same card again.
-Losing a letter is unrecoverable and announcing one twice is not, so the ordering trades the recoverable failure for the unrecoverable one.
-Every consumer of an announcement is therefore idempotent on card id, and the `letterbox-correspondence` skill owns what that means for a handling turn.
-A card id is chosen once by its sender and is immutable, so a repeated announcement is always the same letter and never a second one.
+The [letterbox-correspondence skill](../.agents/skills/letterbox-correspondence/SKILL.md#the-ordering-contract) owns the durable-transition-before-acknowledgement contract and the idempotency required by claim-last, at-least-once announcements.
+The operator-facing recovery outcomes are recorded in the crash matrix below.
 
 ## Crash matrix
 
@@ -266,7 +238,7 @@ Process death is safe on both sides of every boundary.
 | After the stash, before the announcement | Nothing is claimed, so the next poll re-stashes and announces. No letter is lost. |
 | After the announcement, before the claim | The next poll announces the same card again. Announcement is at-least-once by design, and consumers are idempotent on card id. |
 | After the wake append, before acknowledgement | The wake is durable and re-presented on the next drain. |
-| After acknowledgement, before the reply | The obligation is an ordinary task, so it is in the session-start inventory and in the supervision predicate. |
+| After acknowledgement, before the reply | The ordinary backlog task keeps the obligation in the session-start inventory, while the armed letterbox keeps supervision required even when no worker metadata exists. |
 | After the forge close, before the consumed record | Closing is idempotent: re-running `close` closes again harmlessly and completes the record. |
 | After the peer's first terminal reply is claimed, before the winner is cached on the sent claim | The reply claim itself records the letter it answers and its status, in the one write that made it a claim, so the winner is derived from it on the next poll and by `close`; a later terminal reply can never overtake it. |
 | While a stash, outbox record or claim is being built | Generated JSON is staged and validated before it is published, so a `jq` failure never publishes an empty record that is then announced or claimed. |
@@ -277,13 +249,13 @@ Process death is safe on both sides of every boundary.
 
 ### The stale backstop
 
-A claimed letter this estate received whose issue is still open, which has neither a terminal reply from this estate nor a linked live task, is re-surfaced by the poll as `stale` once per `FM_LETTERBOX_STALE_SECS` window.
+A claimed letter this estate received whose issue is still open, which has neither a terminal reply from this estate nor linked task metadata, is re-surfaced by the poll as `stale` once per `FM_LETTERBOX_STALE_SECS` window.
 
 A letter this estate sent whose issue is still open and whose terminal reply it has not consumed is re-surfaced as `unanswered` on the same window.
 That covers a reply that was refused by the credential scan, and one that never came: the requester keeps being woken instead of the letter going silent, and the letter stays open because the peer still owes a clean answer.
 
 This is the part that does not depend on anyone remembering, on either side of an exchange.
-It costs nothing extra, because the open-issue set is already in hand from the poll's single read.
+It costs no extra listing operation, because the open-issue set is already in hand from the poll's paginated `list-open` read.
 
 ## Read pagination
 
@@ -294,7 +266,7 @@ The watcher's per-check timeout is what bounds a paginated read on a pathologica
 
 ## Cost shape
 
-A quiet cycle is **one** API read and no model tokens: the poll runs inside the zero-token bash watcher, and the per-issue cursor means comments are fetched only for a letter whose issue was touched since the last scan.
+A quiet cycle is one paginated `list-open` operation and no model tokens: it uses one HTTP request while the open set fits one 100-item page and additional requests only for further pages, while the per-issue cursor means comments are fetched only for a letter whose issue was touched since the last scan.
 The cursor records an issue's `updated_at` only when that stamp is strictly older than the poll's own second, and compares stamps as instants rather than strings.
 GitHub's `updated_at` has one-second resolution, so a reply landing in the same second as a recorded stamp leaves it unchanged; a stamp at the boundary is left unrecorded so the next cycle refetches, and an absent or malformed cursor always means "fetch".
 The poll never writes to the channel; every write is a deliberate command run by an agent or an operator.
@@ -302,5 +274,5 @@ The poll never writes to the channel; every write is a deliberate command run by
 ## Swapping the transport
 
 `bin/fm-letterbox-transport-github.sh` is the only file that knows about GitHub.
-A second transport implements the same verbs - `require-private`, `list-open`, `comments`, `find-title`, `create`, `comment`, `close` - and nothing else in the letterbox changes.
+A second transport implements the same verbs - `require-private`, `list-open`, `comments`, `find-title`, `create`, `comment`, `close` - and adds its name to the configuration allowlist, while no other letterbox path changes.
 Its own header owns the exact API calls and which CLI each verb uses.

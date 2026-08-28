@@ -16,12 +16,12 @@
 #   fm-letterbox.sh status
 #       Local-only report: activation, whether the poll is armed and registered,
 #       unanswered letters, letters this estate sent whose terminal reply it has
-#       not yet consumed, any outbox record whose transport call never completed
-#       (with its refusal reason when it can no longer be sent), and refused
+#       not yet consumed, any outbox record without a matching receipt (with its
+#       refusal reason when it can no longer be sent), and refused
 #       cards with no usable id, which no command can answer and are listed as
 #       UNANSWERABLE rather than owed. Makes no API call.
 #   fm-letterbox.sh list
-#       Local-only listing of every stashed letter and reply with its state.
+#       Local-only tab-separated summary of every stashed letter and reply.
 #   fm-letterbox.sh read <id>
 #       Print one stashed card from the inbox.
 #   fm-letterbox.sh send --class <c> --subject <s> --file <f> [--expires <iso>]
@@ -59,10 +59,9 @@
 # when the check itself could not run. The transport adapter re-checks at its
 # own boundary and reports the class in its exit status, so a repository that
 # flips between the two checks is still recorded under "visibility". Neither
-# class is cleared by a read; both keep alarming until a write lands. Every
-# write also runs
-# bin/fm-secret-scan.sh over the assembled card first and refuses on anything but
-# a clean result; it refuses, it never redacts.
+# class is cleared by a read; both keep alarming until a write lands. Every write
+# that carries card bytes also runs bin/fm-secret-scan.sh over the assembled card
+# first and refuses on anything but a clean result; it refuses, it never redacts.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -342,8 +341,9 @@ cmd_retire() {
   fi
 }
 
-# Every outbox record with no matching receipt is a transport call that never
-# completed. It is reported rather than hidden, and the next send reconciles it.
+# Every outbox record with no matching receipt may name a transport call that did
+# not land or one that landed before local receipt bookkeeping completed.
+# It is reported rather than hidden, and the next send reconciles it.
 unsent_ids() {
   local record id
   for record in "$(lb_dir "$STATE" outbox)"/*.json; do

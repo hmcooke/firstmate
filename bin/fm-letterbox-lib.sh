@@ -248,7 +248,8 @@ lb_issue_title() {
 # --- the card ---------------------------------------------------------------
 #
 # One fenced block per document, info string letterbox/v1, at column 0.
-# Everything outside the fence is prose for a human reader and is never parsed.
+# Everything outside the fence is prose for a human reader and is never
+# interpreted as card fields, though the whole document is credential-scanned.
 # Inside it: "key: value" lines, one key per line, with exactly one multi-line
 # field (body) written as a block scalar and required to come last.
 #
@@ -688,8 +689,9 @@ lb_first_reply() {
   return 1
 }
 
-# Terminal-reply dedupe: a reply id is recorded in the claim BEFORE the issue is
-# closed, so a replayed reply with an already-recorded id is dropped.
+# Terminal-reply dedupe reads reply ids already recorded after an earlier
+# successful close, so a replayed reply with an already-recorded id is dropped.
+# bin/fm-letterbox.sh owns the close-first, consumed-record-second transition.
 lb_claim_consumed() {
   local state=$1 id=$2 reply=$3 path
   path=$(lb_claim_path "$state" "$id")
@@ -705,10 +707,10 @@ lb_claim_consume() {
 
 # --- credential refusal -----------------------------------------------------
 #
-# One contract, one owner. The scan runs BEFORE the transport call, BEFORE the
-# local outbox write on the send path, and BEFORE the inbox stash on the receive
-# path. Anything other than a clean exit 0 - including the scanner itself
-# failing - is a refusal, because nothing was proven clean.
+# One contract, one owner. The scan runs BEFORE each transport call that carries
+# card bytes, BEFORE the local outbox write on the send path, and BEFORE the
+# inbox stash on the receive path. Anything other than a clean exit 0 - including
+# the scanner itself failing - is a refusal, because nothing was proven clean.
 # LB_SCAN_REASON names the class and never the value.
 lb_scan_refuses() {
   local file=$1 out rc
@@ -726,9 +728,10 @@ lb_scan_refuses() {
 # --- transport dispatch -----------------------------------------------------
 #
 # Exactly one adapter file knows any forge. Every verb below is part of the
-# adapter contract; a second transport implements the same verbs and nothing
-# else in the letterbox changes. docs/letterbox.md names the contract, and each
-# adapter's own header owns its exact API calls.
+# adapter contract; a second transport implements the same verbs and adds its
+# name to lb_load_config's allowlist, while no other letterbox path changes.
+# docs/letterbox.md names the contract, and each adapter's own header owns its
+# exact API calls.
 lb_transport() {
   local adapter="${LB_SCRIPT_DIR:?}/fm-letterbox-transport-$LB_TRANSPORT.sh"
   [ -f "$adapter" ] && [ ! -L "$adapter" ] || return 1

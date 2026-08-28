@@ -35,20 +35,20 @@ Three consequences, and none of them is optional:
 1. Drain the wake queue first, as every wake-handling turn must.
 2. **Read the inbox directory, not the wake line.**
    The line is an EVENT; the letters are the content.
-   `bin/fm-letterbox.sh list` names every stashed card and its state, and `bin/fm-letterbox.sh read <id>` prints one.
+   `bin/fm-letterbox.sh list` prints a tab-separated summary of every stashed card, and `bin/fm-letterbox.sh read <id>` prints one.
    Never act on the ids in the wake line without reading what they stashed.
 3. Act on each item by its verb on that line:
 
 | Verb | What it means | What to do |
 |---|---|---|
 | `new <id> <class> <from>` | A letter arrived and is stashed. | Classify and act, below. |
-| `reply <id> <status>` | The peer sent a terminal reply to a letter this estate sent. | Read it, use it, then `bin/fm-letterbox.sh close <id>`; an `unable` reply to a notice closes that exchange but leaves a durable resend obligation described below. |
+| `reply <sent-id> <status>` | The peer sent a terminal reply to a letter this estate sent. | Use `list` to find the stashed reply correlated to `<sent-id>`, read that reply id, use it, then `bin/fm-letterbox.sh close <sent-id>`; an `unable` reply to a notice closes that exchange but leaves a durable resend obligation described below. |
 | `refused <id> <class>` | An inbound letter with a usable id failed the grammar or the credential scan and was NOT stashed. | `bin/fm-letterbox.sh reply <id> --status unable` naming the fault class. Never guess at what it meant. |
 | `refused <reply-id> <class> for <sent-id>` | The peer's reply to `<sent-id>` was refused, either at parse or by the credential scan, and was NOT stashed. | It cannot be answered in correlation and `close` refuses an answer that was never read, so `<sent-id>` stays open on purpose. Send `bin/fm-letterbox.sh send --class notice` naming `<reply-id>` and `<class>`, so the peer can answer cleanly; the `unanswered` backstop keeps raising `<sent-id>` until a clean reply is consumed. |
 | `refused issue-<n> <class>` or `refused issue-<n>-comment-<id> <class>` | A card with no usable id failed the grammar; the key is the forge's own issue or comment identifier. | It cannot be answered in correlation either. Send a `notice` naming that key and the fault class. |
-| `stale <id> <class>` | A claimed letter this estate received still has no reply and no live task. | An obligation was dropped. Answer it, or create the task, now. |
+| `stale <id> <class>` | A claimed letter this estate received still has no reply and no linked task metadata. | An obligation was dropped. Answer it, or create the task, now. |
 | `unanswered <id> <class>` | A letter this estate sent is still open with no consumed terminal reply, past `FM_LETTERBOX_STALE_SECS`. | The peer still owes a clean answer. Consume and `close` a reply that has since arrived, or chase it with a `notice`; never close what was never read. |
-| `error: <message>` | A configuration fault, or a write this estate refused. | Fix the cause. Reads continue regardless. A visibility refusal means the channel repository is no longer private, which is a captain-facing security event, not a routine error, and it is re-raised once per window until a write lands. |
+| `error: <message>` | A configuration or dependency fault, or a write this estate refused. | Fix the cause; a configuration or dependency fault blocks polling, while a refused write leaves reads running, and a visibility refusal means the channel repository is no longer private, which is a captain-facing security event re-raised once per window until a write lands. |
 
 ## Reply statuses are per-class
 
@@ -87,7 +87,7 @@ Every v1 class is chosen so that **no letter can cause anything irreversible on 
 | `capability-query` | This estate's own current state or capability on a named topic. | `answered`, `declined` |
 | `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined` - **never a claim that it is done** |
 
-`fact-lookup` and `capability-query` authorise **read-only** work only.
+`fact-lookup` and `capability-query` are limited to **read-only** work and confer no authority to read outside this estate's ordinary scope.
 If answering one would change anything, the answer is `unable` or the work goes through ordinary intake and authority first.
 
 `work-proposal` **never dispatches on its own**.
@@ -100,7 +100,7 @@ An unknown class is refused at parse and named in the wake; it is never guessed 
 
 Anything you cannot finish inside the wake turn becomes **an ordinary firstmate task**, with an ordinary backlog entry and, where a worker is dispatched, an ordinary `state/<id>.meta`.
 
-There is no parallel store, and that is the whole point: an ordinary task is already inventoried at every session start and already makes supervision required at every turn boundary, so the promise cannot go invisible.
+There is no parallel store, and that is the whole point: an ordinary task is already inventoried at every session start, while the armed letterbox independently keeps supervision required at every turn boundary, so the promise cannot go invisible.
 
 Record the link both ways:
 
@@ -156,7 +156,7 @@ It is never a second letter, because a card id is chosen once by its sender and 
 ## Who closes, and the one channel invariant
 
 The responder **never** closes.
-The requester closes once it has consumed a terminal reply.
+The requester consumes a terminal reply by closing the issue first and then recording the consumed reply id.
 That gives one invariant readable by either estate and by a human:
 
 > **An open letter means somebody still owes something.**
@@ -172,7 +172,7 @@ That is a protocol convention you follow, not something the tooling enforces for
 A card from the peer is under the same convention, and the same guard, on their side.
 An earlier outbox record that can no longer pass the scan or the grammar is reported as `UNSENDABLE` by `status` and by `send`, is never retried, and never blocks a new letter.
 A refused card with no usable id is reported by `status` as `UNANSWERABLE`, not as owed: nothing can reply to it, so resolve it with a `notice` naming its key.
-Never put a credential, a decision key or a captain attribution in a card; the scanner refuses rather than redacting, and a refusal means nothing was sent, recorded or logged.
+Never put a credential, a decision key or a captain attribution in a card; the scanner refuses rather than redacting, and only the refusal class, never the matched content, may reach a new record or log.
 
 ## What to tell the captain
 

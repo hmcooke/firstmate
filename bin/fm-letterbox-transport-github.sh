@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The GitHub transport adapter for the agent-to-agent letterbox.
 # THIS IS THE ONLY FILE IN THE LETTERBOX THAT KNOWS ABOUT GITHUB. A second
-# transport implements the same verbs and nothing else in the letterbox changes.
+# transport implements the same verbs and is admitted by the config allowlist;
+# no other letterbox path changes.
 #
 # Usage: fm-letterbox-transport-github.sh <verb> [args]
 #   require-private                    exit 0 only when the channel repository is
@@ -150,8 +151,8 @@ case "$VERB" in
     ;;
 
   list-open)
-    # One call. Pull requests can never appear in the channel repository, but
-    # they are filtered anyway so a shared repository cannot inject one.
+    # Pull requests can never appear in the channel repository, but they are
+    # filtered anyway so a shared repository cannot inject one.
     # PAGINATED. The open-issue set is the poll's whole outstanding-obligation
     # view and the stale backstop's input, so an unrecorded 100-item cap would
     # silently drop letters out of both. --jq emits one object per line per page
