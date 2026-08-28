@@ -473,7 +473,7 @@ clear_pause_tracking() {  # <window> <state>
 }
 
 reconcile_pause_tracking() {  # <window> <state> <last-status-line>
-  local win=$1 state=$2 last=$3 pause_class task key marker watcher_key
+  local win=$1 state=$2 last=$3 pause_class task key marker watcher_key had_pause_marker
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
@@ -484,10 +484,16 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
       stale_marker_remove "$win" "$state"
       pause_marker_record "$win" "$state"
     else
+      had_pause_marker=0
+      if [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
+        had_pause_marker=1
+      fi
       rm -f "$marker" "$state/.paused-$watcher_key" \
-        "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
-        "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" \
-        "$state/.wedge-escalations-$watcher_key"
+        "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key"
+      if [ "$had_pause_marker" = 1 ]; then
+        rm -f "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" \
+          "$state/.wedge-escalations-$watcher_key"
+      fi
     fi
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"

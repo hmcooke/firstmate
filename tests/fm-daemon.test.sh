@@ -352,6 +352,79 @@ test_daemon_invalidated_pause_releases_watcher_stale_suppressor() {
   pass "away supervision releases inherited stale suppression before idle aging"
 }
 
+test_daemon_working_verdict_preserves_watcher_stale_suppressor() {
+  local dir state fakebin key watcher_key win pane pane_text pane_hash call_log crew_bin
+  local calls_before calls_after watcher_count watcher_alive out pid i
+  dir=$(make_supercase working-pause-stale-suppressor)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  make_fake_crew_state "$fakebin" >/dev/null
+  call_log="$dir/crew-state.calls"
+  crew_bin="$fakebin/counting-crew-state.sh"
+  cat > "$crew_bin" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-}" >> "$FM_FAKE_CREW_STATE_CALL_LOG"
+exec "$(dirname "$0")/fm-crew-state.sh" "$@"
+SH
+  chmod +x "$crew_bin"
+  win="sess:fm-working-idle-w10"
+  pane="$dir/pane.txt"
+  pane_text='idle prompt $'
+  printf '%s\n' "$pane_text" > "$pane"
+  fm_write_meta "$state/working-idle-w10.meta" "window=$win" "kind=ship" "backend=tmux"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$state/working-idle-w10.status"
+  prime_status_seen "$state" "$state/working-idle-w10.status"
+  key=$(printf '%s' "working-idle-w10" | tr ':/.' '___')
+  watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
+  pane_hash=$(_hash_text "$pane_text")
+  printf '%s' "$pane_hash" > "$state/.stale-$watcher_key"
+  printf '%s' "$pane_hash" > "$state/.hash-$watcher_key"
+  printf '2\n' > "$state/.count-$watcher_key"
+  afk_enter "$state"
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$crew_bin" \
+    FM_FAKE_CREW_STATE_CALL_LOG="$call_log" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    handle_wake "stale: $win" "$state"
+  [ "$(cat "$state/.stale-$watcher_key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "an ordinary working verdict discarded the watcher stale suppressor"
+  [ -e "$state/.subsuper-stale-$key" ] \
+    || fail "an ordinary working verdict did not start daemon wedge aging"
+  calls_before=$(wc -l < "$call_log" | tr -d ' ')
+  [ "$calls_before" -gt 0 ] || fail "the initial stale wake did not consult shared crew state"
+  touch "$state/.last-heartbeat" "$state/.last-check"
+  out="$dir/watch.out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$crew_bin" \
+    FM_FAKE_CREW_STATE_CALL_LOG="$call_log" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=9999999 FM_HEARTBEAT=9999999 \
+    "$ROOT/bin/fm-watch.sh" > "$out" &
+  pid=$!
+  i=0
+  watcher_count=2
+  while [ "$i" -lt 30 ]; do
+    watcher_count=$(cat "$state/.count-$watcher_key" 2>/dev/null || echo 0)
+    case "$watcher_count" in ''|*[!0-9]*) watcher_count=0 ;; esac
+    [ "$watcher_count" -gt 2 ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then watcher_alive=1; else watcher_alive=0; fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  calls_after=$(wc -l < "$call_log" | tr -d ' ')
+  [ "$watcher_count" -gt 2 ] || fail "the unchanged watcher cycle did not run"
+  [ "$watcher_alive" = 1 ] || fail "the unchanged watcher cycle emitted another stale wake"
+  [ ! -s "$state/.wake-queue" ] || fail "the unchanged watcher cycle queued another stale wake"
+  [ "$calls_after" = "$calls_before" ] \
+    || fail "the unchanged watcher cycle repeated the bounded crew-state read"
+  [ "$(cat "$state/.stale-$watcher_key" 2>/dev/null || true)" = "$pane_hash" ] \
+    || fail "the unchanged watcher cycle lost its one-shot stale suppressor"
+  pass "ordinary working verdicts preserve one-shot stale suppression"
+}
+
 test_handle_wake_paused_signal_records_pause_marker() {
   local dir state fakebin key win
   dir=$(make_supercase handle-paused-signal)
@@ -1994,6 +2067,7 @@ test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker
 test_daemon_paused_uses_shared_state_with_inherited_marker
 test_daemon_invalidated_pause_releases_watcher_stale_suppressor
+test_daemon_working_verdict_preserves_watcher_stale_suppressor
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
 test_housekeeping_migrates_watcher_pause_marker
