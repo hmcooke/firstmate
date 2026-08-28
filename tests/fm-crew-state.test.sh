@@ -25,6 +25,11 @@
 #       This is the direct regression pair for the 2026-07-02 herdr incident,
 #       proving the watcher's own absorb-only-when-provably-working predicate
 #       benefits from the fix in both directions.
+#   (l) declared pause vs a WAITING run-step: a crew that declared an external
+#       wait while the run MONITORS ci, including after checks-green or no-CI
+#       readiness, reports paused (run-step+status-log) and classes `paused` for
+#       the always-on watcher's absorb predicate, while running/fixing/gated/
+#       coarse phases keep the run-step's own state.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -513,6 +518,25 @@ test_ci_monitoring_no_checks_terminal_surfaces_done() {
   pass "terminal no-checks ci-monitor marker surfaces done"
 }
 
+test_ci_monitoring_no_checks_declared_pause_surfaces_ready_wait() {
+  reset_fakes
+  local d; d=$(new_case ci-nochecks-paused)
+  make_repo_on_branch "$d/wt" fm/feat-cinocheckspaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cinocheckspaused.meta" "window=fm:fm-feat-cinocheckspaused" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\npaused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cinocheckspaused.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cinocheckspaused)"
+  FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
+  local out; out=$(run_crew_state "$d" feat-cinocheckspaused)
+  assert_contains "$out" "state: paused" "declared no-CI merge wait must read as paused"
+  assert_contains "$out" "source: run-step+status-log" "declared no-CI merge wait names both sources"
+  assert_contains "$out" "waiting on the captain to merge PR 1" "declared no-CI merge wait keeps its reason"
+  assert_contains "$out" "checks green" "declared no-CI merge wait keeps checks-ready detail"
+  assert_contains "$out" "PR ready for review" "declared no-CI merge wait keeps review readiness"
+  assert_contains "$out" "https://github.com/o/r/pull/2" "declared no-CI merge wait keeps the recorded PR"
+  pass "a declared no-CI merge wait preserves ready-for-review facts"
+}
+
 test_ci_monitoring_green_then_rearm_stays_working() {
   reset_fakes
   local d; d=$(new_case ci-green-then-rearm)
@@ -587,6 +611,27 @@ EOF
   pass "a fresh issue after an earlier green reading is not masked"
 }
 
+test_ci_monitoring_repair_declared_pause_stays_working() {
+  reset_fakes
+  local d; d=$(new_case ci-repair-paused)
+  make_repo_on_branch "$d/wt" fm/feat-cirepairpaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cirepairpaused.meta" "window=fm:fm-feat-cirepairpaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cirepairpaused.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cirepairpaused)"
+  FM_FAKE_CI_LOGS=$(cat <<'EOF'
+all CI checks passed - still monitoring until merged or closed
+base branch advanced (aaaaaaa..bbbbbbb), re-arming CI monitor timeout
+issues detected: merge conflict - auto-fixing (attempt 2/10)...
+EOF
+)
+  local out; out=$(run_crew_state "$d" feat-cirepairpaused)
+  assert_contains "$out" "state: working" "active CI repair must outrank a declared pause"
+  assert_contains "$out" "source: run-step" "active CI repair remains run-step sourced"
+  assert_not_contains "$out" "state: paused" "active CI repair must not read as a declared wait"
+  pass "active CI repair outranks a declared pause"
+}
+
 test_ci_ready_done_log_relapse_stays_working() {
   reset_fakes
   local d; d=$(new_case ci-ready-then-relapse)
@@ -655,6 +700,134 @@ test_top_level_fixing_done_log_stays_working() {
   assert_contains "$out" "validating (fixing)" "top-level fixing keeps fixing detail"
   assert_not_contains "$out" "state: done" "top-level fixing must not read as stale checks-green done"
   pass "top-level fixing is not overridden by a stale done log"
+}
+
+# --- declared pause vs a WAITING run-step -----------------------------------
+# The live 2026-08-27/28 case: a ship crew on a repo whose PR is left for the
+# captain to merge reached the pipeline's CI monitor phase, where the run sits
+# `running` until the PR is merged or closed. The crew declared its own external
+# wait ("paused: waiting on the captain to merge PR 1") and idled. The run-step
+# was authoritative unconditionally, so this read `working` and the watcher's
+# shared absorb class wedge-escalated the idle pane every few minutes for hours.
+# While the pipeline is only MONITORING, the crew has nothing to drive, so its
+# declared wait is the more specific truth and must win.
+# The control for this pair is test_ci_monitoring_still_waiting_stays_working
+# above: the same monitoring fixture with NO pause line stays working.
+test_ci_monitoring_declared_pause_is_honoured() {
+  reset_fakes
+  local d; d=$(new_case ci-monitor-paused)
+  make_repo_on_branch "$d/wt" fm/feat-cipaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cipaused.meta" "window=fm:fm-feat-cipaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cipaused.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cipaused)"
+  FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
+  local out; out=$(run_crew_state "$d" feat-cipaused)
+  assert_contains "$out" "state: paused" "a declared wait during CI monitoring must read as paused"
+  assert_contains "$out" "source: run-step+status-log" "the paused verdict names both sources it used"
+  assert_contains "$out" "waiting on the captain to merge PR 1" "the declared wait keeps its reason"
+  assert_not_contains "$out" "state: working" "a declared wait must not read as active work"
+  pass "a declared pause outranks a run-step that is only monitoring CI"
+}
+
+test_ci_monitoring_unavailable_log_declared_pause_stays_working() {
+  reset_fakes
+  local d; d=$(new_case ci-monitor-paused-unavailable-log)
+  make_repo_on_branch "$d/wt" fm/feat-cipausedunknown
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cipausedunknown.meta" "window=fm:fm-feat-cipausedunknown" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cipausedunknown.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cipausedunknown)"
+  FM_FAKE_CI_LOGS=""
+  local out; out=$(run_crew_state "$d" feat-cipausedunknown)
+  assert_contains "$out" "state: working" "an unavailable CI log must keep the run-step authoritative"
+  assert_contains "$out" "source: run-step" "an unavailable CI log remains run-step sourced"
+  assert_contains "$out" "validating (running)" "an unavailable CI log keeps active-run detail"
+  assert_not_contains "$out" "state: paused" "an unavailable CI log cannot prove a declared wait"
+  pass "an unavailable CI log cannot hide an active run"
+}
+
+# The same declared wait during CI monitoring is what the always-on watcher's
+# absorb predicate must see: crew_absorb_class classes it `paused`, so that path
+# uses the bounded re-surface cadence instead of the wedge timer. The away-mode
+# daemon deliberately retains its pre-existing direct status_is_paused
+# classification. Exercised over the REAL helper, not a canned fm-crew-state
+# verdict, so the reader and the watcher predicate cannot drift apart.
+test_ci_monitoring_declared_pause_absorb_class() {
+  reset_fakes
+  local d; d=$(new_case ci-monitor-paused-absorb)
+  make_repo_on_branch "$d/wt" fm/feat-cipausedabsorb
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cipausedabsorb.meta" \
+    "window=fm:fm-feat-cipausedabsorb" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cipausedabsorb.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cipausedabsorb)"
+  FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
+  local class
+  class=$(PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" \
+    crew_absorb_class feat-cipausedabsorb)
+  [ "$class" = paused ] || fail "declared wait during CI monitoring classed '$class', not paused"
+  if PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" \
+    crew_is_provably_working feat-cipausedabsorb; then
+    fail "a declared wait during CI monitoring was treated as provably working"
+  fi
+  pass "crew_absorb_class classes a declared wait during CI monitoring as paused"
+}
+
+# A pause the crew declared while the pipeline is genuinely mid-step is NOT an
+# external wait: the crew is supposed to be driving that work (a running or
+# fixing step, a gate awaiting its response), so the run-step stays
+# authoritative. Only a provable waiting phase may be outranked - a coarse
+# runs-list verdict exposes no phase at all and therefore never qualifies.
+test_declared_pause_does_not_outrank_active_run_steps() {
+  reset_fakes
+  local d out short
+  d=$(new_case active-run-paused)
+  make_repo_on_branch "$d/wt" fm/feat-activepaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-activepaused.meta" "window=fm:fm-feat-activepaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-activepaused.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-activepaused)"
+  out=$(run_crew_state "$d" feat-activepaused)
+  assert_contains "$out" "state: working" "a running review step stays working despite a declared pause"
+  assert_contains "$out" "source: run-step" "an active run-step stays run-step sourced"
+  assert_not_contains "$out" "state: paused" "a crew cannot declare itself paused out of an active step"
+
+  reset_fakes
+  d=$(new_case ci-fixing-paused)
+  make_repo_on_branch "$d/wt" fm/feat-cifixpaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cifixpaused.meta" "window=fm:fm-feat-cifixpaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cifixpaused.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_fixing fm/feat-cifixpaused)"
+  out=$(run_crew_state "$d" feat-cifixpaused)
+  assert_contains "$out" "state: working" "a fixing ci step stays working despite a declared pause"
+  assert_not_contains "$out" "state: paused" "a fixing step is work to drive, not an external wait"
+
+  reset_fakes
+  d=$(new_case parked-paused)
+  make_repo_on_branch "$d/wt" fm/feat-parkedpaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-parkedpaused.meta" "window=fm:fm-feat-parkedpaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-parkedpaused.status"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-parkedpaused)"
+  out=$(run_crew_state "$d" feat-parkedpaused)
+  assert_contains "$out" "state: parked" "a gate the crew must answer stays parked despite a declared pause"
+  assert_not_contains "$out" "state: paused" "a live gate must never be hidden behind a declared pause"
+
+  reset_fakes
+  d=$(new_case coarse-paused)
+  make_repo_on_branch "$d/wt" fm/feat-coarsepaused
+  short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-coarsepaused.meta" "window=fm:fm-feat-coarsepaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-coarsepaused.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="  running    fm/feat-coarsepaused ${short}  2026-08-27 22:05"
+  out=$(run_crew_state "$d" feat-coarsepaused)
+  assert_contains "$out" "state: working" "a coarse run exposes no phase, so it stays working"
+  assert_not_contains "$out" "state: paused" "an unprovable phase must never be treated as a waiting one"
+  pass "a declared pause never outranks an active, gated, or unproven run-step phase"
 }
 
 # (d) terminal run-step is authoritative
@@ -956,9 +1129,9 @@ test_no_run_idle_pane_uses_keyed_log() {
   pass "no run + idle pane parses keyed status syntax"
 }
 
-# (g') no run + idle pane on a DECLARED external-wait pause -> state: paused, so a
-# supervisor reading the crew sees a distinct pause (and its reason) rather than a
-# wedge-suspect idle. This is the reader half the watcher/daemon build on.
+# (g') no run + idle pane on a DECLARED external-wait pause -> state: paused, so
+# the always-on watcher sees a distinct pause (and its reason) rather than a
+# wedge-suspect idle. The away-mode daemon reads the raw status line directly.
 test_no_run_idle_pane_paused() {
   reset_fakes
   local d; d=$(new_case paused)
@@ -1418,14 +1591,20 @@ test_ci_ready_done_log_beats_monitoring_run
 test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
 test_ci_monitoring_no_checks_terminal_surfaces_done
+test_ci_monitoring_no_checks_declared_pause_surfaces_ready_wait
 test_ci_monitoring_green_then_rearm_stays_working
 test_ci_monitoring_no_checks_yet_stays_working
 test_ci_monitoring_still_waiting_stays_working
 test_ci_monitoring_green_then_new_issue_stays_working
+test_ci_monitoring_repair_declared_pause_stays_working
 test_ci_ready_done_log_relapse_stays_working
 test_ci_fixing_after_green_stays_working
 test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
+test_ci_monitoring_declared_pause_is_honoured
+test_ci_monitoring_unavailable_log_declared_pause_stays_working
+test_ci_monitoring_declared_pause_absorb_class
+test_declared_pause_does_not_outrank_active_run_steps
 test_terminal_passed
 test_terminal_failed
 test_cross_branch_attribution_via_runs_list

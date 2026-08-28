@@ -16,7 +16,11 @@
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
 # token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|remote-endpoint|none> · <detail>
+#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|run-step+status-log|pane|status-log|remote-endpoint|none> · <detail>
+#
+# `run-step+status-log` is the one verdict both sources produce together: a crew
+# that DECLARED an external wait while its run-step is in the CI monitor phase,
+# including after checks-green or no-CI readiness is visible (step 3 below).
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta. A meta
@@ -41,11 +45,24 @@
 #      the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
-#      green, so a green PR is never silently read as still-validating.
-#   3. Reconcile the status log: if its last line says needs-decision/blocked but
-#      the run-step shows the run moved on, the log is deterministically stale and
-#      is flagged superseded. A genuinely parked run plus a needs-decision log
-#      agree, and are reported as parked.
+#      green, so a green PR without a declared wait is never silently read as
+#      still-validating.
+#   3. Reconcile the status log against that run. A DECLARED external wait
+#      (`paused: <reason>`) outranks the run-step ONLY while the run is merely
+#      waiting - the ci monitor phase, which holds the PR open until it is merged
+#      or closed, including the checks-green and no-CI readiness promotion,
+#      when its latest recognized CI marker affirmatively reports waiting or
+#      ready - and is then reported as paused · run-step+status-log with the
+#      declared reason and readiness facts, so the always-on watcher does not
+#      escalate an idle pane waiting on a captain's merge as a possible wedge. An
+#      unreadable or unrecognized CI log, active repair, a running or fixing
+#      step, a gate awaiting the crew's response, and a coarse runs-list verdict
+#      with no visible phase all keep the run-step's own state: a crew cannot
+#      declare itself paused out of work it must drive.
+#      Separately, if the log's last line says needs-decision/blocked but the
+#      run-step shows the run moved on, the log is deterministically stale and is
+#      flagged superseded. A genuinely parked run plus a needs-decision log agree,
+#      and are reported as parked.
 #   4. No run for this crew (pre-validation, or kind=scout): fall back to the
 #      recorded backend's pane busy state, then the status log's last line only
 #      when its verb maps to a recognized run-state. Decision-only events such as
@@ -337,7 +354,9 @@ nm_effective_ci_step_status() {
 # actual PR #252 run). Reads the ci step's log tail via `axi logs` and scans it
 # for the MOST RECENT recognized marker (the log is append-only/chronological,
 # so the last match is current): green with nothing red after it means CI is
-# green right now, still only waiting on merge/close.
+# green right now, a failure or issue marker means active repair, a pending-check
+# marker means the run is waiting on CI, and missing or unrecognized evidence is
+# unknown.
 nm_ci_checks_state() {
   local run_id log_tail marker
   run_id=$(strip_quotes "$(nm_field id)")
@@ -349,7 +368,8 @@ nm_ci_checks_state() {
     | tail -1)
   case "$marker" in
     *"checks passed"*|*"no CI checks reported - still monitoring"*) printf 'green' ;;
-    *"no CI checks reported yet"*|*"checks failed"*|*"issues detected"*|*"CI checks running"*|*"base branch advanced"*"re-arming CI monitor timeout"*) printf 'not-ready' ;;
+    *"checks failed"*|*"issues detected"*) printf 'repairing' ;;
+    *"no CI checks reported yet"*|*"CI checks running"*|*"base branch advanced"*"re-arming CI monitor timeout"*) printf 'not-ready' ;;
     *) printf 'unknown' ;;
   esac
 }
@@ -557,9 +577,44 @@ if [ "$HAVE_RUN" = 1 ]; then
     elif [ "$CI_STEP_STATUS" = fixing ]; then
       CI_LOG_STATE=not-ready
     fi
-    if [ "$CI_LOG_STATE" != not-ready ]; then
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
-    fi
+    case "$CI_LOG_STATE" in
+      not-ready|repairing) ;;
+      *) emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR" ;;
+    esac
+  fi
+
+  # A DECLARED external wait outranks a run-step that is only WAITING. While the
+  # pipeline sits in its CI monitor phase it holds the PR open until that PR is
+  # merged or closed, so the crew has nothing left to drive and its own
+  # `paused: <reason>` line is the more specific account of why the pane is idle.
+  # Reporting that as working made the always-on watcher's absorb class
+  # (fm-classify-lib.sh's crew_absorb_class) treat a captain-owned merge wait as a
+  # possible wedge and escalate it every wedge window for hours. The away-mode
+  # daemon deliberately retains its pre-existing direct status_is_paused
+  # classification and does not consume this verdict.
+  # The run-step stays authoritative everywhere else, because a crew cannot
+  # declare itself paused out of work it is supposed to be driving: a running or
+  # fixing step, a gate awaiting its response, and a coarse runs-list verdict that
+  # exposes no phase at all each keep their own state. CI_STEP_STATUS=running is
+  # a provable waiting phase only when the latest CI log marker affirmatively
+  # reports not-ready or green. An unreadable or unrecognized log keeps the run
+  # authoritative. A checks-green or no-CI marker promotes RUN_STATE to done for
+  # current-state readiness, but the CI phase remains the same external monitor.
+  # The worker's terminal `done: PR <url> checks green` line remains the
+  # captain-facing ready signal, while this paused detail retains the run's
+  # readiness facts and recorded PR for readers of the current-state line.
+  if [ "$CI_STEP_STATUS" = running ] && status_is_paused "$LOG_LINE"; then
+    case "$CI_LOG_STATE" in
+      not-ready|green)
+        PAUSE_DETAIL="$(status_line_note "$LOG_LINE")${SEP}run monitoring CI until merged or closed"
+        if [ "$CI_LOG_STATE" = green ]; then
+          PAUSE_DETAIL="$PAUSE_DETAIL${SEP}$RUN_DETAIL"
+          RUN_PR=$(strip_quotes "$(nm_field pr)")
+          [ -n "$RUN_PR" ] && PAUSE_DETAIL="$PAUSE_DETAIL${SEP}PR $RUN_PR"
+        fi
+        emit paused run-step+status-log "$PAUSE_DETAIL"
+        ;;
+    esac
   fi
 
   # Reconcile the status log. A needs-decision/blocked log line that the run-step
