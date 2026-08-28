@@ -1284,6 +1284,10 @@ inject_msg() {  # <message> [state]
   # re-export of fm_tmux_submit_core - byte-identical to calling it directly.
   retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
+  # Reaching an affirmatively empty composer ends any previous unsent episode:
+  # whatever was stuck is gone, so a fresh digest starts with a full recovery
+  # budget rather than inheriting an exhausted one.
+  rm -f "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
   verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
   if [ "$verdict" = empty ]; then
     # Delivered: no unsent text of ours remains, so drop any recovery state a

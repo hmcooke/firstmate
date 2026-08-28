@@ -1298,6 +1298,25 @@ test_own_unsent_recovery_is_bounded_and_still_alarms() {
   pass "own-unsent recovery is bounded per digest and the max-defer wedge alarm still fires"
 }
 
+test_recovery_budget_resets_when_a_fresh_digest_is_typed() {
+  local dir state fakebin sent
+  dir=$(make_bordered_case own-unsent-budget-reset)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
+  # An earlier episode exhausted its recovery budget.
+  printf '9\n' > "$state/.subsuper-inject-recover-attempts"
+  escalate_add "$state" "done: PR https://x/y/pull/9"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_INJECT_RECOVER_ATTEMPTS=2 FM_ESCALATE_BATCH_SECS=0 \
+    FM_INJECT_CONFIRM_SLEEP=0.05 escalate_flush "$state" \
+    || fail "an empty composer should still deliver normally"
+  [ ! -e "$state/.subsuper-inject-recover-attempts" ] \
+    || fail "an exhausted recovery budget survived a delivery into an empty composer"
+  pass "reaching an empty composer ends the unsent episode and restores the recovery budget"
+}
+
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
   local dir state fakebin sent last
   dir=$(make_bordered_case own-unsent-grown-buffer)
@@ -2116,6 +2135,7 @@ test_own_unsent_recovery_after_swallowed_enter_clears_buffer
 test_pending_human_draft_is_never_recovered
 test_own_unsent_recovery_is_bounded_and_still_alarms
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items
+test_recovery_budget_resets_when_a_fresh_digest_is_typed
 test_watcher_collision_is_silent_below_the_bound
 test_persistent_watcher_collision_escalates_once
 test_watcher_collision_episode_clears_on_a_real_wake
