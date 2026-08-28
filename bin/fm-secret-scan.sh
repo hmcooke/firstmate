@@ -7,8 +7,10 @@
 #   0  clean       - the caller may proceed
 #   1  refused     - the caller MUST NOT proceed; one line naming the detection
 #                    class is printed to stdout, and never the matched value
-#   2  usage error - unreadable input or bad arguments; the caller must treat
-#                    this as a refusal too, because nothing was scanned
+#   2  not scanned  - unreadable input, bad arguments, or a check that could not
+#                    run; the caller must treat this as a refusal too, because
+#                    nothing was proven clean. The scanner FAILS CLOSED: a grep
+#                    that is missing or errors is never read as "no match".
 #
 # It REFUSES; it never redacts. A redacted secret is still a secret that reached
 # the pipeline, so the only safe outcome is that the content is not sent, not
@@ -53,7 +55,8 @@ usage() {
 [ "$#" -eq 1 ] || usage
 
 TMP=
-trap '[ -z "$TMP" ] || rm -f -- "$TMP"' EXIT HUP INT TERM
+EXTRACT=
+trap '[ -z "$TMP" ] || rm -f -- "$TMP"; [ -z "$EXTRACT" ] || rm -f -- "$EXTRACT"' EXIT HUP INT TERM
 
 case "$1" in
   --stdin)
@@ -81,10 +84,23 @@ refuse() {
   exit 1
 }
 
+# A check that could not run proves nothing, so it is reported as "not scanned"
+# rather than passed. grep exits 1 for no match and 2 (or anything else, such as
+# 127 when it is missing) for an execution error; only 0 and 1 are answers.
+not_scanned() {
+  echo "error: the scanner could not run its check" >&2
+  exit 2
+}
+
 # grep -q keeps the match out of stdout even under set -x tracing of the caller.
 # -e guards a pattern that begins with a dash; -- guards the target path.
 match() {
   grep -qE -e "$1" -- "$TARGET" 2>/dev/null
+  case "$?" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) not_scanned ;;
+  esac
 }
 
 match '(^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
@@ -114,12 +130,18 @@ match 'hermes-archie-env' && refuse vault-note-name
 # while grep -E supports them on both GNU and BSD.
 match '[A-Fa-f0-9]{32,}' && refuse high-entropy
 
+EXTRACT=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-secret-scan.XXXXXX") || not_scanned
+grep -oE -e '[A-Za-z0-9_+/=-]{40,}' -- "$TARGET" > "$EXTRACT" 2>/dev/null
+case "$?" in
+  0|1) : ;;
+  *) not_scanned ;;
+esac
 while IFS= read -r token; do
   [ -n "$token" ] || continue
   case "$token" in *[a-z]*) ;; *) continue ;; esac
   case "$token" in *[A-Z]*) ;; *) continue ;; esac
   case "$token" in *[0-9]*) ;; *) continue ;; esac
   refuse high-entropy
-done < <(grep -oE -e '[A-Za-z0-9_+/=-]{40,}' -- "$TARGET" 2>/dev/null || true)
+done < "$EXTRACT"
 
 exit 0

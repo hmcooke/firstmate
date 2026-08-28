@@ -42,11 +42,17 @@ The transport needs both `gh-axi` and `gh`, which are already firstmate dependen
 Put all four settings in the home's gitignored `.env`:
 
 ```sh
-FM_LETTERBOX_REPO=owner/name          # the private channel repository
-FM_LETTERBOX_SELF=firstmate.shipyard  # this estate's identity in the card grammar
-FM_LETTERBOX_PEER=archie              # the peer estate's identity
-FM_LETTERBOX_TRANSPORT=github         # the only transport implemented in v1
+# the private channel repository
+FM_LETTERBOX_REPO=owner/name
+# this estate's identity in the card grammar
+FM_LETTERBOX_SELF=firstmate.shipyard
+# the peer estate's identity
+FM_LETTERBOX_PEER=archie
+# the only transport implemented in v1
+FM_LETTERBOX_TRANSPORT=github
 ```
+
+The `.env` parser does not strip an inline comment, so a comment belongs on its own line as above, never after a value.
 
 **Any one of them missing leaves the whole feature inert.**
 All four present but one of them invalid is a configuration fault rather than inertness: the home has opted in, so the poll says so once instead of silently ignoring it.
@@ -54,9 +60,13 @@ All four present but one of them invalid is a configuration fault rather than in
 Optional tuning:
 
 ```sh
-FM_LETTERBOX_STALE_SECS=21600            # re-surface window for a dropped obligation (default 6 h, floor 300 s)
-FM_LETTERBOX_REPLY_FETCH_MAX=5           # letters whose replies one poll cycle may fetch (default 5)
+# re-surface window for a dropped obligation (default 6 h, floor 300 s)
+FM_LETTERBOX_STALE_SECS=21600
+# letters whose replies one poll cycle may fetch (default 5)
+FM_LETTERBOX_REPLY_FETCH_MAX=5
 ```
+
+Both are read from the home `.env` by the same configuration path as the activation keys, so they reach the watcher-run poll, whose generated shim exports only `FM_HOME`.
 
 ### 4. Arm the poll
 
@@ -115,6 +125,10 @@ body: |
 ```
 ````
 
+A card id is `<sender-prefix>-<UTC compact timestamp>-<8 hex>`.
+The sender prefix is the estate's first identity segment normalised to the id alphabet: every character outside `[a-z0-9]` is dropped and the result is cut to 12 characters, so both `firstmate.shipyard` and `first-mate.shipyard` issue `firstmate-...` ids.
+The validator accepts any 1-12 character lowercase alphanumeric prefix, so the peer's ids parse unchanged.
+
 The issue **title** is generated, never authored: `[letterbox] <class> <id>`.
 The subject is a human-legibility field inside the card only and never reaches the title, which is what lets a retry find a letter by exact title match instead of using the search API.
 Keeping the search API off the poll path matters: its rate limit is far tighter than the core limit and it would be the first thing to break.
@@ -149,7 +163,8 @@ Each of these is refused at parse, on both the sending and the receiving side, r
 - A class outside the v1 allowlist.
 - A card version above `1`, refused by name and never silently downgraded.
 - Credential-shaped content in any field.
-- An absolute host path, in **every** form: a root-level path (`/etc`), a file URI (`file:///home/...`), and a label-prefixed path (`path:/Users/...`), not only a two-component path surrounded by whitespace.
+- An absolute host path, in **every** form: a root-level path (`/etc`), a file URI (`file:///home/...`), a label-prefixed path (`path:/Users/...`), and a path whose first byte is not alphanumeric (`/$HOME/secret`, `/+cache/file`, a bare `/`), not only a two-component path surrounded by whitespace.
+  Any slash that begins a path is refused, whatever follows it; a slash inside a word (`and/or`, `24/7`, `docs/letterbox`) is not a path start and stays legal.
   Cards refer to files by role.
   An http or https URL is not a host path and stays legal, as does a relative path such as `docs/letterbox`.
 - Any `decision-key`, answer-to-a-hold, approval or captain-attribution field.
@@ -161,7 +176,8 @@ Each of these is refused at parse, on both the sending and the receiving side, r
 
 A refused card is named in the wake by its fault class and its content is never stashed as an accepted letter.
 An inbound letter with a usable id is answered `unable` naming that class.
-A refused reply is named together with the sent letter it answers, and a card with no usable id is keyed `issue-<n>`; neither can be answered in correlation, so each is resolved with an ordinary `notice` letter naming the refused id and the class, and the letter stays open until a clean answer is consumed.
+A refused reply is named together with the sent letter it answers, and a card with no usable id is keyed by the forge's own stable identifiers - `issue-<n>` for an issue body, `issue-<n>-comment-<comment id>` for a reply - never by its position in a listing, which shifts when an earlier comment is deleted; neither can be answered in correlation, so each is resolved with an ordinary `notice` letter naming the refused id and the class, and the letter stays open until a clean answer is consumed.
+Every valid correlated reply is credential-scanned before anything decides whether it is terminal, so a non-terminal `ack` carrying a credential is refused and named rather than cursor-skipped.
 
 A body authored through the forge's web editor arrives with CRLF line endings; a single trailing carriage return per line is stripped as line-ending normalisation, so such a card parses to exactly the fields its LF twin does and every refusal above still fires on it.
 
@@ -183,6 +199,8 @@ Two limits, stated here and in the scanner's own header rather than discovered l
 ## The visibility precondition
 
 Immediately before **every** write, the transport verifies through the API that the channel repository is still private, and refuses the write if it is not.
+The check runs twice: once in `bin/fm-letterbox.sh` before the write is attempted, and again inside the transport adapter at its own write boundary.
+The adapter reports the class of its refusal in its exit status (2 for not private, 3 for visibility unreadable), so a repository that flips between the two checks is still recorded under the `visibility` class rather than collapsing into a generic failure.
 
 That converts "the repository was accidentally made public" from a silent, ongoing exposure into a hard stop plus an alarm.
 The refusal is recorded durably under `state/letterbox/write-error`, so the poll raises it as a wake even if the turn that hit it was lost, and it re-alarms once per `FM_LETTERBOX_STALE_SECS` window until a write lands.
@@ -244,6 +262,8 @@ Process death is safe on both sides of every boundary.
 | After the wake append, before acknowledgement | The wake is durable and re-presented on the next drain. |
 | After acknowledgement, before the reply | The obligation is an ordinary task, so it is in the session-start inventory and in the supervision predicate. |
 | After the forge close, before the consumed record | Closing is idempotent: re-running `close` closes again harmlessly and completes the record. |
+| After the peer's first terminal reply is claimed, before the winner is cached on the sent claim | The reply claim itself records the letter it answers and its status, in the one write that made it a claim, so the winner is derived from it on the next poll and by `close`; a later terminal reply can never overtake it. |
+| While a stash, outbox record or claim is being built | Generated JSON is staged and validated before it is published, so a `jq` failure never publishes an empty record that is then announced or claimed. |
 | After a refused write, before anyone notices | The refusal is durable under `state/letterbox/write-error` and the next poll raises it as a wake while reads continue. Neither class is retired by a successful read: both re-alarm once per window until a write lands. |
 | After the alarm is printed, before the watcher appends its wake | The write-error record survives, so the next window raises it again. A read never consumes the evidence, because a read proves the transport is back and proves nothing about whether the alarm was delivered. |
 | After the sent claim, before its receipt | The letter stays in the unsent set, so the next send adopts it by title and completes the receipt. The claim is written first precisely so no window leaves the obligation invisible to both reconciliation and the backstops. |

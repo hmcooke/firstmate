@@ -371,6 +371,17 @@ SH
 '
     printf 'the file is at /var/log/thing
 '
+    # shellcheck disable=SC2016 # The literal, unexpanded form is the input under test.
+    printf '/$HOME/secret
+'
+    printf '/+cache/file
+'
+    printf '/
+'
+    printf 'the root is / on every host
+'
+    printf '(/etc/hosts)
+'
   } > "$dir/refuse.txt"
   out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/refuse.txt") || fail "harness: $out"
   assert_not_contains "$out" "accepted" "every absolute host path form must be refused"$'
@@ -390,7 +401,22 @@ SH
   out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/accept.txt") || fail "harness: $out"
   assert_not_contains "$out" "REFUSED" "a URL and a relative path are not host paths"$'
 '"$out"
-  pass "root-level, file-URI and label-prefixed paths are refused; URLs and relative paths are not"
+  pass "root-level, file-URI, label-prefixed and non-alphanumeric-start paths are refused; URLs and relative paths are not"
+}
+
+test_a_hyphenated_estate_identity_generates_a_valid_id() {
+  local dir out
+  dir="$TMP_ROOT/id-prefix"; mkdir -p "$dir"
+  cat > "$dir/snippet.sh" <<'SH'
+id=$(lb_id_new) || { echo "GENERATE-FAILED"; exit 0; }
+if lb_id_valid "$id"; then printf 'valid %s\n' "${id%%-2*}"; else printf 'INVALID %s\n' "$id"; fi
+SH
+  out=$(lb_run first-mate.shipyard archie "$dir/snippet.sh") || fail "harness: $out"
+  assert_contains "$out" "valid firstmate" \
+    "a hyphenated first segment must normalise to the id alphabet and validate"$'\n'"$out"
+  out=$(lb_run a-very-long-estate-name.shipyard archie "$dir/snippet.sh") || fail "harness: $out"
+  assert_contains "$out" "valid averylongest" "the normalised prefix is cut to twelve characters"$'\n'"$out"
+  pass "a valid estate identity with hyphens generates an id its own validator accepts"
 }
 
 # ---------------------------------------------------------------------------
@@ -485,6 +511,34 @@ test_scanner_treats_its_own_failure_as_a_refusal() {
   out=$("$SCAN" 2>&1); rc=$?
   expect_code 2 "$rc" "no argument must be a usage error"
   pass "an unscannable input exits non-zero, so a caller can never read it as clean"
+}
+
+test_scanner_fails_closed_when_grep_cannot_run() {
+  local dir out rc
+  dir="$TMP_ROOT/scan-grep"; mkdir -p "$dir/bin"
+  printf 'ordinary content\n' > "$dir/plain.txt"
+  # A grep that reports an execution error, as a missing or broken grep would.
+  printf '#!/usr/bin/env bash\nexit 2\n' > "$dir/bin/grep"
+  chmod +x "$dir/bin/grep"
+  out=$(PATH="$dir/bin:$PATH" "$SCAN" "$dir/plain.txt" 2>&1); rc=$?
+  expect_code 2 "$rc" "a grep execution error must be reported as not scanned, never as clean"
+  assert_contains "$out" "could not run" "the caller must be told the check did not run"
+  # A grep that dies only on the final extractor, which used to discard its status.
+  cat > "$dir/bin/grep" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" -oE "*) exit 2 ;; esac
+exec /usr/bin/grep "$@"
+SH
+  [ -x /usr/bin/grep ] || sed -i.bak 's#/usr/bin/grep#'"$(command -v grep)"'#' "$dir/bin/grep"
+  out=$(PATH="$dir/bin:$PATH" "$SCAN" "$dir/plain.txt" 2>&1); rc=$?
+  expect_code 2 "$rc" "an extractor failure must be reported as not scanned"
+  cat > "$dir/snippet.sh" <<'SH'
+if lb_scan_refuses "$1"; then echo "REFUSED ${LB_SCAN_REASON}"; else echo CLEAN; fi
+SH
+  out=$(PATH="$dir/bin:$PATH" lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/plain.txt") \
+    || fail "scan gate harness must run: $out"
+  assert_contains "$out" "REFUSED scanner-unavailable" "the gate must refuse when a check could not run"
+  pass "the scanner fails closed: a grep error is a refusal, never a pass"
 }
 
 test_scanner_gate_refuses_when_the_scanner_cannot_run() {
@@ -588,7 +642,9 @@ test_class_allowlist_is_exactly_v1
 test_a_document_with_no_card_is_ignored_not_refused
 test_unknown_or_missing_kind_is_a_named_refusal
 test_every_absolute_host_path_form_is_refused
+test_a_hyphenated_estate_identity_generates_a_valid_id
 test_scanner_negative_controls
+test_scanner_fails_closed_when_grep_cannot_run
 test_scanner_refusal_never_echoes_the_value
 test_scanner_honesty_control_n7_records_the_measured_limit
 test_scanner_positive_control_passes_ordinary_prose

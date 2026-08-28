@@ -21,6 +21,11 @@
 #   comment <number> --body-file <f>   post one reply; print the comment URL (gh-axi)
 #   close <number>                     close one letter (gh-axi)
 #
+# Every write verb exits 2 when its own visibility gate finds the repository
+# NOT private and 3 when that gate could not read the visibility at all, so the
+# caller can record the refusal under its class (visibility or transport)
+# without re-deriving it from prose. Any other failure exits 1.
+#
 # The channel repository is FM_LETTERBOX_REPO, revalidated here rather than
 # trusted, so a doctored setting cannot redirect a write at another repository.
 # Authentication is firstmate's existing GitHub credential; this adapter
@@ -115,13 +120,25 @@ find_title_number() {
 }
 
 # A write refused for visibility must never be retried past the refusal, so
-# every write verb funnels through this one gate.
+# every write verb funnels through this one gate. Its exit status carries the
+# class: the caller checked visibility moments earlier, and a repository that
+# flipped between that check and this one must still land as a durable
+# visibility refusal rather than a generic failure.
 gate_write() {
-  local reason
-  reason=$(require_private) || {
-    printf '%s\n' "letterbox transport: refusing to write, $reason" >&2
-    exit 1
-  }
+  local reason rc
+  reason=$(require_private); rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  printf '%s\n' "letterbox transport: refusing to write, $reason" >&2
+  case "$rc" in
+    2) exit 2 ;;
+    *) exit 3 ;;
+  esac
+}
+
+# A flag that takes a value must have one; otherwise "$2" is empty, "shift 2"
+# fails without terminating the script, and the parser loops forever.
+need_value() {
+  [ "$#" -ge 2 ] || die "letterbox transport: $1 needs a value"
 }
 
 VERB=${1-}
@@ -171,9 +188,9 @@ case "$VERB" in
     TITLE=; BODY_FILE=; LABEL=
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --title) TITLE=${2-}; shift 2 ;;
-        --body-file) BODY_FILE=${2-}; shift 2 ;;
-        --label) LABEL=${2-}; shift 2 ;;
+        --title) need_value "$@"; TITLE=$2; shift 2 ;;
+        --body-file) need_value "$@"; BODY_FILE=$2; shift 2 ;;
+        --label) need_value "$@"; LABEL=$2; shift 2 ;;
         *) die "letterbox transport: unknown create flag $1" ;;
       esac
     done
@@ -211,7 +228,7 @@ case "$VERB" in
     BODY_FILE=
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --body-file) BODY_FILE=${2-}; shift 2 ;;
+        --body-file) need_value "$@"; BODY_FILE=$2; shift 2 ;;
         *) die "letterbox transport: unknown comment flag $1" ;;
       esac
     done

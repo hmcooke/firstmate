@@ -80,7 +80,9 @@ LB_SCRIPT_DIR=$SCRIPT_DIR
 
 lb_load_config
 # Hard no-op when the letterbox is off: this is what keeps the check shim inert.
-[ -n "$LB_REPO$LB_SELF$LB_PEER$LB_TRANSPORT" ] || exit 0
+# The gate is LB_ACTIVE (all four keys present and valid) or a configuration
+# fault in a home that has fully opted in; a partial configuration is neither,
+# so it creates no state and makes no transport call.
 [ "$LB_ACTIVE" = 1 ] || [ -n "$LB_CONFIG_ERROR" ] || exit 0
 
 ROOT=$(lb_root "$STATE")
@@ -208,8 +210,14 @@ PENDING_RESURFACE=
 PENDING_FIRST_REPLY=
 PENDING_CURSOR=
 
+# Queued records are joined with a unit separator rather than a tab: a tab is
+# IFS whitespace, so an EMPTY field (a clean reply has no refusal) would be
+# collapsed by read and every later column would shift.
+SEP=$(printf '\037')
+
+# queue_claim <id> <class> <from> <issue> <refusal> [in-reply-to] [status]
 queue_claim() {
-  PENDING_CLAIMS="$PENDING_CLAIMS$1	$2	$3	$4	$5
+  PENDING_CLAIMS="$PENDING_CLAIMS$1$SEP$2$SEP$3$SEP$4$SEP$5$SEP${6-}$SEP${7-}
 "
 }
 
@@ -219,16 +227,20 @@ queue_resurface() {
 }
 
 queue_first_reply() {
-  PENDING_FIRST_REPLY="$PENDING_FIRST_REPLY$1	$2	$3
+  PENDING_FIRST_REPLY="$PENDING_FIRST_REPLY$1$SEP$2$SEP$3
 "
 }
 
 flush_suppressions() {
-  local cid cclass cfrom cissue crefusal
+  local cid cclass cfrom cissue crefusal ccorrelate cstatus
   [ -z "$PENDING_ERROR" ] || mark_error_raised "$PENDING_ERROR"
-  while IFS="	" read -r cid cclass cfrom cissue crefusal; do
+  # A reply claim carries the letter it answers and its status in the same
+  # O_EXCL write, so the first-terminal-reply winner is durable from this one
+  # step: the first_reply cache written below may be lost to a crash and is
+  # recovered from the claim by lb_first_reply.
+  while IFS="$SEP" read -r cid cclass cfrom cissue crefusal ccorrelate cstatus; do
     [ -n "$cid" ] || continue
-    lb_claim_create "$STATE" "$cid" "$cclass" "$cfrom" "$cissue" "$crefusal" >/dev/null 2>&1
+    lb_claim_create "$STATE" "$cid" "$cclass" "$cfrom" "$cissue" "$crefusal" "$ccorrelate" "$cstatus" >/dev/null 2>&1
     case "$?" in
       1) [ -z "$crefusal" ] || lb_claim_set "$STATE" "$cid" refusal "$crefusal" >/dev/null 2>&1 || true ;;
     esac
@@ -242,7 +254,7 @@ EOF
 $PENDING_RESURFACE
 EOF
   local sid rid rstatus
-  while IFS="	" read -r sid rid rstatus; do
+  while IFS="$SEP" read -r sid rid rstatus; do
     [ -n "$sid" ] && [ -n "$rid" ] && [ -n "$rstatus" ] || continue
     lb_claim_set "$STATE" "$sid" first_reply_status "$rstatus" >/dev/null 2>&1 || true
     lb_claim_set "$STATE" "$sid" first_reply "$rid" >/dev/null 2>&1 || true
@@ -307,16 +319,18 @@ while [ "$i" -lt "$COUNT" ]; do
   fi
 
   # Stash, announce, then claim. A crash anywhere before the claim costs one
-  # repeated stash and one repeated announcement, and never a lost letter.
-  if ! jq -n --arg id "$ID" --arg kind request --arg class "$LB_F_CLASS" \
+  # repeated stash and one repeated announcement, and never a lost letter. The
+  # stash is staged and validated before it is published, so a jq failure can
+  # never publish an empty card that is then announced and claimed for good.
+  # shellcheck disable=SC2016 # A jq filter, expanded by jq.
+  if ! lb_json_publish "$INBOX" "$ID.json" --arg id "$ID" --arg kind request --arg class "$LB_F_CLASS" \
     --arg from "$LB_F_FROM" --arg to "$LB_F_TO" --arg subject "$LB_F_SUBJECT" \
     --arg issued "$LB_F_ISSUED" --arg expires "$LB_F_EXPIRES" \
     --arg expired "$LB_F_EXPIRED" --arg body "$LB_F_BODY" \
     --argjson issue "$NUMBER" --argjson seen "$(date -u +%s)" \
     '{id:$id,kind:$kind,class:$class,from:$from,to:$to,subject:$subject,
       issued:$issued,expires:$expires,expired:($expired=="true"),body:$body,
-      issue:$issue,seen:$seen}' 2>/dev/null \
-    | fmx_private_artifact_publish_stdin "$INBOX" "$ID.json" 600; then
+      issue:$issue,seen:$seen}'; then
     emit_error_once "cannot write the letterbox inbox"
     exit 0
   fi
@@ -351,8 +365,7 @@ else
 fi
 
 FETCHES=0
-FETCH_MAX=${FM_LETTERBOX_REPLY_FETCH_MAX:-5}
-case "$FETCH_MAX" in ''|*[!0-9]*) FETCH_MAX=5 ;; esac
+FETCH_MAX=$LB_REPLY_FETCH_MAX
 
 for receipt in "$SENT"/*.receipt; do
   [ -e "$receipt" ] || continue
@@ -387,64 +400,85 @@ for receipt in "$SENT"/*.receipt; do
   # requester must pick one deterministic answer rather than stashing every one
   # and leaving the handling turn with two conflicting answers. Comments arrive
   # oldest first, so the first terminal reply in this scan is the winner, and
-  # once one is recorded on the sent claim no later reply is ever consumed.
-  FIRST_REPLY=$(lb_claim_field "$STATE" "$SENT_ID" first_reply)
+  # once one is recorded no later reply is ever stashed or consumed. The winner
+  # is recovered from its own reply claim (lb_first_reply), so a crash between
+  # that claim and the first_reply cache on the sent claim cannot hide it.
+  FIRST_REPLY=$(lb_first_reply "$STATE" "$SENT_ID") || FIRST_REPLY=
+  if [ -n "$FIRST_REPLY" ] && [ -z "$(lb_claim_field "$STATE" "$SENT_ID" first_reply)" ]; then
+    queue_first_reply "$SENT_ID" "${FIRST_REPLY%% *}" "${FIRST_REPLY#* }"
+  fi
+  FIRST_REPLY=${FIRST_REPLY%% *}
   COMMENTS_COMPLETE=1
   j=0
   while [ "$j" -lt "$CN" ]; do
-    [ -z "$FIRST_REPLY" ] || break
     if [ "$ITEMS" -ge "$WAKE_ITEM_MAX" ]; then
       COMMENTS_COMPLETE=0
       break
     fi
     CRAW="$WORK/comment.$SENT_NUMBER.$j"
     jq -r --argjson j "$j" '.[$j].body' "$COMMENTS" > "$CRAW" 2>/dev/null || { j=$((j + 1)); continue; }
+    # The forge's own comment id is the only stable key for a comment whose card
+    # id is unusable: an array index shifts when an earlier comment is deleted,
+    # so a new malformed reply could inherit an old claim and be buried.
+    COMMENT_ID=$(jq -r --argjson j "$j" '.[$j].id // ""' "$COMMENTS" 2>/dev/null)
+    case "$COMMENT_ID" in ''|*[!0-9]*) COMMENT_ID= ;; esac
     lb_card_parse "$CRAW"
     CRC=$?
     if [ "$CRC" -eq 1 ]; then
       # A reply refused at parse gets the SAME refusal item, refusal claim and
       # notice/backstop path as a scanner refusal. Without this the reason was
-      # announced nowhere and the cursor then advanced past it forever.
+      # announced nowhere and the cursor then advanced past it forever. With no
+      # usable card id and no forge comment id there is nothing stable to claim
+      # under, so it is announced every cycle rather than suppressed.
       CKEY=$LB_F_ID
-      lb_id_valid "$CKEY" || CKEY="issue-$SENT_NUMBER-c$j"
-      if ! lb_claim_exists "$STATE" "$CKEY"; then
+      if ! lb_id_valid "$CKEY"; then
+        CKEY=
+        [ -z "$COMMENT_ID" ] || CKEY="issue-$SENT_NUMBER-comment-$COMMENT_ID"
+      fi
+      if [ -z "$CKEY" ]; then
+        announce "refused issue-$SENT_NUMBER $LB_REFUSAL for $SENT_ID"
+      elif ! lb_claim_exists "$STATE" "$CKEY"; then
         announce "refused $CKEY $LB_REFUSAL for $SENT_ID"
-        queue_claim "$CKEY" reply "$LB_PEER" "$SENT_NUMBER" "$LB_REFUSAL"
+        queue_claim "$CKEY" reply "$LB_PEER" "$SENT_NUMBER" "$LB_REFUSAL" "$SENT_ID" "$LB_F_STATUS"
       fi
       j=$((j + 1)); continue
     fi
     if [ "$CRC" -eq 0 ] && [ "$LB_F_KIND" = reply ] && [ "$LB_F_IN_REPLY_TO" = "$SENT_ID" ]; then
+      # Every claim key below is the reply's own id, so one existing claim -
+      # stashed or refused - settles it for good.
+      if lb_claim_exists "$STATE" "$LB_F_ID"; then j=$((j + 1)); continue; fi
       # A status the sent letter's class cannot carry is a protocol fault, named
       # like any other refusal rather than silently consumed as an answer.
       if ! lb_status_allowed_for_class "$LB_F_STATUS" "$SENT_CLASS"; then
-        if ! lb_claim_exists "$STATE" "$LB_F_ID"; then
-          announce "refused $LB_F_ID status-not-valid-for-class for $SENT_ID"
-          queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" status-not-valid-for-class
-        fi
+        announce "refused $LB_F_ID status-not-valid-for-class for $SENT_ID"
+        queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" status-not-valid-for-class "$SENT_ID" "$LB_F_STATUS"
         j=$((j + 1)); continue
       fi
-      if lb_status_terminal "$LB_F_STATUS" "$SENT_CLASS" \
-        && ! lb_claim_consumed "$STATE" "$SENT_ID" "$LB_F_ID" \
-        && ! lb_claim_exists "$STATE" "$LB_F_ID"; then
-        if ! lb_scan_refuses "$CRAW"; then
-          if jq -n --arg id "$LB_F_ID" --arg kind reply --arg correlate "$SENT_ID" \
-            --arg from "$LB_F_FROM" --arg status "$LB_F_STATUS" \
-            --arg issued "$LB_F_ISSUED" --arg body "$LB_F_BODY" \
-            --argjson issue "$SENT_NUMBER" --argjson seen "$(date -u +%s)" \
-            '{id:$id,kind:$kind,"in-reply-to":$correlate,from:$from,status:$status,
-              issued:$issued,body:$body,issue:$issue,seen:$seen}' 2>/dev/null \
-            | fmx_private_artifact_publish_stdin "$INBOX" "$LB_F_ID.json" 600; then
-            announce "reply $SENT_ID $LB_F_STATUS"
-            queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" ""
-            queue_first_reply "$SENT_ID" "$LB_F_ID" "$LB_F_STATUS"
-            FIRST_REPLY=$LB_F_ID
-          fi
-        else
-          # The wake names the SENT letter too: a refused reply cannot be
-          # answered in correlation, so the letter it answers is what the
-          # requester acts on, and the sent-letter backstop keeps raising it.
-          announce "refused $LB_F_ID $LB_SCAN_REASON for $SENT_ID"
-          queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" "$LB_SCAN_REASON"
+      # Credential refusal runs on EVERY valid correlated reply, before anything
+      # decides whether it is terminal: a legal non-terminal ack is content the
+      # peer transmitted to this estate and is refused on the same terms, or
+      # the cursor would carry it past the one gate silently.
+      if lb_scan_refuses "$CRAW"; then
+        # The wake names the SENT letter too: a refused reply cannot be
+        # answered in correlation, so the letter it answers is what the
+        # requester acts on, and the sent-letter backstop keeps raising it.
+        announce "refused $LB_F_ID $LB_SCAN_REASON for $SENT_ID"
+        queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" "$LB_SCAN_REASON" "$SENT_ID" "$LB_F_STATUS"
+        j=$((j + 1)); continue
+      fi
+      if [ -z "$FIRST_REPLY" ] && lb_status_terminal "$LB_F_STATUS" "$SENT_CLASS" \
+        && ! lb_claim_consumed "$STATE" "$SENT_ID" "$LB_F_ID"; then
+        # shellcheck disable=SC2016 # A jq filter, expanded by jq.
+        if lb_json_publish "$INBOX" "$LB_F_ID.json" --arg id "$LB_F_ID" --arg kind reply --arg correlate "$SENT_ID" \
+          --arg from "$LB_F_FROM" --arg status "$LB_F_STATUS" \
+          --arg issued "$LB_F_ISSUED" --arg body "$LB_F_BODY" \
+          --argjson issue "$SENT_NUMBER" --argjson seen "$(date -u +%s)" \
+          '{id:$id,kind:$kind,"in-reply-to":$correlate,from:$from,status:$status,
+            issued:$issued,body:$body,issue:$issue,seen:$seen}'; then
+          announce "reply $SENT_ID $LB_F_STATUS"
+          queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" "" "$SENT_ID" "$LB_F_STATUS"
+          queue_first_reply "$SENT_ID" "$LB_F_ID" "$LB_F_STATUS"
+          FIRST_REPLY=$LB_F_ID
         fi
       fi
     fi

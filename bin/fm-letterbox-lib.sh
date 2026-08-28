@@ -10,7 +10,8 @@
 #
 # It defines:
 #   lb_load_config              - resolve LB_REPO/LB_SELF/LB_PEER/LB_TRANSPORT,
-#                                 LB_STALE_SECS, LB_ACTIVE and LB_CONFIG_ERROR
+#                                 LB_STALE_SECS, LB_REPLY_FETCH_MAX, LB_ACTIVE
+#                                 and LB_CONFIG_ERROR
 #   lb_root <state>             - the home-local letterbox state root
 #   lb_dir <state> <name>       - one child directory of that root
 #   lb_now_iso / lb_iso_epoch   - UTC timestamps, portable across BSD and GNU date
@@ -91,6 +92,16 @@ lb_load_config() {
     *) LB_STALE_SECS=$raw ;;
   esac
   [ "$LB_STALE_SECS" -ge 300 ] 2>/dev/null || LB_STALE_SECS=300
+  # Read through the same home configuration path as every other setting, so
+  # the documented .env tuning reaches the watcher-run poll, whose generated
+  # shim exports only FM_HOME.
+  if [ -n "${FM_LETTERBOX_REPLY_FETCH_MAX+x}" ]; then raw=${FM_LETTERBOX_REPLY_FETCH_MAX-}
+  else raw=$(fmx_env_get FM_LETTERBOX_REPLY_FETCH_MAX "$env_file"); fi
+  # shellcheck disable=SC2034 # Read by bin/fm-letterbox-poll.sh after sourcing.
+  case "$raw" in
+    ''|*[!0-9]*|0) LB_REPLY_FETCH_MAX=5 ;;
+    *) LB_REPLY_FETCH_MAX=$raw ;;
+  esac
   # shellcheck disable=SC2034 # Read by callers (fm-letterbox.sh, fm-letterbox-poll.sh) after sourcing.
   [ -n "$LB_CONFIG_ERROR" ] || LB_ACTIVE=1
   return 0
@@ -135,11 +146,16 @@ lb_iso_epoch() {
 }
 
 # <sender-prefix>-<UTC compact timestamp>-<8 hex>. The sender prefix is this
-# estate's first identity segment, so "firstmate.shipyard" issues
-# firstmate-20260824T140311Z-9f2c1ab4. The id is chosen BEFORE the transport
-# call and is immutable thereafter, which is what makes re-delivery a no-op.
+# estate's first identity segment NORMALISED to the id alphabet: every character
+# outside [a-z0-9] is dropped and the result is cut to 12 characters, so
+# "firstmate.shipyard" issues firstmate-20260824T140311Z-9f2c1ab4 and the
+# equally valid identity "first-mate.shipyard" issues the same prefix rather
+# than an id its own validator would refuse. The id is chosen BEFORE the
+# transport call and is immutable thereafter, which is what makes re-delivery a
+# no-op.
 lb_id_prefix() {
-  local seg=${LB_SELF%%.*}
+  local seg
+  seg=$(printf '%s' "${LB_SELF%%.*}" | tr -cd 'a-z0-9')
   printf '%s' "${seg:0:12}"
 }
 
@@ -290,10 +306,15 @@ lb_card_seen() {
 #
 # A relative path stays legal because the slash must not follow an alphanumeric:
 # docs/letterbox, and/or and 24/7 are all accepted.
+#
+# What FOLLOWS the slash is not constrained at all. An earlier detector required
+# the first byte after it to be [A-Za-z0-9._-], which accepted /$HOME/secret,
+# /+cache/file and a bare "/" - each a valid absolute form on a real host. Any
+# slash that begins a path is refused, whatever the path's first byte is.
 lb_has_host_path() {
   printf '%s' "$1" \
     | sed -E 's#[Hh][Tt][Tt][Pp][Ss]?://[^[:space:]]*# #g' \
-    | grep -qE '(^|[^A-Za-z0-9._~+-])/[A-Za-z0-9._-]'
+    | grep -qE '(^|[^A-Za-z0-9._~+-])/'
 }
 
 lb_iso_valid() {
@@ -518,7 +539,12 @@ lb_card_reply_write() {
 #   replied reply_id              our terminal reply, recorded when posted
 #   consumed                      reply ids already consumed (requester side),
 #                                 which is what makes a replayed reply a no-op
-#   first_reply first_reply_status the first terminal peer reply and its status
+#   in_reply_to status            on a reply claim, the sent letter it answers
+#                                 and the status it carried, written at claim
+#                                 time so the winner is recoverable from the
+#                                 claim alone (see lb_first_reply)
+#   first_reply first_reply_status the first terminal peer reply and its status,
+#                                 a cache of what lb_first_reply derives
 #   resend_required resent_as     an unable notice still needs a corrected
 #                                 notice under a new id, and the id that did so
 #   resurfaced                    epoch of the last stale re-announcement
@@ -536,16 +562,20 @@ lb_claim_exists() {
 }
 
 
-# lb_claim_create <state> <id> <class> <from> <issue> [refusal]
+# lb_claim_create <state> <id> <class> <from> <issue> [refusal] [in-reply-to] [status]
 # 0 = this caller claimed it, 1 = already claimed, 2 = could not claim.
+# A reply claim records the sent letter it answers and its status in the same
+# O_EXCL write that makes it a claim, so there is exactly one durable step and
+# nothing about the winner can be half-written.
 lb_claim_create() {
-  local state=$1 id=$2 class=$3 from=$4 issue=$5 refusal=${6-} tmp rc
+  local state=$1 id=$2 class=$3 from=$4 issue=$5 refusal=${6-} correlate=${7-} status=${8-} tmp rc
   tmp=$(lb_claim_tmp) || return 2
   if ! jq -n --arg id "$id" --arg class "$class" --arg from "$from" \
     --argjson issue "$issue" --argjson claimed "$(date -u +%s)" \
-    --arg refusal "$refusal" \
+    --arg refusal "$refusal" --arg correlate "$correlate" --arg status "$status" \
     '{id:$id,class:$class,from:$from,issue:$issue,claimed:$claimed,
-      refusal:$refusal,task:"",replied:"",reply_id:"",first_reply:"",
+      refusal:$refusal,in_reply_to:$correlate,status:$status,
+      task:"",replied:"",reply_id:"",first_reply:"",
       first_reply_status:"",resend_required:"",resent_as:"",resurfaced:0,consumed:[]}' \
     > "$tmp" 2>/dev/null || ! jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
     rm -f -- "$tmp"
@@ -557,12 +587,30 @@ lb_claim_create() {
   return "$rc"
 }
 
-# The rewrite helpers never pipe jq straight into the publisher: jq's output is
-# written to a private temp file and published only once jq succeeded and
-# produced an object, so a claim that jq cannot read is left exactly as it was
-# and the caller sees the failure instead of an empty file over a good claim.
+# No JSON is ever piped straight from jq into the publisher, anywhere in the
+# letterbox: without pipefail a failing jq would publish an empty file and the
+# pipeline would still report success. jq's output goes to a private temp file
+# and is published only once jq succeeded AND produced an object, so a record
+# jq could not build is never written and the caller sees the failure.
 lb_claim_tmp() {
   (umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-claim.XXXXXX")
+}
+
+# lb_json_publish <dir> <base> [jq args...] <filter>: build one JSON object with
+# jq -n and publish it as a private artifact, replacing any existing one.
+lb_json_publish() {
+  local dir=$1 base=$2 tmp rc
+  shift 2
+  tmp=$(lb_claim_tmp) || return 1
+  if ! jq -n "$@" > "$tmp" 2>/dev/null \
+    || ! jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  fmx_private_artifact_publish_stdin "$dir" "$base" 600 < "$tmp"
+  rc=$?
+  rm -f -- "$tmp"
+  return "$rc"
 }
 
 # lb_claim_rewrite <state> <id> <jq-filter> [jq args...]
@@ -602,6 +650,35 @@ lb_claim_set_number() {
   case "$value" in ''|*[!0-9]*) return 1 ;; esac
   # shellcheck disable=SC2016 # A jq filter, expanded by jq.
   lb_claim_rewrite "$state" "$id" '.[$f] = $v' --arg f "$field" --argjson v "$value"
+}
+
+# FIRST TERMINAL REPLY WINS, recovered from ONE boundary. The winner is the
+# reply claim that records the sent letter as its in_reply_to (a clean reply
+# claim, never a refusal), and that claim is created in one O_EXCL write. The
+# sent claim's first_reply field is a cache of the same fact: when the poll died
+# between creating the reply claim and writing the cache, the winner is derived
+# here from the reply claim, so a later terminal reply can never overtake it.
+# Prints "<reply-id> <status>" or nothing.
+lb_first_reply() {
+  local state=$1 sent=$2 winner status dir claim
+  winner=$(lb_claim_field "$state" "$sent" first_reply)
+  if [ -n "$winner" ]; then
+    status=$(lb_claim_field "$state" "$sent" first_reply_status)
+    [ -n "$status" ] || status=$(lb_claim_field "$state" "$winner" status)
+    printf '%s %s\n' "$winner" "$status"
+    return 0
+  fi
+  dir=$(lb_claim_dir "$state")
+  for claim in "$dir"/*.json; do
+    [ -e "$claim" ] || continue
+    winner=$(jq -r --arg s "$sent" \
+      'select(.class == "reply" and .in_reply_to == $s and (.refusal // "") == "")
+       | "\(.id) \(.status // "")"' "$claim" 2>/dev/null)
+    [ -n "$winner" ] || continue
+    printf '%s\n' "$winner"
+    return 0
+  done
+  return 1
 }
 
 # Terminal-reply dedupe: a reply id is recorded in the claim BEFORE the issue is

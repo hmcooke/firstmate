@@ -135,6 +135,9 @@ case "${1:-}" in
       case "$1" in --jq) expr=$2; shift 2 ;; *) shift ;; esac
     done
     jq -n --argjson p "$(cat "$S/private")" '{private: $p}' | jq -c -r "$expr"
+    # A one-shot flip: the visibility changes immediately AFTER this read, which
+    # is the window between the caller's check and the adapter's own gate.
+    [ ! -f "$S/private-flip" ] || mv -f "$S/private-flip" "$S/private"
     ;;
   issue)
     sub=${2:-}; shift 2
@@ -1795,6 +1798,249 @@ test_status_on_an_unconfigured_home_says_inert() {
   pass "status on an unconfigured home reports inert and creates nothing"
 }
 
+
+# ---------------------------------------------------------------------------
+# review round three: the activation gate, staged JSON, durable winners, stable
+# keys, the adapter's visibility class, scanning before terminality, option
+# values, and the fetch budget
+
+test_cli_partial_configuration_is_not_configured_and_creates_nothing() {
+  local home store fakebin out rc cmd
+  home=$(make_home cli-partial)
+  fakebin=$(make_fakebin "$home")
+  store="$home/forge"
+  printf 'FM_LETTERBOX_REPO=%s\nFM_LETTERBOX_SELF=%s\n' "$CHANNEL" "$SELF" > "$home/.env"
+  printf 'body\n' > "$home/body.txt"
+  for cmd in arm list "read archie-20260824T140311Z-9f2c1ab4" "close archie-20260824T140311Z-9f2c1ab4" \
+    "send --class notice --subject s --file $home/body.txt" \
+    "reply archie-20260824T140311Z-9f2c1ab4 --status ack --file $home/body.txt"; do
+    # shellcheck disable=SC2086 # Word-split on purpose: each entry is a command line.
+    out=$(run_lb "$home" "$store" "$fakebin" $cmd 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "$cmd must refuse on a partial configuration"
+    assert_contains "$out" "not configured" "$cmd must report the letterbox as not configured, not as a fault"
+  done
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "inert (not configured in this home)" "status must report a partial configuration as inert"
+  assert_absent "$home/state/letterbox" "a partial configuration must create no state directory"
+  assert_absent "$home/state/letterbox.check.sh" "a partial configuration must arm nothing"
+  [ ! -s "$store/calls.log" ] || fail "a partial configuration must make no transport call"
+  pass "every CLI command treats a partial configuration as not configured: no state, no shim, no transport call"
+}
+
+# A jq that fails only for the inbox stash, so the poll's staging is exercised
+# on the exact pipeline the review named while every other jq call stays real.
+install_failing_jq() {
+  local fakebin=$1 match=$2 real
+  real=$(command -v jq)
+  cat > "$fakebin/jq" <<SH
+#!/usr/bin/env bash
+case " \$* " in *" $match "*) exit 5 ;; esac
+exec "$real" "\$@"
+SH
+  chmod +x "$fakebin/jq"
+}
+
+test_a_failed_stash_is_never_published_announced_or_claimed() {
+  local home store fakebin out id
+  read -r home store fakebin <<< "$(fixture stash-jq | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$id" fact-lookup "q" "body" >/dev/null
+  install_failing_jq "$fakebin" "--arg kind request"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "cannot write the letterbox inbox" "a stash that could not be built must be reported"
+  assert_not_contains "$out" "new $id" "a letter whose stash failed must not be announced"
+  assert_absent "$home/state/letterbox/inbox/$id.json" "no empty stash may be published over a jq failure"
+  assert_absent "$home/state/letterbox/claims/$id.json" "a letter that was never stashed must not be claimed"
+  rm -f "$fakebin/jq"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "new $id fact-lookup archie" "the letter must be stashed and announced once jq works"
+  jq -e '.body == "body"' "$home/state/letterbox/inbox/$id.json" >/dev/null \
+    || fail "the eventual stash must carry the card"
+  pass "a stash is staged and validated before publish, so a jq failure never announces or claims an unreadable letter"
+}
+
+test_a_failed_outbox_record_stops_the_send_before_any_transport_call() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture outbox-jq | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  install_failing_jq "$fakebin" "--arg expires"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a send whose outbox record could not be built must fail"
+  assert_contains "$out" "cannot record the outbox entry" "the failure must be named"
+  [ "$(count_files "$home/state/letterbox/outbox")" = 0 ] || fail "no empty outbox record may be published"
+  [ "$(grep -c 'issue create' "$store/calls.log")" = 0 ] || fail "nothing may be transmitted without its outbox record"
+  rm -f "$fakebin/jq"
+  pass "an outbox record is staged and validated before publish, and a failure stops the send"
+}
+
+test_the_first_terminal_reply_survives_a_crash_before_it_is_cached() {
+  local home store fakebin out id number first
+  read -r home store fakebin <<< "$(fixture winner-crash | tr '\n' ' ')"
+  first=archie-20260824T141902Z-3b71c40d
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  inject_reply "$store" "$number" "$first" "$id" answered "the answer"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id answered" "the first terminal reply must be announced"
+  # The crash: the reply claim landed but the sent claim's cache did not.
+  jq '.first_reply = "" | .first_reply_status = ""' "$home/state/letterbox/claims/$id.json" > "$home/c.new" \
+    && cat "$home/c.new" > "$home/state/letterbox/claims/$id.json"
+  inject_reply "$store" "$number" archie-20260824T142002Z-4c82d51e "$id" unable "actually no"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_not_contains "$out" "unable" "a later terminal reply must never overtake the first after a crash"
+  assert_absent "$home/state/letterbox/inbox/archie-20260824T142002Z-4c82d51e.json" \
+    "the later reply must not be stashed"
+  [ "$(jq -r '.first_reply' "$home/state/letterbox/claims/$id.json")" = "$first" ] \
+    || fail "the winner must be recovered from its reply claim and re-cached"
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "close must consume the winner"
+  [ "$(jq -r '.consumed | join(" ")' "$home/state/letterbox/claims/$id.json")" = "$first" ] \
+    || fail "close must consume exactly the first reply"
+  pass "the first-terminal-reply winner is durable from its own claim, so a crash before the cache cannot change it"
+}
+
+# A malformed reply comment with no usable card id, given a fixed forge comment id.
+inject_malformed_comment() {
+  local store=$1 number=$2 cid=$3 ago=${4:-120} body
+  # shellcheck disable=SC2016 # Backticks are the literal card fence, not a substitution.
+  body=$(printf '```letterbox/v1\nkind: reply\nv: 1\nid: not an id\nin-reply-to: x\nfrom: archie\nstatus: answered\nissued: %s\nbody: |\n  x\n```\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  [ -f "$store/comments-$number.json" ] || printf '[]\n' > "$store/comments-$number.json"
+  jq --argjson i "$cid" --arg b "$body" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + [{id: $i, body: $b, user: {login: "archie"}, created_at: $at}]' \
+    "$store/comments-$number.json" > "$store/c.new" && mv "$store/c.new" "$store/comments-$number.json"
+  set_issue_updated_at "$store" "$number" "$(past_stamp "$ago")"
+}
+
+test_a_malformed_reply_is_keyed_by_its_forge_comment_id_not_its_position() {
+  local home store fakebin out id number
+  read -r home store fakebin <<< "$(fixture comment-key | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  inject_malformed_comment "$store" "$number" 700
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused issue-$number-comment-700 bad-id for $id" \
+    "a malformed reply must be keyed by the forge comment id"
+  assert_present "$home/state/letterbox/claims/issue-$number-comment-700.json" "the refusal must be claimed under that key"
+  # The peer deletes the first comment and posts a new malformed one: it now
+  # sits at index 0, exactly where the claimed one was.
+  printf '[]\n' > "$store/comments-$number.json"
+  inject_malformed_comment "$store" "$number" 701 60
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused issue-$number-comment-701 bad-id for $id" \
+    "a new malformed reply at a reused index must be named, never buried under the old claim"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "an announced malformed reply must then be suppressed (got: $out)"
+  pass "synthetic reply claims use the stable forge comment id, so a shifted index cannot hide a refusal"
+}
+
+test_a_repository_that_flips_between_the_two_checks_is_a_visibility_refusal() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture visibility-flip | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  printf 'false\n' > "$store/private-flip"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a write must be refused when the adapter's own gate sees a public repository"
+  assert_contains "$out" "refusing to write" "the refusal must be explicit"
+  assert_contains "$out" "is not private" "the refusal must name visibility, not a generic failure"
+  [ "$(grep -c 'issue create' "$store/calls.log")" = 0 ] || fail "no letter may be created"
+  assert_present "$home/state/letterbox/write-error" "the refusal must be recorded durably"
+  [ "$(head -n1 "$home/state/letterbox/write-error")" = visibility ] \
+    || fail "the record must carry the visibility class, not transport"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "error: letterbox write refused" "the poll must raise the refusal as a wake"
+  assert_contains "$out" "is not private" "the wake must name the visibility cause"
+  pass "a visibility refusal at the adapter's own gate is recorded under its class and wakes firstmate"
+}
+
+test_a_non_terminal_ack_carrying_a_credential_is_refused_not_skipped() {
+  local home store fakebin out id number rid
+  read -r home store fakebin <<< "$(fixture ack-scan | tr '\n' ' ')"
+  rid=archie-20260824T141902Z-3b71c40d
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  # A legal, non-terminal ack whose body carries a synthetic provider key.
+  inject_reply "$store" "$number" "$rid" "$id" ack "working on it, token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused $rid provider-key-prefix for $id" \
+    "a non-terminal reply is scanned before terminality is decided, and refused by class"
+  assert_not_contains "$out" "ghp_" "the wake must never carry the matched value"
+  assert_absent "$home/state/letterbox/inbox/$rid.json" "a refused reply is never stashed"
+  [ "$(jq -r '.refusal' "$home/state/letterbox/claims/$rid.json")" = provider-key-prefix ] \
+    || fail "the refusal must be claimed so it is announced once"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "the refusal must then be suppressed (got: $out)"
+  pass "every valid correlated reply is credential-scanned, terminal or not"
+}
+
+# Run one command line with a bound: the parser under test used to loop forever
+# on a missing option value, so a hang is itself the failure.
+run_bounded() {
+  local label=$1 pid i=0 rc
+  shift
+  "$@" >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || { kill "$pid" 2>/dev/null; fail "$label must terminate, not loop forever"; }
+    sleep 0.1
+  done
+  wait "$pid"; rc=$?
+  [ "$rc" -ne 0 ] || fail "$label must fail"
+}
+
+test_a_missing_option_value_is_refused_not_looped() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture option-values | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class 2>&1); rc=$?
+  expect_code 1 "$rc" "send --class with no value"
+  assert_contains "$out" "--class needs a value" "the missing value must be named"
+  run_bounded "send --file" run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file
+  run_bounded "reply --status" run_lb "$home" "$store" "$fakebin" reply archie-20260824T140311Z-9f2c1ab4 --status
+  out=$(PATH="$fakebin:$BASE_PATH" FAKE_STORE="$store" FM_LETTERBOX_REPO="$CHANNEL" \
+    "$ROOT/bin/fm-letterbox-transport-github.sh" create --title 2>&1); rc=$?
+  expect_code 1 "$rc" "transport create --title with no value"
+  assert_contains "$out" "needs a value" "the transport parser must refuse a missing value too"
+  run_bounded "transport comment --body-file" env PATH="$fakebin:$BASE_PATH" FAKE_STORE="$store" \
+    FM_LETTERBOX_REPO="$CHANNEL" "$ROOT/bin/fm-letterbox-transport-github.sh" comment 1 --body-file
+  [ ! -s "$store/calls.log" ] || fail "a rejected command line must make no transport call"
+  pass "every option parser rejects a missing value before shifting, on the send, reply and transport paths"
+}
+
+test_the_reply_fetch_budget_is_read_from_the_home_env() {
+  local home store fakebin out id1 id2 n1 n2
+  read -r home store fakebin <<< "$(fixture fetch-budget | tr '\n' ' ')"
+  printf 'FM_LETTERBOX_REPLY_FETCH_MAX=1\n' >> "$home/.env"
+  printf 'one\n' > "$home/one.txt"
+  printf 'two\n' > "$home/two.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject a --file "$home/one.txt" >/dev/null \
+    || fail "first send must succeed"
+  id1=$(sole_sent_id "$home")
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject b --file "$home/two.txt" >/dev/null \
+    || fail "second send must succeed"
+  for id2 in "$home"/state/letterbox/sent/*.receipt; do
+    id2=${id2##*/}; id2=${id2%.receipt}
+    [ "$id2" != "$id1" ] && break
+  done
+  n1=$(head -n1 "$home/state/letterbox/sent/$id1.receipt")
+  n2=$(head -n1 "$home/state/letterbox/sent/$id2.receipt")
+  set_issue_updated_at "$store" "$n1" "$(past_stamp 120)"
+  set_issue_updated_at "$store" "$n2" "$(past_stamp 120)"
+  : > "$store/calls.log"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  out=$(grep -c 'comments' "$store/calls.log")
+  [ "$out" = 1 ] || fail "with FM_LETTERBOX_REPLY_FETCH_MAX=1 in .env exactly one comment fetch may run per cycle, not $out"
+  pass "FM_LETTERBOX_REPLY_FETCH_MAX is honoured from the home .env, as documented"
+}
+
 # ---------------------------------------------------------------------------
 
 test_poll_unconfigured_is_a_hard_noop
@@ -1861,3 +2107,12 @@ test_a_sent_letter_with_a_consumed_reply_is_not_resurfaced
 test_a_reply_card_in_an_issue_body_is_ignored
 test_a_missing_gh_is_diagnosed_not_silent
 test_status_counts_only_sent_letters_still_awaiting_a_reply
+test_cli_partial_configuration_is_not_configured_and_creates_nothing
+test_a_failed_stash_is_never_published_announced_or_claimed
+test_a_failed_outbox_record_stops_the_send_before_any_transport_call
+test_the_first_terminal_reply_survives_a_crash_before_it_is_cached
+test_a_malformed_reply_is_keyed_by_its_forge_comment_id_not_its_position
+test_a_repository_that_flips_between_the_two_checks_is_a_visibility_refusal
+test_a_non_terminal_ack_carrying_a_credential_is_refused_not_skipped
+test_a_missing_option_value_is_refused_not_looped
+test_the_reply_fetch_budget_is_read_from_the_home_env
