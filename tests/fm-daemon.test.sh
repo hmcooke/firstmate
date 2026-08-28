@@ -396,13 +396,11 @@ test_housekeeping_paused_resurfaces_and_resets() {
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
   watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
   : > "$state/.subsuper-paused-$key"
-  : > "$state/.paused-resurfaced-$watcher_key"
   back=$(( $(date +%s) - 5000 ))
   if [ "$(uname)" = Darwin ]; then
-    touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" \
-      "$state/held-w11.status" "$state/.paused-resurfaced-$watcher_key"
+    touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$state/held-w11.status"
   else
-    touch -m -d "@$back" "$state/held-w11.status" "$state/.paused-resurfaced-$watcher_key"
+    touch -m -d "@$back" "$state/held-w11.status"
   fi
   make_fake_crew_state "$fakebin" >/dev/null
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \

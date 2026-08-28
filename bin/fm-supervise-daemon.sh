@@ -450,13 +450,10 @@ stale_marker_remove() {  # <window> <state>
 # declared pause. Housekeeping shares the watcher's status-file age and
 # .paused-resurfaced-<key> throttle for the bounded re-surface cadence.
 pause_marker_record() {  # <window> <state> - create if absent
-  local win=$1 state=$2 key marker watcher_key resurface_marker
+  local win=$1 state=$2 key marker
   key=$(_stale_key "$(window_to_task "$win" "$state")")
   marker="$state/.subsuper-paused-$key"
   [ -e "$marker" ] || _now > "$marker"
-  watcher_key=$(_stale_key "$win")
-  resurface_marker="$state/.paused-resurfaced-$watcher_key"
-  [ -e "$resurface_marker" ] || _now > "$resurface_marker"
 }
 
 pause_marker_remove() {  # <window> <state>

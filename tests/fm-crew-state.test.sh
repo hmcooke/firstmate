@@ -730,6 +730,23 @@ test_ci_monitoring_declared_pause_is_honoured() {
   pass "a declared pause outranks a run-step that is only monitoring CI"
 }
 
+test_ci_monitoring_unavailable_log_declared_pause_stays_working() {
+  reset_fakes
+  local d; d=$(new_case ci-monitor-paused-unavailable-log)
+  make_repo_on_branch "$d/wt" fm/feat-cipausedunknown
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cipausedunknown.meta" "window=fm:fm-feat-cipausedunknown" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cipausedunknown.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cipausedunknown)"
+  FM_FAKE_CI_LOGS=""
+  local out; out=$(run_crew_state "$d" feat-cipausedunknown)
+  assert_contains "$out" "state: working" "an unavailable CI log must keep the run-step authoritative"
+  assert_contains "$out" "source: run-step" "an unavailable CI log remains run-step sourced"
+  assert_contains "$out" "validating (running)" "an unavailable CI log keeps active-run detail"
+  assert_not_contains "$out" "state: paused" "an unavailable CI log cannot prove a declared wait"
+  pass "an unavailable CI log cannot hide an active run"
+}
+
 # The same declared wait during CI monitoring is what the supervisors' shared
 # absorb predicate must see: crew_absorb_class classes it `paused`, so the
 # watcher and the away-mode daemon both use the bounded re-surface cadence
@@ -1584,6 +1601,7 @@ test_ci_fixing_after_green_stays_working
 test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_ci_monitoring_declared_pause_is_honoured
+test_ci_monitoring_unavailable_log_declared_pause_stays_working
 test_ci_monitoring_declared_pause_absorb_class
 test_declared_pause_does_not_outrank_active_run_steps
 test_terminal_passed
