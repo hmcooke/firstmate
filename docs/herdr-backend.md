@@ -308,6 +308,10 @@ Recovery reads the composer through `fm_backend_composer_content`, which returns
 Re-sends are bounded per buffered digest, and an unrecoverable composer still raises the max-defer wedge alarm.
 When the buffer has grown since the digest was typed, the recovered submit does not clear it and the newer items are delivered by the next flush.
 
+Authorship is proven from the envelope alone, so recovery only reaches a digest whose envelope is still visible in the composer.
+A digest long enough to scroll its own opening out of the composer's viewport shows no envelope, reads as ordinary pending text, and keeps deferring and alarming as before.
+That is the fail-safe direction and it is deliberate: no weaker authorship signal is accepted, because the cost of a wrong verdict is submitting somebody else's input.
+
 Harnesses with native tracked background execution can run the daemon in their terminal.
 Pi has no such mechanism.
 `bin/fm-afk-launch.sh` therefore creates a dedicated unfocused Herdr workspace, runs the daemon there with an explicit supervisor target and backend, records the exact daemon pane, and closes only that pane on stop.
@@ -341,6 +345,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
   The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
 - Only tmux and Herdr can host the away-mode supervisor terminal.
+- Own-unsent recovery needs the digest's envelope visible in the composer, so a digest that has scrolled its opening out of view is not recovered.
 
 ## Regression entry points
 
