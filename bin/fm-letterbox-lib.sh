@@ -877,6 +877,7 @@ lb_transport_dependencies() {
   if [ -n "$missing" ]; then
     LB_TRANSPORT_DIAGNOSTIC="missing transport dependency: $missing"
   else
+    # shellcheck disable=SC2034 # Read by callers (fm-letterbox.sh, fm-letterbox-poll.sh) after sourcing.
     LB_TRANSPORT_DIAGNOSTIC="transport dependency check failed for $LB_TRANSPORT"
   fi
   return 1
