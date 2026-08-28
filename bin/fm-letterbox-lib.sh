@@ -33,6 +33,8 @@
 #                                 rewrite, so a crash cannot leave halves that disagree
 #   lb_claim_close_record <state> <id> <resend> [reply...] - the requester's close
 #                                 transition as one rewrite (see its header)
+#   lb_text_publish <dir> <base> <mode> <line>... - stage and publish text
+#   lb_transport_dependencies    - ask the adapter to report its own dependencies
 #   lb_transport <verb> [args]  - dispatch to the configured transport adapter
 #   lb_scan_refuses <file>      - run the credential scanner, refusing on any
 #                                 non-clean result including a scanner failure
@@ -159,13 +161,14 @@ lb_iso_epoch() {
 # no-op.
 lb_id_prefix() {
   local seg
-  seg=$(printf '%s' "${LB_SELF%%.*}" | tr -cd 'a-z0-9')
+  seg=$(tr -cd 'a-z0-9' <<< "${LB_SELF%%.*}") || return 1
   printf '%s' "${seg:0:12}"
 }
 
 lb_id_new() {
   local hex
-  hex=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  hex=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null) || return 1
+  hex=$(tr -d ' \n' <<< "$hex") || return 1
   case "$hex" in
     ????????) : ;;
     *) return 1 ;;
@@ -179,8 +182,7 @@ lb_id_valid() {
     ''|.*|*/*) return 1 ;;
   esac
   [ "${#id}" -le 64 ] || return 1
-  printf '%s' "$id" \
-    | grep -qE '^[a-z][a-z0-9]{0,11}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
+  grep -qE '^[a-z][a-z0-9]{0,11}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$' <<< "$id"
 }
 
 lb_class_allowed() {
@@ -324,13 +326,19 @@ lb_card_seen() {
 # would otherwise look exactly like one. Every other scheme, file: included, is
 # left in place and therefore refused: a file URI IS a host path wearing a scheme.
 lb_has_host_path() {
-  printf '%s' "$1" \
-    | sed -E 's#[Hh][Tt][Tt][Pp][Ss]?://[^[:space:]]*# #g' \
-    | grep -qE '(^|[^A-Za-z0-9])~?/[^[:space:]/]'
+  local stripped rc
+  stripped=$(sed -E 's#[Hh][Tt][Tt][Pp][Ss]?://[^[:space:]]*# #g' <<< "$1") || return 0
+  grep -qE '(^|[^A-Za-z0-9])~?/[^[:space:]/]' <<< "$stripped"
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 lb_iso_valid() {
-  printf '%s' "${1-}" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+  grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<< "${1-}"
 }
 
 # lb_card_parse <file> [now-epoch]
@@ -339,14 +347,19 @@ lb_iso_valid() {
 #   2  not addressed to this estate, or carries no readable card at all - the
 #      caller ignores it silently and owes no reply
 lb_card_parse() {
-  local file=$1 now=${2-} line key val content fences
+  local file=$1 now=${2-} line key val content fences rc
   lb_card_reset
   [ -f "$file" ] && [ ! -L "$file" ] || return 2
   # grep -c prints 0 and EXITS 1 when there is no match, so a "|| printf 0"
   # fallback appends a SECOND count and makes a card-free document look like
   # several cards. Ordinary prose on a letterbox issue must be ignored, not
   # refused: keep grep's own count and discard only its exit status.
-  fences=$(grep -c "^$LB_CARD_FENCE$(printf '\r')\{0,1\}\$" -- "$file" 2>/dev/null || true)
+  fences=$(grep -c "^$LB_CARD_FENCE$(printf '\r')\{0,1\}\$" -- "$file" 2>/dev/null)
+  rc=$?
+  case "$rc" in
+    0|1) : ;;
+    *) lb_refuse parser-unavailable; return 1 ;;
+  esac
   case "$fences" in ''|*[!0-9]*) fences=0 ;; esac
   case "$fences" in
     0) return 2 ;;
@@ -449,6 +462,9 @@ lb_card_validate() {
     lb_class_allowed "$LB_F_CLASS" || { lb_refuse unknown-class; return 1; }
     [ -n "$LB_F_SUBJECT" ] || { lb_refuse missing-subject; return 1; }
     [ "${#LB_F_SUBJECT}" -le 120 ] || { lb_refuse subject-too-long; return 1; }
+    case "$LB_F_SUBJECT" in
+      *[[:cntrl:]]*) lb_refuse subject-control-character; return 1 ;;
+    esac
     if lb_card_seen status || lb_card_seen in-reply-to; then
       lb_refuse unknown-field; return 1
     fi
@@ -474,8 +490,12 @@ lb_card_validate() {
   fi
 
   # 8 KiB is a refusal bound, never a truncation bound.
-  [ "$(printf '%s' "$LB_F_BODY" | wc -c | tr -d ' ')" -le 8192 ] \
-    || { lb_refuse body-too-large; return 1; }
+  local body_size
+  body_size=$(wc -c <<< "$LB_F_BODY") || { lb_refuse body-size-unavailable; return 1; }
+  body_size=${body_size//[[:space:]]/}
+  case "$body_size" in ''|*[!0-9]*) lb_refuse body-size-unavailable; return 1 ;; esac
+  body_size=$((body_size - 1))
+  [ "$body_size" -le 8192 ] || { lb_refuse body-too-large; return 1; }
   if [ "$LB_F_CLASS" = ping ] && [ -n "$LB_F_BODY" ]; then
     lb_refuse ping-carries-content; return 1
   fi
@@ -625,6 +645,20 @@ lb_json_publish() {
   return "$rc"
 }
 
+lb_text_publish() {
+  local dir=$1 base=$2 mode=$3 tmp rc
+  shift 3
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-text.XXXXXX") || return 1
+  if ! printf '%s\n' "$@" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  fmx_private_artifact_publish_stdin "$dir" "$base" "$mode" < "$tmp"
+  rc=$?
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
 # lb_claim_rewrite <state> <id> <jq-filter> [jq args...]
 lb_claim_rewrite() {
   local state=$1 id=$2 filter=$3 path tmp rc
@@ -743,12 +777,9 @@ lb_claim_set_many() {
 # the letter is still reported as awaiting a reply and close can simply be run
 # again.
 lb_claim_close_record() {
-  local state=$1 id=$2 resend=$3 reply list
+  local state=$1 id=$2 resend=$3 list
   shift 3
-  list='[]'
-  if [ "$#" -gt 0 ]; then
-    list=$(for reply in "$@"; do printf '%s\n' "$reply"; done | jq -R . | jq -s -c '.') || return 1
-  fi
+  list=$(jq -cn --args '$ARGS.positional' "$@") || return 1
   # shellcheck disable=SC2016 # A jq filter, expanded by jq.
   lb_claim_rewrite "$state" "$id" \
     '.consumed = (((.consumed // []) + $r) | unique)
@@ -781,10 +812,43 @@ lb_scan_refuses() {
 # Exactly one adapter file knows any forge. Every verb below is part of the
 # adapter contract; a second transport implements the same verbs and adds its
 # name to lb_load_config's allowlist, while no other letterbox path changes.
+# The dependencies verb reports only adapter-owned tools. jq is owned and
+# checked by the letterbox core because the core itself uses it.
 # docs/letterbox.md names the contract, and each adapter's own header owns its
 # exact API calls.
+lb_transport_adapter_path() {
+  printf '%s\n' "${LB_SCRIPT_DIR:?}/fm-letterbox-transport-$LB_TRANSPORT.sh"
+}
+
+lb_transport_dependencies() {
+  local adapter out rc line missing=''
+  adapter=$(lb_transport_adapter_path)
+  if [ ! -f "$adapter" ] || [ -L "$adapter" ] || [ ! -r "$adapter" ]; then
+    LB_TRANSPORT_DIAGNOSTIC="transport adapter $LB_TRANSPORT is missing or unreadable"
+    return 1
+  fi
+  out=$(FM_LETTERBOX_REPO="$LB_REPO" bash "$adapter" dependencies 2>/dev/null)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    LB_TRANSPORT_DIAGNOSTIC=
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      missing\ ?*) missing="$missing${missing:+, }${line#missing }" ;;
+    esac
+  done <<< "$out"
+  if [ -n "$missing" ]; then
+    LB_TRANSPORT_DIAGNOSTIC="missing transport dependency: $missing"
+  else
+    LB_TRANSPORT_DIAGNOSTIC="transport dependency check failed for $LB_TRANSPORT"
+  fi
+  return 1
+}
+
 lb_transport() {
-  local adapter="${LB_SCRIPT_DIR:?}/fm-letterbox-transport-$LB_TRANSPORT.sh"
-  [ -f "$adapter" ] && [ ! -L "$adapter" ] || return 1
+  local adapter
+  adapter=$(lb_transport_adapter_path)
+  [ -f "$adapter" ] && [ ! -L "$adapter" ] && [ -r "$adapter" ] || return 1
   FM_LETTERBOX_REPO="$LB_REPO" bash "$adapter" "$@"
 }

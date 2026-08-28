@@ -2034,15 +2034,45 @@ SH
   inject_letter "$store" archie-20260824T140311Z-9f2c1ab4 >/dev/null
   out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$no_gh"); rc=$?
   expect_code 0 "$rc" "a poll without gh must still exit 0"
-  assert_contains "$out" "letterbox error: missing gh" \
+  assert_contains "$out" "letterbox error: missing transport dependency: gh" \
     "a home without gh must be told once rather than polling silently forever"
   out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$no_gh")
   [ -z "$out" ] || fail "the missing-gh diagnostic must be rate-limited (got: $out)"
   out=$(BASH_ENV="$no_gh" run_lb "$home" "$store" "$fakebin" arm 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "arm must refuse without gh, which every read verb needs"
-  assert_contains "$out" "gh is required" "arm must name the missing dependency"
+  assert_contains "$out" "missing transport dependency: gh" "arm must name the missing dependency"
   assert_absent "$home/state/letterbox.check.sh" "arm must not generate a shim it cannot serve"
   pass "a missing gh is diagnosed once by the poll and refused by arm"
+}
+
+test_the_transport_adapter_owns_its_dependency_check() {
+  local home store fakebin out scoped_command id
+  read -r home store fakebin <<< "$(fixture adapter-dependencies | tr '\n' ' ')"
+  scoped_command="$home/scoped-command.bash"
+  cat > "$scoped_command" <<'SH'
+command() {
+  if [ "${1:-}" = -v ]; then
+    case "${2:-}" in
+      gh|gh-axi)
+        case "${BASH_SOURCE[1]-}" in
+          *fm-letterbox-transport-github.sh) builtin command "$@" ;;
+          *) return 1 ;;
+        esac
+        return
+        ;;
+    esac
+  fi
+  builtin command "$@"
+}
+SH
+  out=$(BASH_ENV="$scoped_command" run_lb "$home" "$store" "$fakebin" arm) \
+    || fail "arm must accept the adapter's own dependency verdict: $out"
+  assert_contains "$out" "letterbox armed" "the core must ask the adapter instead of probing forge tools itself"
+  id=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$id" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$scoped_command")
+  assert_contains "$out" "new $id" "the poll must rely on the same adapter-owned dependency verdict"
+  pass "the transport adapter owns its dependencies, so the core is transport-neutral"
 }
 
 test_status_counts_only_sent_letters_still_awaiting_a_reply() {
@@ -2318,6 +2348,142 @@ test_the_reply_fetch_budget_is_read_from_the_home_env() {
   pass "FM_LETTERBOX_REPLY_FETCH_MAX is honoured from the home .env, as documented"
 }
 
+test_a_failed_reply_stash_leaves_the_cursor_retryable() {
+  local home store fakebin out id number reply_id
+  read -r home store fakebin <<< "$(fixture reply-stash-cursor | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T150000Z-0c1ea11e
+  inject_reply "$store" "$number" "$reply_id" "$id" answered "the answer"
+  set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
+  install_failing_jq "$fakebin" "--arg kind reply"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_not_contains "$out" "reply $id" "a reply whose stash failed must not be announced"
+  assert_absent "$home/state/letterbox/inbox/$reply_id.json" "a failed reply stash must publish nothing"
+  rm -f "$fakebin/jq"
+  if [ -f "$home/state/letterbox/cursor" ]; then
+    jq -e --arg n "$number" 'has($n) | not' "$home/state/letterbox/cursor" >/dev/null \
+      || fail "a failed reply stash must not advance the cursor past that reply"
+  fi
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id answered" "the reply must be fetched again after the stash recovers"
+  assert_present "$home/state/letterbox/inbox/$reply_id.json" "the retried reply must be stashed"
+  pass "a failed terminal-reply stash leaves the cursor behind for a retry"
+}
+
+test_a_failed_reply_extraction_leaves_the_cursor_retryable() {
+  local home store fakebin out id number reply_id
+  read -r home store fakebin <<< "$(fixture reply-extract-cursor | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T150000Z-0c1ea11e
+  inject_reply "$store" "$number" "$reply_id" "$id" answered "the answer"
+  set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
+  install_failing_jq "$fakebin" "--argjson j 0"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_not_contains "$out" "reply $id" "a reply whose body could not be extracted must not be announced"
+  rm -f "$fakebin/jq"
+  if [ -f "$home/state/letterbox/cursor" ]; then
+    jq -e --arg n "$number" 'has($n) | not' "$home/state/letterbox/cursor" >/dev/null \
+      || fail "a failed reply extraction must not advance the cursor past that reply"
+  fi
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id answered" "the reply must be extracted again after jq recovers"
+  assert_present "$home/state/letterbox/inbox/$reply_id.json" "the retried reply must be stashed"
+  pass "a failed terminal-reply extraction leaves the cursor behind for a retry"
+}
+
+test_a_failed_deferred_claim_cannot_advance_the_cursor() {
+  local home store fakebin out id number reply_id
+  read -r home store fakebin <<< "$(fixture reply-claim-cursor | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T150000Z-0c1ea11e
+  inject_reply "$store" "$number" "$reply_id" "$id" answered "the answer"
+  set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
+  printf '0\n' > "$home/mktemp.count"
+  out=$(run_poll "$home" "$store" "$fakebin" LB_MKTEMP_ALLOW=1 LB_MKTEMP_COUNTER="$home/mktemp.count")
+  assert_contains "$out" "reply $id answered" "the reply must be announced before its deferred claim"
+  assert_absent "$home/state/letterbox/claims/$reply_id.json" "the injected failure must prevent the reply claim"
+  if [ -f "$home/state/letterbox/cursor" ]; then
+    jq -e --arg n "$number" 'has($n) | not' "$home/state/letterbox/cursor" >/dev/null \
+      || fail "a failed deferred claim must not advance the cursor past its announcement"
+  fi
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id answered" "the unclaimed reply must be announced again"
+  assert_present "$home/state/letterbox/claims/$reply_id.json" "the retry must take the reply claim"
+  pass "cursor publication waits for every deferred suppression write it depends on"
+}
+
+test_close_reply_array_building_cannot_mask_a_failed_stage() {
+  local home store fakebin id number reply_id
+  read -r home store fakebin <<< "$(fixture close-reply-array | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T150000Z-0c1ea11e
+  inject_reply "$store" "$number" "$reply_id" "$id" answered "the answer"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  install_failing_jq "$fakebin" "-R ."
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null \
+    || fail "close must build and publish the consumed reply array as one checked operation"
+  rm -f "$fakebin/jq"
+  assert_grep "$reply_id" <(jq -r '.consumed[]' "$home/state/letterbox/claims/$id.json") \
+    "close must never report success after silently dropping the consumed reply"
+  pass "close builds the reply array in one checked operation, so no failed stage is masked"
+}
+
+test_duplicate_ids_are_reserved_within_one_poll_cycle() {
+  local home store fakebin out id first_number rest new_count=0
+  read -r home store fakebin <<< "$(fixture duplicate-cycle | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  first_number=$(inject_letter "$store" "$id" fact-lookup first "first body")
+  inject_letter "$store" "$id" fact-lookup second "second body" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin")
+  rest=$out
+  while [[ "$rest" == *"new $id"* ]]; do
+    rest=${rest#*"new $id"}
+    new_count=$((new_count + 1))
+  done
+  [ "$new_count" = 1 ] \
+    || fail "one poll cycle must announce a duplicated card id only once (got: $out)"
+  [ "$(jq -r '.subject' "$home/state/letterbox/inbox/$id.json")" = first ] \
+    || fail "the first reserved card must remain in the inbox"
+  [ "$(jq -r '.issue' "$home/state/letterbox/claims/$id.json")" = "$first_number" ] \
+    || fail "the durable claim must identify the same issue as the stashed card"
+  pass "one-cycle reservations keep a duplicated card id's stash and durable claim consistent"
+}
+
+test_inbound_subject_control_characters_are_refused() {
+  local home store fakebin out tab_id escape_id tab_subject escape_subject
+  read -r home store fakebin <<< "$(fixture subject-controls | tr '\n' ' ')"
+  tab_id=archie-20260824T140311Z-9f2c1ab4
+  escape_id=archie-20260824T140312Z-8e1b2c3d
+  tab_subject=$(printf 'bad\tsubject')
+  escape_subject=$(printf 'bad\033subject')
+  inject_letter "$store" "$tab_id" fact-lookup "$tab_subject" "body" >/dev/null
+  inject_letter "$store" "$escape_id" fact-lookup "$escape_subject" "body" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused $tab_id subject-control-character" \
+    "an inbound tab must be refused at the parser boundary"
+  assert_contains "$out" "refused $escape_id subject-control-character" \
+    "an inbound terminal escape must be refused at the parser boundary"
+  assert_absent "$home/state/letterbox/inbox/$tab_id.json" "a tab-bearing subject must never reach the inbox"
+  assert_absent "$home/state/letterbox/inbox/$escape_id.json" "an escape-bearing subject must never reach the inbox"
+  pass "inbound subjects reject control characters before list can emit them"
+}
+
 # ---------------------------------------------------------------------------
 
 test_poll_unconfigured_is_a_hard_noop
@@ -2390,6 +2556,7 @@ test_a_scan_refused_reply_names_the_sent_letter_and_keeps_it_open
 test_a_sent_letter_with_a_consumed_reply_is_not_resurfaced
 test_a_reply_card_in_an_issue_body_is_ignored
 test_a_missing_gh_is_diagnosed_not_silent
+test_the_transport_adapter_owns_its_dependency_check
 test_status_counts_only_sent_letters_still_awaiting_a_reply
 test_cli_partial_configuration_is_not_configured_and_creates_nothing
 test_a_failed_stash_is_never_published_announced_or_claimed
@@ -2400,3 +2567,9 @@ test_a_repository_that_flips_between_the_two_checks_is_a_visibility_refusal
 test_a_non_terminal_ack_carrying_a_credential_is_refused_not_skipped
 test_a_missing_option_value_is_refused_not_looped
 test_the_reply_fetch_budget_is_read_from_the_home_env
+test_a_failed_reply_stash_leaves_the_cursor_retryable
+test_a_failed_reply_extraction_leaves_the_cursor_retryable
+test_a_failed_deferred_claim_cannot_advance_the_cursor
+test_close_reply_array_building_cannot_mask_a_failed_stage
+test_duplicate_ids_are_reserved_within_one_poll_cycle
+test_inbound_subject_control_characters_are_refused

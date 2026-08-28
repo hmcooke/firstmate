@@ -220,6 +220,28 @@ SH
   pass "an absolute URL and a relative path are not host paths (the positive control)"
 }
 
+test_host_path_detection_refuses_when_its_normalizer_fails() {
+  local dir fakebin out
+  dir="$TMP_ROOT/host-path-normalizer"; mkdir -p "$dir"
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/sed" <<'SH'
+#!/usr/bin/env bash
+exit 2
+SH
+  chmod +x "$fakebin/sed"
+  cat > "$dir/snippet.sh" <<'SH'
+if lb_has_host_path "ordinary prose"; then
+  echo REFUSED
+else
+  echo ACCEPTED
+fi
+SH
+  out=$(PATH="$fakebin:$PATH" lb_run firstmate.shipyard archie "$dir/snippet.sh") \
+    || fail "the host-path guard harness must run: $out"
+  assert_contains "$out" REFUSED "a failed normalizer must refuse instead of reporting content clean"
+  pass "the host-path safety guard refuses when its normalizer cannot run"
+}
+
 test_authority_fields_are_refused() {
   local dir field
   dir="$TMP_ROOT/authority"; mkdir -p "$dir"
@@ -636,6 +658,7 @@ test_unknown_class_is_refused_at_parse
 test_higher_version_is_refused_by_name
 test_absolute_host_path_is_refused
 test_ordinary_url_is_not_mistaken_for_a_host_path
+test_host_path_detection_refuses_when_its_normalizer_fails
 test_authority_fields_are_refused
 test_unknown_field_is_refused
 test_oversized_body_is_refused_not_truncated

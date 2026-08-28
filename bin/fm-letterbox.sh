@@ -87,7 +87,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,64p' "$0" | sed -e 's/^# \{0,1\}//'
+  sed -n '2,64{s/^# \{0,1\}//;p;}' "$0"
   exit "${1:-0}"
 }
 
@@ -128,8 +128,7 @@ ensure_dirs() {
 # line is the class (visibility or transport) so the poll reports it structurally
 # rather than inferring its kind from the prose.
 record_write_error() {
-  printf '%s\n%s\n' "$1" "$2" \
-    | fmx_private_artifact_publish_stdin "$(ROOT_DIR)" "write-error" 600 2>/dev/null || true
+  lb_text_publish "$(ROOT_DIR)" "write-error" 600 "$1" "$2" 2>/dev/null || true
 }
 
 clear_write_error() {
@@ -178,7 +177,8 @@ transport_write() {
       return 0
       ;;
     2|3)
-      reason=$(sed -n 's/^letterbox transport: refusing to write, //p' "$WORK/transport.err" 2>/dev/null | tail -n1)
+      reason=$(sed -n 's/^letterbox transport: refusing to write, //p' "$WORK/transport.err" 2>/dev/null) || reason=
+      reason=${reason##*$'\n'}
       [ -n "$reason" ] || reason="cannot confirm $LB_REPO is private"
       if [ "$rc" -eq 2 ]; then
         record_write_error visibility "letterbox write refused: $reason"
@@ -190,6 +190,14 @@ transport_write() {
   esac
   cat "$WORK/transport.err" >&2 2>/dev/null
   return "$rc"
+}
+
+file_size_bytes() {
+  local size
+  size=$(wc -c < "$1") || return 1
+  size=${size//[[:space:]]/}
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$size"
 }
 
 # Whole-card enforcement on the EXACT bytes that will be recorded or
@@ -204,7 +212,7 @@ transport_write() {
 # prints nothing and returns 1 when it may.
 card_unsendable_reason() {
   local file=$1 kind=$2 expected_id=$3 expected=$4 correlate=${5-} size self peer rc
-  size=$(wc -c < "$file" | tr -d ' ')
+  size=$(file_size_bytes "$file") || { printf 'unreadable size\n'; return 0; }
   [ "$size" -le 65536 ] || { printf 'implausibly large\n'; return 0; }
   if lb_has_host_path "$(cat "$file")"; then printf 'absolute host path\n'; return 0; fi
   self=$LB_SELF
@@ -267,7 +275,7 @@ require_sendable() {
     *[[:cntrl:]]*) die "subject must be one line" ;;
   esac
   lb_has_host_path "$subject" && die "subject names an absolute host path; refer to files by role"
-  size=$(wc -c < "$bodyfile" | tr -d ' ')
+  size=$(file_size_bytes "$bodyfile") || die "cannot measure body size"
   [ "$size" -le 8192 ] || die "body is larger than 8 KiB; it is refused, not truncated"
   lb_has_host_path "$(cat "$bodyfile")" \
     && die "body names an absolute host path; refer to files by role"
@@ -315,8 +323,7 @@ write_shim() {
 
 cmd_arm() {
   require_active
-  command -v gh-axi >/dev/null 2>&1 || die "gh-axi is required to reach the channel"
-  command -v gh >/dev/null 2>&1 || die "gh is required to read the channel"
+  lb_transport_dependencies || die "$LB_TRANSPORT_DIAGNOSTIC"
   [ -f "$FM_ROOT/bin/fm-letterbox-poll.sh" ] && [ ! -L "$FM_ROOT/bin/fm-letterbox-poll.sh" ] \
     || die "bin/fm-letterbox-poll.sh is unavailable"
   ensure_dirs
@@ -518,8 +525,8 @@ record_receipt() {
       die "letter $id was sent, but the resend of notice $resends could not be recorded; run status"
     fi
   fi
-  printf '%s\n%s\n%s\n' "$number" "$url" "$(date -u +%s)" \
-    | fmx_private_artifact_publish_stdin "$(lb_dir "$STATE" sent)" "$id.receipt" 600 \
+  lb_text_publish "$(lb_dir "$STATE" sent)" "$id.receipt" 600 \
+    "$number" "$url" "$(date -u +%s)" \
     || die "cannot record the receipt for $id"
 }
 

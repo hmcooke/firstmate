@@ -35,7 +35,8 @@ Keeping it private is a hard requirement, not a preference: every write checks i
 There is none to add.
 Reading and commenting on one more private repository uses firstmate's existing GitHub credential, so this adds no authority to the machine that it does not already have.
 
-The transport needs both `gh-axi` and `gh`, which are already firstmate dependencies (`bin/fm-bootstrap.sh`'s `COMMON_TOOLS`), plus `jq`.
+The letterbox core checks `jq`, which it uses independently of any transport.
+The GitHub adapter's `dependencies` verb reports its own need for `gh-axi` and `gh`, which are already firstmate dependencies (`bin/fm-bootstrap.sh`'s `COMMON_TOOLS`).
 
 ### 3. Activation
 
@@ -274,5 +275,5 @@ The poll never writes to the channel; every write is a deliberate command run by
 ## Swapping the transport
 
 `bin/fm-letterbox-transport-github.sh` is the only file that knows about GitHub.
-A second transport implements the same verbs - `require-private`, `list-open`, `comments`, `find-title`, `create`, `comment`, `close` - and adds its name to the configuration allowlist, while no other letterbox path changes.
+A second transport implements the same verbs - `dependencies`, `require-private`, `list-open`, `comments`, `find-title`, `create`, `comment`, `close` - and adds its name to the configuration allowlist, while no other letterbox path changes.
 Its own header owns the exact API calls and which CLI each verb uses.

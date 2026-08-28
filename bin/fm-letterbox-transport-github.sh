@@ -5,6 +5,10 @@
 # no other letterbox path changes.
 #
 # Usage: fm-letterbox-transport-github.sh <verb> [args]
+#   dependencies                       print "present <tool>" or "missing <tool>"
+#                                      for each transport-owned dependency and
+#                                      exit nonzero when any is missing; jq is a
+#                                      letterbox-core dependency checked by callers
 #   require-private                    exit 0 only when the channel repository is
 #                                      still private; otherwise print one reason
 #                                      line and exit 2 when the repository is
@@ -74,6 +78,27 @@ esac
 case "${REPO%%/*}" in ''|*[!A-Za-z0-9._-]*) die "letterbox transport: bad repository owner" ;; esac
 case "${REPO#*/}" in ''|*[!A-Za-z0-9._-]*) die "letterbox transport: bad repository name" ;; esac
 
+transport_dependencies() {
+  local dependency rc=0
+  for dependency in gh-axi gh; do
+    if command -v "$dependency" >/dev/null 2>&1; then
+      printf 'present %s\n' "$dependency"
+    else
+      printf 'missing %s\n' "$dependency"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+VERB=${1-}
+shift 2>/dev/null || true
+
+if [ "$VERB" = dependencies ]; then
+  transport_dependencies
+  exit
+fi
+
 command -v gh-axi >/dev/null 2>&1 || die "letterbox transport: gh-axi is not installed"
 command -v gh >/dev/null 2>&1 || die "letterbox transport: gh is not installed"
 command -v jq >/dev/null 2>&1 || die "letterbox transport: jq is not installed"
@@ -120,6 +145,22 @@ find_title_number() {
   return "$rc"
 }
 
+extract_last_url() {
+  local pattern=$1 value=$2 tmp rc line last=''
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-github.XXXXXX") || return 1
+  grep -oE -e "$pattern" <<< "$value" > "$tmp" 2>/dev/null
+  rc=$?
+  case "$rc" in
+    0|1) : ;;
+    *) rm -f -- "$tmp"; return 1 ;;
+  esac
+  while IFS= read -r line; do
+    last=$line
+  done < "$tmp"
+  rm -f -- "$tmp"
+  printf '%s\n' "$last"
+}
+
 # A write refused for visibility must never be retried past the refusal, so
 # every write verb funnels through this one gate. Its exit status carries the
 # class: the caller checked visibility moments earlier, and a repository that
@@ -141,9 +182,6 @@ gate_write() {
 need_value() {
   [ "$#" -ge 2 ] || die "letterbox transport: $1 needs a value"
 }
-
-VERB=${1-}
-shift 2>/dev/null || true
 
 case "$VERB" in
   require-private)
@@ -204,7 +242,8 @@ case "$VERB" in
       printf '%s\n' "letterbox transport: create failed: $OUT" >&2
       exit 1
     }
-    URL=$(printf '%s\n' "$OUT" | grep -oE 'https://[A-Za-z0-9._/-]+/issues/[0-9]+' | tail -n1)
+    URL=$(extract_last_url 'https://[A-Za-z0-9._/-]+/issues/[0-9]+' "$OUT") \
+      || die "letterbox transport: cannot parse the create response"
     if [ -n "$URL" ]; then
       printf '%s %s\n' "${URL##*/}" "$URL"
       exit 0
@@ -241,7 +280,8 @@ case "$VERB" in
     }
     # The URL is informational; the reply landed either way, so a CLI that does
     # not print one is not a failure.
-    printf '%s\n' "$OUT" | grep -oE 'https://[A-Za-z0-9._#/-]+' | tail -n1 || true
+    URL=$(extract_last_url 'https://[A-Za-z0-9._#/-]+' "$OUT") || URL=
+    [ -z "$URL" ] || printf '%s\n' "$URL"
     ;;
 
   close)
