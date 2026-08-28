@@ -16,7 +16,11 @@
 # fixed mapping logic, no heuristics and no LLM. Output is one stable, parseable,
 # token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|remote-endpoint|none> · <detail>
+#   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|run-step+status-log|pane|status-log|remote-endpoint|none> · <detail>
+#
+# `run-step+status-log` is the one verdict both sources produce together: a crew
+# that DECLARED an external wait while its run-step is only monitoring CI (step 3
+# below).
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta. A meta
@@ -42,10 +46,18 @@
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
 #      green, so a green PR is never silently read as still-validating.
-#   3. Reconcile the status log: if its last line says needs-decision/blocked but
-#      the run-step shows the run moved on, the log is deterministically stale and
-#      is flagged superseded. A genuinely parked run plus a needs-decision log
-#      agree, and are reported as parked.
+#   3. Reconcile the status log against that run. A DECLARED external wait
+#      (`paused: <reason>`) outranks the run-step ONLY while the run is merely
+#      waiting - the ci monitor phase, which holds the PR open until it is merged
+#      or closed - and is then reported as paused · run-step+status-log, so an
+#      idle pane waiting on a captain's merge is not escalated as a possible
+#      wedge. A running or fixing step, a gate awaiting the crew's response, and a
+#      coarse runs-list verdict with no visible phase all keep the run-step's own
+#      state: a crew cannot declare itself paused out of work it must drive.
+#      Separately, if the log's last line says needs-decision/blocked but the
+#      run-step shows the run moved on, the log is deterministically stale and is
+#      flagged superseded. A genuinely parked run plus a needs-decision log agree,
+#      and are reported as parked.
 #   4. No run for this crew (pre-validation, or kind=scout): fall back to the
 #      recorded backend's pane busy state, then the status log's last line only
 #      when its verb maps to a recognized run-state. Decision-only events such as
@@ -560,6 +572,27 @@ if [ "$HAVE_RUN" = 1 ]; then
     if [ "$CI_LOG_STATE" != not-ready ]; then
       emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
     fi
+  fi
+
+  # A DECLARED external wait outranks a run-step that is only WAITING. While the
+  # pipeline sits in its CI monitor phase it holds the PR open until that PR is
+  # merged or closed, so the crew has nothing left to drive and its own
+  # `paused: <reason>` line is the more specific account of why the pane is idle.
+  # Reporting that as working made the supervisors' shared absorb class
+  # (fm-classify-lib.sh's crew_absorb_class) treat a captain-owned merge wait as a
+  # possible wedge and escalate it every wedge window for hours.
+  # The run-step stays authoritative everywhere else, because a crew cannot
+  # declare itself paused out of work it is supposed to be driving: a running or
+  # fixing step, a gate awaiting its response, and a coarse runs-list verdict that
+  # exposes no phase at all each keep their own state. CI_STEP_STATUS is the one
+  # provable waiting phase this reader has (nm_effective_ci_step_status, which
+  # already reports `fixing` rather than `running` whenever the pipeline is
+  # actively repairing), and RUN_STATE is still working here, so a green PR that
+  # became done above is likewise unaffected.
+  if [ "$RUN_STATE" = working ] && [ "$CI_STEP_STATUS" = running ] \
+    && status_is_paused "$LOG_LINE"; then
+    emit paused run-step+status-log \
+      "$(status_line_note "$LOG_LINE")${SEP}run monitoring CI until merged or closed"
   fi
 
   # Reconcile the status log. A needs-decision/blocked log line that the run-step

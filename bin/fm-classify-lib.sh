@@ -1095,9 +1095,12 @@ signal_reason_is_actionable() {  # <file> ...
 #             pause (paused:), which is EXPECTED to idle;
 #   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
 #             torn-down/unknown crew, or an unreadable verdict).
-# One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
-# authoritatively (not the status log) is what keeps run-step precedence: a crew
-# that appended paused: but then STARTED a run reports working, never paused.
+# One fm-crew-state.sh read serves BOTH absorb reasons at once, and that reader is
+# the single owner of how a run-step and a declared pause rank against each other
+# (see its header): a crew that appended paused: but then started a run it must
+# drive reports working, while one whose run is merely monitoring CI reports its
+# declared pause. Reading the state rather than the status log is what keeps that
+# one owner in force here.
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
 # run it only on no-verb signal and first-sighting stale paths, never every wake.
 # FM_CREW_STATE_BIN lets tests stub the verdict.

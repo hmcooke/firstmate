@@ -772,6 +772,112 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   pass "a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated"
 }
 
+# --- declared pause while the pipeline only MONITORS -------------------------
+# The live 2026-08-27/28 case: a ship crew whose PR is left for the captain to
+# merge sat in the pipeline's CI monitor phase and declared its own external
+# wait. bin/fm-crew-state.sh now reports that as a declared pause sourced from
+# the run-step AND the status log (state: paused · source: run-step+status-log),
+# and the watcher must treat it exactly like any other declared wait: the
+# bounded pause cadence with its .paused-<key> marker, never the wedge timer.
+# The disconfirming half is the same declared pause while the run-step is still
+# ACTIVELY working - a crew cannot declare itself paused out of work it is meant
+# to be driving, so that one keeps the wedge timer and escalates.
+test_declared_pause_during_ci_monitor_is_bounded_not_wedged() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid back
+  dir=$(make_case ci-monitor-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/merge.status"
+  window="test:fm-merge"
+  printf 'idle awaiting the merge\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/merge.meta"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-merge_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle awaiting the merge")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # First sight surfaces once (a live agent's first declared wait is shown), and
+  # must record the pause cadence marker rather than starting a wedge timer.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: paused · source: run-step+status-log · waiting on the captain to merge PR 1 · run monitoring CI until merged or closed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a declared wait during CI monitoring did not surface on first sight"
+  [ -e "$state/.paused-$key" ] || fail "a declared wait during CI monitoring recorded no pause cadence marker"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the first declared-wait surface"
+
+  # Re-arm with the wedge timer already past its threshold: the pause cadence
+  # must absorb it and discard that timer instead of escalating a possible wedge.
+  printf '%s\n' $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: paused · source: run-step+status-log · waiting on the captain to merge PR 1 · run monitoring CI until merged or closed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"
+    fail "a declared wait during CI monitoring wedge-escalated: $(cat "$out")"
+  fi
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "the CI-monitor pause cadence marker was cleared"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "a declared wait during CI monitoring kept the wedge timer"; }
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional CI-monitor absorb stop"
+
+  # Past the re-surface window (anchored on the pause's own status-file age) it
+  # comes back once as an awaiting-external recheck, never as a wedge.
+  back=$(( $(date +%s) - 5000 ))
+  if [ "$(uname)" = Darwin ]; then
+    touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf" "$state/.paused-resurfaced-$key"
+  else
+    touch -m -d "@$back" "$statusf" "$state/.paused-resurfaced-$key"
+  fi
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-merge_status"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: paused · source: run-step+status-log · waiting on the captain to merge PR 1 · run monitoring CI until merged or closed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a declared wait during CI monitoring never re-surfaced for a recheck"
+  grep -F "awaiting external" "$out" >/dev/null || fail "the CI-monitor pause recheck was not labeled an external wait"
+  grep -F "possible wedge" "$out" >/dev/null && fail "the CI-monitor pause recheck was mislabeled a possible wedge"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the CI-monitor pause recheck"
+
+  # Disconfirming case: the identical declared pause while the run-step is still
+  # actively validating stays working, so the wedge timer still owns it.
+  dir=$(make_case active-run-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/active.status"
+  window="test:fm-active"
+  printf 'idle mid-validation\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/active.meta"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-active_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle mid-validation")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # This exact stale hash was already classified once and its wedge timer is
+  # past the threshold - the repeat-escalation state the live case sat in.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '%s\n' $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "an actively validating crew did not use the wedge timer despite a declared pause"
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "an actively validating crew's declared pause suppressed its wedge escalation"
+  [ ! -e "$state/.paused-$key" ] || fail "an actively validating crew was given the pause cadence marker"
+  pass "a declared wait during CI monitoring is bounded, while the same wait mid-validation still wedge-escalates"
+}
+
 # A captain-held crew can leave a stable backend endpoint after its agent exits.
 # fm-crew-state then authoritatively reports stopped rather than paused, but the
 # confirmed-dead agent plus the declared wait or captain-held transfer must retain
@@ -1954,6 +2060,7 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
 test_busy_pane_default_turn_age_bound_is_3600s
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
+test_declared_pause_during_ci_monitor_is_bounded_not_wedged
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
