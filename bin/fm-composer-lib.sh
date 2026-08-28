@@ -337,7 +337,7 @@ FM_DELIVERY_CURSOR_BUSY_REGEX_DEFAULT='ctrl\+c to stop'
 FM_DELIVERY_KIMI_BUSY_REGEX_DEFAULT='^[[:space:]]*(🌑|🌒|🌓|🌔|🌕|🌖|🌗|🌘)[[:space:]]+·[[:space:]]+'
 
 fm_busy_lines_match() {  # [harness] [nonblank-limit] [composer-mode]
-  local harness=${1:-} limit=${2:-12} composer_mode=${3:-exclude} lines regex
+  local harness=${1:-} limit=${2:-12} composer_mode=${3:-include} lines regex
   case "$limit" in ''|0|*[!0-9]*) return 1 ;; esac
   IFS= read -r -d '' lines || true
   case "$composer_mode" in
@@ -1338,8 +1338,8 @@ EOF
 # stays a loud refusal rather than a blind retry into an unreadable pane.
 # tmux keeps its own richer core (bin/fm-tmux-lib.sh: the busy-queued-Enter
 # and idle-baseline turn-started conversions its busy primitive enables), and
-# herdr confirms through native agent-state with affirmative clearance after a
-# missed transition; both consume the same shared
+# herdr confirms through native agent-state with a rendered-footer fallback;
+# both consume the same shared
 # verdict, so no shape knowledge lives in any of the three loops.
 fm_composer_submit_retry_core() {  # <send-key-fn> <state-fn> <target> <retries> <enter-sleep> [expected-label]
   local send_key_fn=$1 state_fn=$2 target=$3 retries=$4 sleep_s=$5 expected_label=${6:-} i=0 state

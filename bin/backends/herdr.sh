@@ -2712,7 +2712,7 @@ fm_backend_herdr_composer_content() {  # <target> -> composer text on stdout
 # shared matcher uses its union of verified tokens, which is what the submit
 # core wants: it has no recorded harness for the pane.
 fm_backend_herdr_rendered_busy_state() {  # <target> [harness] [composer-mode] -> busy|idle|unknown
-  local target=$1 harness=${2:-} composer_mode=${3:-exclude} cap visible
+  local target=$1 harness=${2:-} composer_mode=${3:-include} cap visible
   cap=$(fm_backend_herdr_capture "$target" 40) || { printf 'unknown'; return 0; }
   visible=$(printf '%s' "$cap" | grep -v '^[[:space:]]*$' | tail -12)
   [ -n "$visible" ] || { printf 'unknown'; return 0; }
@@ -2726,7 +2726,7 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] [composer-mode] -
 # fm_backend_herdr_send_text_submit types <text> into <target> once, while
 # fm_backend_herdr_submit_enter starts from text already in the composer.
 # Both submit with a named Enter key, retrying only while native state and
-# affirmative composer clearance cannot confirm it landed. Verified hazard (herdr-verification-p2.md
+# the conservative fallback cannot confirm it landed. Verified hazard (herdr-verification-p2.md
 # "slash/$ autocomplete popup"): a `/`- or `$`-prefixed send opens a
 # completion popup within ~0.1s, exactly like tmux's claude/codex popups, so
 # the caller's <settle> before the first Enter matters here the same way it
@@ -2735,19 +2735,17 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] [composer-mode] -
 # Confirmation signal (rewritten for the 2026-07-07 incident below;
 # superseded a composer-content read that itself replaced a delta-based check
 # for the 2026-07-03 incident): when the target is legibly idle before Enter,
-# submission is confirmed first by fm_backend_herdr_wait_for_working observing
-# a submit-active agent_status after Enter. Only a missed transition reaches
-# affirmative composer clearance, so native state remains the primary
-# cross-agent signal regardless of what text a harness's idle composer displays.
+# submission is confirmed by fm_backend_herdr_wait_for_working observing a
+# submit-active agent_status after Enter, regardless of what text a harness's
+# idle composer displays.
 #
 # Incident (2026-07-07, followed up on 2026-07-08): a redelivery loop in the
 # away-mode daemon. Root cause: composer-content submit confirmation was too
 # sensitive to harness rendering details. Real claude/codex use bare prompt
 # rows, and real codex adds dynamic idle suggestions after `›`; the later
 # ANSI-aware composer classifier now handles the pre-injection guard for that
-# Codex shape, but idle-baseline submit confirmation prioritizes native
-# agent-state and consults composer clearance only after the polling window
-# misses a transition. Composer content is also retained for the away-mode
+# Codex shape, while idle-baseline submit confirmation uses native agent-state.
+# Composer content is retained for the away-mode
 # daemon's PRE-injection empty-box guard, still dispatched via
 # fm_backend_composer_state / fm_backend_herdr_composer_state, and for submit
 # attempts whose pre-Enter agent-state baseline is not legibly idle.
@@ -2771,52 +2769,39 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] [composer-mode] -
 #     polls): unavoidable in the absolute, but bounded by how tightly polls
 #     are packed into the budget; real claude/codex measured first-working
 #     at 90-490ms, comfortably inside a several-hundred-ms, multiply-sampled
-#     window. If every native sample misses that transition, an affirmatively
-#     empty composer confirms that Enter landed, while pending text still earns
-#     only another Enter retry.
+#     window. If every native sample misses that transition, the verdict stays
+#     pending and only Enter is retried.
 # Fallback path, for a harness whose native agent-state is not legibly idle:
 # an idle-to-busy rendered-footer transition ACROSS our Enter proves the
 # harness accepted the submission. The pre-Enter baseline excludes the selected
-# composer region, while the post-Enter read includes that row only after its
-# selected content differs from the submitted text.
+# composer region, while the post-Enter read keeps the whole rendered tail.
 # Echoes empty|pending|unknown|send-failed, a subset of the proof-carrying
 # submit vocabulary. Empty means confirmed submitted for every backend; how
 # each backend confirms it is an internal decision, and herdr's is no longer
 # literally "the composer read empty".
-fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep> [expected-text]
+fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
   local target=$1 retries=$2 sleep_s=$3 i=0 verdict baseline confirm_sleep
-  local expected=${4:-} raw_status footer_baseline='' post_content
-  fm_composer_normalize_spaces_var expected
-  expected=${expected//[$' \t\r\n\v\f']/}
+  local raw_status footer_baseline=''
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   raw_status=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
   baseline=$(fm_backend_herdr_classify_submit_agent_status "$raw_status")
   confirm_sleep=$(fm_backend_herdr_submit_confirm_budget "$sleep_s")
   # Typing never starts a turn, so a footer read taken after the literal send
   # and before the first Enter is still a pre-submission baseline.
-  [ "$baseline" = idle ] || footer_baseline=$(fm_backend_herdr_rendered_busy_state "$target")
+  [ "$baseline" = idle ] || footer_baseline=$(fm_backend_herdr_rendered_busy_state "$target" '' exclude)
   while :; do
     fm_backend_herdr_send_key "$target" Enter || true
     if [ "$baseline" = idle ]; then
       verdict=$(fm_backend_herdr_wait_for_working "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE" \
         "$confirm_sleep" "$FM_BACKEND_HERDR_SUBMIT_POLLS")
-      [ "$verdict" != idle ] || verdict=$(fm_backend_herdr_composer_state "$target")
     else
       sleep "$sleep_s"
       verdict=$(fm_backend_herdr_composer_state "$target")
       case "$verdict" in
         pending|unknown)
-          post_content=
-          if [ -n "$expected" ] \
-            && post_content=$(fm_backend_herdr_composer_content "$target" 2>/dev/null); then
-            fm_composer_normalize_spaces_var post_content
-            post_content=${post_content//[$' \t\r\n\v\f']/}
-          fi
-          if [ -n "$post_content" ] \
-            && [ "$post_content" != "$expected" ] \
-            && [ "$raw_status" != working ] \
+          if [ "$raw_status" != working ] \
             && [ "$footer_baseline" = idle ] \
-            && [ "$(fm_backend_herdr_rendered_busy_state "$target" '' include)" = busy ]; then
+            && [ "$(fm_backend_herdr_rendered_busy_state "$target")" = busy ]; then
             verdict=busy
           fi
           ;;
@@ -2837,7 +2822,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
-  fm_backend_herdr_submit_enter "$target" "$retries" "$sleep_s" "$text"
+  fm_backend_herdr_submit_enter "$target" "$retries" "$sleep_s"
 }
 
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors

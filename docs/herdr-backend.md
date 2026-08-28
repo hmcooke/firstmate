@@ -212,18 +212,16 @@ Enter, Escape, and Ctrl-C are supported.
 Slash and dollar-prefixed input uses the shared harness-aware settle before the first Enter so a completion popup cannot consume it.
 Text is typed once; only Enter is retried.
 
-On an idle or done native baseline, submit confirmation first waits for `working` or `blocked` across a bounded polling window, then accepts only a positively empty composer if the transition was missed.
-On an already active or unreadable baseline, it falls back to conservative composer clearance.
+On an idle or done native baseline, submit confirmation waits for `working` or `blocked` across a bounded polling window, and a missed transition remains pending while only Enter is retried.
+On an already active or unreadable baseline, it falls back to conservative composer clearance and a rendered idle-to-busy transition.
 A fully unreadable target stops retrying and reports unknown.
 
-Some harnesses never present a legibly idle native baseline at all, so the composer fallback is their only path.
+Some harnesses never present a legibly idle native baseline at all, so the conservative fallback is their only path.
 Herdr reports a Cursor pane `blocked` in every state, and Cursor's mid-turn composer renders its placeholder beside a right-aligned busy token, which is composer content and therefore `pending` on a composer that holds no user text.
-The pre-Enter rendered-busy baseline excludes the selected composer region, so pending input cannot establish the starting side of a transition.
-After Enter, the adapter compares the selected composer content with the submitted text after stripping whitespace, and an equal value remains pending because the text has not left.
-Only a positively different post-Enter composer permits a busy token on that row to confirm the transition, while an idle-to-busy footer outside the composer remains valid under the same proof.
+Only the away daemon's pre-injection busy guard and Herdr's pre-Enter rendered-busy baseline exclude the selected composer region, so the daemon's pending digest cannot establish either precondition.
+Herdr's post-Enter rendered read, tmux delivery busy state, and pending-reply observation keep the whole tail because Cursor's verified `ctrl+c to stop` signal shares its composer row.
 It is the same semantic signal the native path uses and the same one the tmux submit core reads, so a pane already mid-turn before the text was typed still reports `pending` rather than borrowing another turn as proof of this delivery.
-Cursor's right-aligned status token can therefore confirm a landed steer only after the typed content has positively left the composer.
-The affirmative empty-composer fallback closes the residual possibility of an extremely fast complete turn without reporting its landed Enter as pending or permitting duplicate message text.
+Cursor delivery confirmation on tmux and Herdr is therefore unchanged by the away-mode composer exclusion.
 
 `pane read --lines N` can return empty output when N is below the viewport height.
 The capture owner requests at least 200 lines from Herdr and trims locally to the caller's bound.
@@ -348,6 +346,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
   The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
 - Only tmux and Herdr can host the away-mode supervisor terminal.
 - Own-unsent recovery needs the digest's envelope visible in the composer, so a digest that has scrolled its opening out of view is not recovered.
+- The Herdr non-idle fallback compares a composer-excluded pre-Enter baseline with a whole-tail post-Enter read, so a swallowed long digest whose visible suffix contains a verified busy token can be reported as confirmed.
 
 ## Regression entry points
 

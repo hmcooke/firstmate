@@ -327,25 +327,17 @@ test_claude_busy_signature_uses_real_capture_shapes() {
   pass "fm_pane_is_busy: Claude spinner is scoped, multi-frame, and backward-compatible"
 }
 
-test_busy_state_preserves_full_capture_geometry() {
-  local dir fakebin composer harness token screen out
+test_busy_state_keeps_composer_row_tokens_visible() {
+  local dir fakebin composer screen out
   dir="$TMP_ROOT/full-capture-geometry"
   fakebin=$(make_submit_mock "$dir")
   composer="$dir/composer"
-  while IFS="$(printf '\t')" read -r harness token; do
-    [ -n "$harness" ] || continue
-    screen=$(fm_test_busy_token_inside_composer "$token")
-    printf '%s' "$screen" > "$composer"
-    out=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$composer" \
-      fm_pane_busy_state firstmate:0 "$harness")
-    [ "$out" = idle ] || fail "$harness composer text made tmux busy state '$out'"
-    screen=$(fm_test_busy_footer_below_bare_composer "$token")
-    printf '%s' "$screen" > "$composer"
-    out=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$composer" \
-      fm_pane_busy_state firstmate:0 "$harness")
-    [ "$out" = busy ] || fail "$harness external footer made tmux busy state '$out'"
-  done < <(fm_test_delivery_busy_cases)
-  pass "tmux busy state excludes composers before folding every harness capture"
+  screen=$(fm_test_busy_token_inside_composer 'ctrl+c to stop')
+  printf '%s' "$screen" > "$composer"
+  out=$(PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$composer" \
+    fm_pane_busy_state firstmate:0 cursor)
+  [ "$out" = busy ] || fail "Cursor's composer-row token was hidden from tmux busy state: $out"
+  pass "tmux busy state keeps composer-row delivery tokens visible"
 }
 
 test_busy_pane_pending_returns_empty
@@ -359,4 +351,4 @@ test_failed_baseline_capture_keeps_busy_unknown_unconfirmed
 test_busy_pane_ambiguous_pending_retries_without_conversion
 test_unrecognized_state_skips_busy_conversion
 test_claude_busy_signature_uses_real_capture_shapes
-test_busy_state_preserves_full_capture_geometry
+test_busy_state_keeps_composer_row_tokens_visible

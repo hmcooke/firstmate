@@ -1534,67 +1534,6 @@ test_recovery_rejects_invalid_budget_inputs() {
   pass "recovery fails closed on malformed state and invalid limits"
 }
 
-test_empty_composer_never_retypes_a_matching_unsent_record() {
-  local dir state send_log alarm_log rc
-  dir=$(make_supercase own-unsent-delivery-ambiguous)
-  state="$dir/state"
-  send_log="$dir/send.log"; : > "$send_log"
-  alarm_log="$dir/alarm.log"; : > "$alarm_log"
-  escalate_add "$state" "done: delivered ambiguously"
-  afk_enter "$state"
-  printf '2\n' > "$state/.subsuper-inject-recover-attempts"
-  (
-    fm_backend_target_exists() { return 0; }
-    pane_is_busy() { return 1; }
-    fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'pending'; }
-    if LOG="$alarm_log" FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
-      escalate_flush "$state"; then
-      fail "the setup submit unexpectedly confirmed"
-    fi
-  ) || fail "ambiguous-delivery setup flush failed"
-  [ -s "$state/.subsuper-inject-unsent" ] || fail "the unconfirmed digest was not recorded"
-  printf '2\n' > "$state/.subsuper-inject-recover-attempts"
-  : > "$send_log"
-  (
-    trap 'exit 143' TERM
-    fm_backend_target_exists() { return 0; }
-    pane_is_busy() { return 1; }
-    fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'pending'; }
-    _inject_recover_attempts_reset() { kill -TERM "${BASHPID:-$$}"; }
-    LOG="$alarm_log" FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
-      escalate_flush "$state"
-  )
-  rc=$?
-  [ "$rc" -eq 143 ] || fail "ambiguous resolution was not interrupted between buffer clear and state retirement: rc=$rc"
-  [ ! -s "$send_log" ] || fail "an empty composer caused the recorded digest to be retyped"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "the interrupted ambiguous resolution did not clear the buffer first"
-  [ -s "$state/.subsuper-inject-unsent" ] || fail "interruption retired the no-retype guard before resolution completed"
-  [ -s "$state/.subsuper-inject-recover-attempts" ] || fail "interruption retired recovery state before resolution completed"
-  escalate_add "$state" "done: delivered ambiguously"
-  : > "$alarm_log"
-  (
-    fm_backend_target_exists() { return 0; }
-    pane_is_busy() { return 1; }
-    fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'pending'; }
-    LOG="$alarm_log" FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
-      escalate_flush "$state"
-  ) || fail "ambiguous-delivery retry flush failed"
-  [ ! -s "$send_log" ] || fail "the interrupted digest was retyped on retry"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "the ambiguous delivered digest stayed buffered"
-  [ ! -e "$state/.subsuper-inject-unsent" ] || fail "the handled unsent record survived"
-  [ ! -e "$state/.subsuper-inject-recover-attempts" ] || fail "the handled recovery budget survived"
-  [ "$(grep -c 'ERROR: away-mode escalation delivery ambiguous' "$alarm_log" 2>/dev/null || true)" -eq 1 ] \
-    || fail "ambiguous delivery did not raise exactly one alarm line: $(cat "$alarm_log" 2>/dev/null)"
-  LOG="$alarm_log" FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
-    escalate_flush "$state" || fail "an empty handled buffer should be a no-op"
-  [ "$(grep -c 'ERROR: away-mode escalation delivery ambiguous' "$alarm_log" 2>/dev/null || true)" -eq 1 ] \
-    || fail "ambiguous delivery raised its alarm more than once"
-  pass "ambiguous delivery clears its buffer before retiring the no-retype guard and alarms once"
-}
-
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
   local dir state fakebin sent last
   dir=$(make_bordered_case own-unsent-grown-buffer)
@@ -2515,7 +2454,6 @@ test_own_unsent_recovery_with_grown_buffer_keeps_new_items
 test_recovery_budget_resets_when_a_fresh_digest_is_typed
 test_recovery_requires_persisted_budget_transitions
 test_recovery_rejects_invalid_budget_inputs
-test_empty_composer_never_retypes_a_matching_unsent_record
 test_watcher_collision_is_silent_below_the_bound
 test_persistent_watcher_collision_escalates_once
 test_watcher_collision_episode_clears_on_verified_ownership

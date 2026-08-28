@@ -603,7 +603,7 @@ pane_is_busy() {  # <target> [backend]
     idle) return 1 ;;
   esac
   tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || return 1
-  printf '%s' "$tail40" | fm_busy_lines_match "$harness" 12
+  printf '%s' "$tail40" | fm_busy_lines_match "$harness" 12 exclude
 }
 
 # pane_input_pending dispatches through fm_backend_composer_state and treats
@@ -651,19 +651,11 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
-_escalation_buffer_clear() {  # <buffer>
-  local buf=$1 tmp="$1.clear.${BASHPID:-$$}"
-  if ! : > "$tmp" 2>/dev/null || ! mv "$tmp" "$buf" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
-    return 1
-  fi
-}
-
 # Flush the escalation buffer as ONE batched, single-line digest to the
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg rc
+  local state=$1 buf item n msg
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(wc -l < "$buf" 2>/dev/null || echo 0)
@@ -672,26 +664,7 @@ escalate_flush() {  # <state>
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  inject_msg "$msg" "$state"
-  rc=$?
-  case "$rc" in
-    0)
-      _escalation_buffer_clear "$buf" || return 1
-      rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
-      return 0
-      ;;
-    2)
-      if ! _escalation_buffer_clear "$buf"; then
-        log "inject deferred: ambiguous-delivery buffer could not be cleared"
-        return 1
-      fi
-      log "ERROR: away-mode escalation delivery ambiguous; refusing to retype the recorded digest and clearing its buffer."
-      _inject_recover_attempts_reset "$state" || return 1
-      rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || return 1
-      rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
-      return 0
-      ;;
-  esac
+  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
   return 1
 }
 
@@ -1207,22 +1180,6 @@ _inject_recover_attempts_reset() {  # <state>
   [ ! -e "$counter" ] || rm -f "$counter" 2>/dev/null
 }
 
-_inject_unsent_matches() {  # <state> <message>
-  local record="$1/.subsuper-inject-unsent" saved
-  [ -f "$record" ] || return 1
-  saved=$(cat "$record" 2>/dev/null) || return 1
-  [ "$saved" = "$2" ]
-}
-
-_inject_unsent_store() {  # <state> <message>
-  local record="$1/.subsuper-inject-unsent" tmp
-  tmp="$record.tmp.$$"
-  if ! printf '%s' "$2" > "$tmp" 2>/dev/null || ! mv "$tmp" "$record" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
-    return 1
-  fi
-}
-
 # inject_recover_own_unsent: submit our own unsent digest with Enter only.
 #
 # Returns 0 ONLY when the submit was confirmed AND the recovered text is the
@@ -1260,7 +1217,7 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
   fi
   verdict=$(fm_backend_submit_enter "$backend" "$target" \
     "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
-    "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}" "$recovered")
+    "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}")
   if [ "$verdict" != empty ]; then
     log "inject recovery: our own unsent digest is still unsubmitted (verdict=$verdict); deferring"
     return 1
@@ -1288,8 +1245,7 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
 #     sentinel-prefixed digests into one corrupted turn.
 #   - SUBMIT ACK = the backend submit primitive reports `empty` after Enter.
 #     For tmux that means a cleared composer; for herdr's normal idle-baseline
-#     path it means native agent-state observed a real turn start or the
-#     post-poll composer was affirmatively empty.
+#     path it means native agent-state observed a real turn start.
 #     Pending means Enter was swallowed; unknown is treated as undelivered by
 #     this strict daemon path.
 #   - COMPOSER GUARD before typing: if the cursor line already has real content
@@ -1359,19 +1315,11 @@ inject_msg() {  # <message> [state]
   # re-export of fm_tmux_submit_core - byte-identical to calling it directly.
   retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
-  if _inject_unsent_matches "$state" "$msg"; then
-    return 2
-  fi
   # Reaching an affirmatively empty composer ends any previous unsent episode:
   # whatever was stuck is gone, so a fresh digest starts with a full recovery
   # budget rather than inheriting an exhausted one.
   if ! _inject_recover_attempts_reset "$state"; then
     log "inject deferred: stale recovery budget could not be cleared"
-    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
-    return 1
-  fi
-  if ! _inject_unsent_store "$state" "$msg"; then
-    log "inject deferred: unsent digest record could not be persisted"
     inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
     return 1
   fi
@@ -1382,12 +1330,10 @@ inject_msg() {  # <message> [state]
     rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
     return 0  # Backend confirmed the submit.
   fi
-  if [ "$verdict" = send-failed ]; then
-    rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
-  fi
   # Our text is now sitting unsent in the composer. Record it verbatim so the
   # next cycle can tell a full recovery (same digest, buffer clearable) from a
   # partial one (buffer has grown since), and so recovery attempts stay bounded.
+  printf '%s' "$msg" > "$state/.subsuper-inject-unsent" 2>/dev/null || true
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1
 }
