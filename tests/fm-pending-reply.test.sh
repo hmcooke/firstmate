@@ -843,6 +843,26 @@ test_busy_idle_observation_via_backend_abstraction() {
   pass "backend busy/idle observation covers Pi/Claude paths without conversation scrape"
 }
 
+test_fallback_observation_preserves_full_capture_geometry() {
+  local harness token screen out
+  (
+    fm_backend_busy_state() { printf 'unknown'; }
+    fm_backend_capture() { printf '%s' "$screen"; }
+    while IFS="$(printf '\t')" read -r harness token; do
+      [ -n "$harness" ] || continue
+      screen=$(fm_test_busy_token_inside_composer "$token")
+      out=$(fm_pending_reply_backend_observation tmux firstmate:0 '' "$harness")
+      [ "$out" = fallback-idle ] \
+        || fail "$harness composer text made pending-reply observation '$out'"
+      screen=$(fm_test_busy_footer_below_bare_composer "$token")
+      out=$(fm_pending_reply_backend_observation tmux firstmate:0 '' "$harness")
+      [ "$out" = busy ] \
+        || fail "$harness external footer made pending-reply observation '$out'"
+    done < <(fm_test_delivery_busy_cases)
+  ) || fail "pending-reply full-capture busy matrix subshell failed"
+  pass "pending-reply fallback excludes composers before folding every harness capture"
+}
+
 test_unknown_backend_state_uses_capture_fallback() {
   local backend
   for backend in tmux zellij; do
@@ -1111,6 +1131,7 @@ test_fm_send_marked_secondmate_creates_pending_and_embeds_corr
 test_document_pointer_resolves
 test_helper_report_resolves
 test_busy_idle_observation_via_backend_abstraction
+test_fallback_observation_preserves_full_capture_geometry
 test_unknown_backend_state_uses_capture_fallback
 test_kimi_capture_fallback_uses_recorded_harness
 test_tick_skips_terminal_and_reuses_target_observation

@@ -1450,6 +1450,54 @@ test_recovery_budget_resets_when_a_fresh_digest_is_typed() {
   pass "reaching an empty composer ends the unsent episode and restores the recovery budget"
 }
 
+test_recovery_requires_persisted_budget_transitions() {
+  local dir state msg enter_log send_log alarm_log
+  dir=$(make_supercase own-unsent-budget-write-failure)
+  state="$dir/state"
+  enter_log="$dir/enter.log"; : > "$enter_log"
+  send_log="$dir/send.log"; : > "$send_log"
+  alarm_log="$dir/alarm.log"; : > "$alarm_log"
+  fm_operational_input_encode away-supervisor "done: durable budget" msg \
+    || fail "could not encode the recovery-budget digest"
+
+  chmod 500 "$state"
+  (
+    fm_backend_composer_content() { printf '%s' "$msg"; }
+    fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
+    inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
+    if FM_INJECT_RECOVER_ATTEMPTS=2 \
+      inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
+      fail "recovery succeeded without persisting its attempt count"
+    fi
+  ) || fail "failed-counter recovery subshell failed"
+  chmod 700 "$state"
+  [ ! -s "$enter_log" ] || fail "recovery sent Enter after its attempt-count write failed"
+  [ ! -e "$state/.subsuper-inject-recover-attempts" ] \
+    || fail "a failed first attempt-count write left a usable counter"
+
+  printf '9\n' > "$state/.subsuper-inject-recover-attempts"
+  afk_enter "$state"
+  chmod 500 "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'empty'; }
+    inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
+    if FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
+      inject_msg "done: durable budget" "$state"; then
+      fail "a fresh digest started without clearing its stale recovery counter"
+    fi
+  ) || fail "failed-counter reset subshell failed"
+  chmod 700 "$state"
+  [ "$(cat "$state/.subsuper-inject-recover-attempts")" = 9 ] \
+    || fail "the stale recovery budget was silently reset after clear failure"
+  [ ! -s "$send_log" ] || fail "a fresh digest was typed after its budget reset failed"
+  [ "$(grep -c '^alarm$' "$alarm_log" 2>/dev/null || true)" -eq 2 ] \
+    || fail "failed recovery-budget transitions did not take the wedge-alarm path"
+  pass "recovery never submits or resets its budget without durable state"
+}
+
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {
   local dir state fakebin sent last
   dir=$(make_bordered_case own-unsent-grown-buffer)
@@ -2097,6 +2145,25 @@ test_primary_busy_guard_is_harness_scoped() {
   pass "primary busy guard isolates rendered signatures by detected harness"
 }
 
+test_primary_busy_guard_preserves_full_capture_geometry() {
+  local harness token screen
+  (
+    fm_backend_busy_state() { printf 'unknown'; }
+    fm_backend_capture() { printf '%s' "$screen"; }
+    while IFS="$(printf '\t')" read -r harness token; do
+      [ -n "$harness" ] || continue
+      screen=$(fm_test_busy_token_inside_composer "$token")
+      if FM_DAEMON_PRIMARY_HARNESS="$harness" pane_is_busy firstmate:0 tmux; then
+        fail "$harness composer text established daemon busy"
+      fi
+      screen=$(fm_test_busy_footer_below_bare_composer "$token")
+      FM_DAEMON_PRIMARY_HARNESS="$harness" pane_is_busy firstmate:0 tmux \
+        || fail "$harness external footer stopped establishing daemon busy"
+    done < <(fm_test_delivery_busy_cases)
+  ) || fail "daemon full-capture busy matrix subshell failed"
+  pass "daemon busy fallback excludes composers before folding every harness capture"
+}
+
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted() {
   local dir fakebin capture
   dir=$(make_supercase busy-default-backend)
@@ -2306,6 +2373,7 @@ test_pending_human_draft_is_never_recovered
 test_own_unsent_recovery_is_bounded_and_still_alarms
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items
 test_recovery_budget_resets_when_a_fresh_digest_is_typed
+test_recovery_requires_persisted_budget_transitions
 test_watcher_collision_is_silent_below_the_bound
 test_persistent_watcher_collision_escalates_once
 test_watcher_collision_episode_clears_on_verified_ownership
@@ -2339,6 +2407,7 @@ test_discover_supervisor_target_herdr
 test_pane_is_busy_herdr_native_busy_state
 test_native_idle_keeps_busy_text_in_an_unsent_digest_recoverable
 test_primary_busy_guard_is_harness_scoped
+test_primary_busy_guard_preserves_full_capture_geometry
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted
 test_pane_input_pending_herdr_dispatch
 test_inject_msg_herdr_busy_guard_defers

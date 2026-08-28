@@ -3590,6 +3590,24 @@ test_rendered_busy_state_excludes_the_cursor_token_inside_composer() {
   pass "fm_backend_herdr_rendered_busy_state: excludes composer text and keeps unreadable panes unknown"
 }
 
+test_rendered_busy_state_preserves_full_capture_geometry() {
+  local harness token screen out
+  (
+    . "$ROOT/bin/backends/herdr.sh"
+    fm_backend_herdr_capture() { printf '%s' "$screen"; }
+    while IFS="$(printf '\t')" read -r harness token; do
+      [ -n "$harness" ] || continue
+      screen=$(fm_test_busy_token_inside_composer "$token")
+      out=$(fm_backend_herdr_rendered_busy_state default:w1:p2 "$harness")
+      [ "$out" = idle ] || fail "$harness composer text made Herdr rendered state '$out'"
+      screen=$(fm_test_busy_footer_below_bare_composer "$token")
+      out=$(fm_backend_herdr_rendered_busy_state default:w1:p2 "$harness")
+      [ "$out" = busy ] || fail "$harness external footer made Herdr rendered state '$out'"
+    done < <(fm_test_delivery_busy_cases)
+  ) || fail "Herdr full-capture busy matrix subshell failed"
+  pass "Herdr rendered busy excludes composers before folding every harness capture"
+}
+
 test_send_text_submit_confirms_external_footer_transition() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-cursor-footer-transition"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -4497,6 +4515,7 @@ test_send_text_submit_confirms_blocked_after_enter
 test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
 test_composer_state_cursor_midturn_row_reads_pending
 test_rendered_busy_state_excludes_the_cursor_token_inside_composer
+test_rendered_busy_state_preserves_full_capture_geometry
 test_send_text_submit_confirms_external_footer_transition
 test_submit_enter_excludes_an_unsent_digest_from_its_footer_baseline
 test_send_text_submit_never_idle_native_state_keeps_pending_without_a_transition

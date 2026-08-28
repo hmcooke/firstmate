@@ -603,8 +603,7 @@ pane_is_busy() {  # <target> [backend]
     idle) return 1 ;;
   esac
   tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || return 1
-  printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 \
-    | fm_busy_lines_match "$harness"
+  printf '%s' "$tail40" | fm_busy_lines_match "$harness" 12
 }
 
 # pane_input_pending dispatches through fm_backend_composer_state and treats
@@ -1163,6 +1162,20 @@ _inject_recover_attempts() {  # <state>
   printf '%s' "$n"
 }
 
+_inject_recover_attempts_store() {  # <state> <next>
+  local counter="$1/.subsuper-inject-recover-attempts" tmp
+  tmp="$counter.tmp.$$"
+  if ! printf '%s\n' "$2" > "$tmp" 2>/dev/null || ! mv "$tmp" "$counter" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+_inject_recover_attempts_reset() {  # <state>
+  local counter="$1/.subsuper-inject-recover-attempts"
+  [ ! -e "$counter" ] || rm -f "$counter" 2>/dev/null
+}
+
 # inject_recover_own_unsent: submit our own unsent digest with Enter only.
 #
 # Returns 0 ONLY when the submit was confirmed AND the recovered text is the
@@ -1183,7 +1196,11 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
     log "inject recovery exhausted after $attempts attempts; our own unsent digest is still in the supervisor composer"
     return 1
   fi
-  printf '%s\n' "$((attempts + 1))" > "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
+  if ! _inject_recover_attempts_store "$state" "$((attempts + 1))"; then
+    log "inject recovery exhausted: recovery budget could not be persisted"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
   verdict=$(fm_backend_submit_enter "$backend" "$target" \
     "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
     "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}")
@@ -1191,7 +1208,7 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
     log "inject recovery: our own unsent digest is still unsubmitted (verdict=$verdict); deferring"
     return 1
   fi
-  rm -f "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
+  _inject_recover_attempts_reset "$state" || true
   rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
   if [ "$recovered" = "$requested" ]; then
     log "inject recovery: submitted our own unsent digest with Enter only; delivery confirmed"
@@ -1287,7 +1304,11 @@ inject_msg() {  # <message> [state]
   # Reaching an affirmatively empty composer ends any previous unsent episode:
   # whatever was stuck is gone, so a fresh digest starts with a full recovery
   # budget rather than inheriting an exhausted one.
-  rm -f "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
+  if ! _inject_recover_attempts_reset "$state"; then
+    log "inject deferred: stale recovery budget could not be cleared"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
   verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
   if [ "$verdict" = empty ]; then
     # Delivered: no unsent text of ours remains, so drop any recovery state a
