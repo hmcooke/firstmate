@@ -1462,6 +1462,8 @@ test_recovery_requires_persisted_budget_transitions() {
   chmod 500 "$state"
   (
     fm_backend_composer_content() { printf '%s' "$msg"; }
+    [ "$(fm_backend_composer_content tmux firstmate:0)" = "$msg" ] \
+      || fail "recovery-budget composer stub did not return its digest"
     fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
     inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
     if FM_INJECT_RECOVER_ATTEMPTS=2 \
@@ -1508,6 +1510,8 @@ test_recovery_rejects_invalid_budget_inputs() {
   printf 'not-a-count\n' > "$state/.subsuper-inject-recover-attempts"
   (
     fm_backend_composer_content() { printf '%s' "$msg"; }
+    [ "$(fm_backend_composer_content tmux firstmate:0)" = "$msg" ] \
+      || fail "malformed-budget composer stub did not return its digest"
     fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
     inject_wedge_alarm() { printf 'alarm\n' >> "$alarm_log"; }
     if inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
@@ -1521,6 +1525,8 @@ test_recovery_rejects_invalid_budget_inputs() {
   printf '%s\n' "$INJECT_RECOVER_ATTEMPTS_DEFAULT" > "$state/.subsuper-inject-recover-attempts"
   (
     fm_backend_composer_content() { printf '%s' "$msg"; }
+    [ "$(fm_backend_composer_content tmux firstmate:0)" = "$msg" ] \
+      || fail "invalid-maximum composer stub did not return its digest"
     fm_backend_submit_enter() { printf 'enter\n' >> "$enter_log"; printf 'empty'; }
     if FM_INJECT_RECOVER_ATTEMPTS=not-a-number \
       inject_recover_own_unsent firstmate:0 tmux "$state" "$msg"; then
@@ -2198,6 +2204,8 @@ test_native_idle_keeps_busy_text_in_an_unsent_digest_recoverable() {
     fm_backend_capture() { printf '%s\n' "$pending"; }
     fm_backend_composer_state() { printf 'pending'; }
     fm_backend_composer_content() { printf '%s' "$pending"; }
+    [ "$(fm_backend_composer_content herdr default:w1:p2)" = "$pending" ] \
+      || fail "native-idle composer stub did not return its digest"
     fm_backend_submit_enter() { printf '[ENTER]\n' >> "$enter_log"; printf 'empty'; }
     fm_backend_send_text_submit() { fail "native-idle recovery retyped the pending digest"; }
     FM_DAEMON_PRIMARY_HARNESS=claude FM_SUPERVISOR_BACKEND=herdr \
