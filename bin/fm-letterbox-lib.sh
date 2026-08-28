@@ -574,10 +574,14 @@ lb_card_reply_write() {
 #
 # Fields:
 #   id class from issue claimed   written at claim time
-#   refusal                       set when the card was refused at parse
+#   refusal                       set when the card was refused at parse or scan
 #   task                          the ordinary firstmate task id that now owns
 #                                 the obligation, recorded once work is created
 #   replied reply_id              our terminal reply, recorded when posted
+#   reply_attempt reply_attempt_status
+#                                 our reply id and status, recorded before the
+#                                 non-idempotent comment post and cleared when
+#                                 its completion is recorded
 #   consumed                      reply ids already consumed (requester side),
 #                                 which is what makes a replayed reply a no-op
 #   in_reply_to status            on a reply claim, the sent letter it answers
