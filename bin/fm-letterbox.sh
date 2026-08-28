@@ -379,7 +379,7 @@ cmd_status() {
     if reason=$(outbox_unsendable_reason "$id"); then
       printf '  UNSENDABLE: %s (%s; the outbox record is kept and never retried, and it does not block other sends)\n' "$id" "$reason"
     else
-      printf '  UNSENT: %s (transport call never completed; the next send reconciles it)\n' "$id"
+      printf '  UNSENT: %s (no matching receipt; the next send reconciles it)\n' "$id"
     fi
   done
   for claim in "$(lb_claim_dir "$STATE")"/*.json; do
