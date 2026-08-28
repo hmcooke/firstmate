@@ -927,6 +927,24 @@ test_a_landed_letter_is_adopted_even_when_its_bytes_now_fail_the_gate() {
   pass "an outbox record whose issue already landed is adopted before any gate is applied"
 }
 
+# A crash at the exact moment the receipt is published: the private-artifact
+# publisher's final step is `mv` of the staged receipt into state/letterbox/sent,
+# so a fakebin `mv` that refuses that one destination fails the publish and
+# nothing else. (A mode-500 sent directory cannot model this: ensure_dirs runs
+# before any bookkeeping and refuses a directory that is not mode 700, so the
+# send would die too early under either ordering.)
+install_receipt_crashing_mv() {
+  local fakebin=$1 real
+  real=$(command -v mv)
+  cat > "$fakebin/mv" <<SH
+#!/usr/bin/env bash
+for a in "\$@"; do :; done
+case "\$a" in */sent/*.receipt) exit 1 ;; esac
+exec "$real" "\$@"
+SH
+  chmod +x "$fakebin/mv"
+}
+
 test_a_crash_before_the_resend_receipt_is_completed_by_the_retry() {
   local home store fakebin out rc id number new_id
   read -r home store fakebin <<< "$(fixture resend-crash | tr '\n' ' ')"
@@ -939,13 +957,24 @@ test_a_crash_before_the_resend_receipt_is_completed_by_the_retry() {
   run_poll "$home" "$store" "$fakebin" >/dev/null
   run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
   printf 'fixed\n' > "$home/fixed.txt"
-  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id") \
-    || fail "the corrected notice must send: $out"
-  new_id=$(printf '%s\n' "$out" | sed -n 's/^sent \([^ ]*\) .*/\1/p')
-  # The crash: the resend bookkeeping landed, the receipt did not.
-  rm -f "$home/state/letterbox/sent/$new_id.receipt"
+  install_receipt_crashing_mv "$fakebin"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  rm -f "$fakebin/mv"
+  [ "$rc" -ne 0 ] || fail "the send must fail when its receipt cannot be published (got: $out)"
+  assert_contains "$out" "cannot record the receipt" "the failure must be the receipt publish itself"
+  new_id=$(for f in "$home"/state/letterbox/outbox/*.json; do
+    f=${f##*/}; f=${f%.json}
+    [ -e "$home/state/letterbox/sent/$f.receipt" ] || { printf '%s\n' "$f"; break; }
+  done)
+  [ -n "$new_id" ] || fail "the corrected notice must have an outbox record with no receipt"
+  [ "$new_id" != "$id" ] || fail "the corrected notice must carry a new id"
+  assert_absent "$home/state/letterbox/sent/$new_id.receipt" "the crash left no receipt"
+  # The discriminating assertion: the bookkeeping precedes the receipt, so it
+  # is already durable when the receipt publish dies.
   [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "$new_id" ] \
-    || fail "the bookkeeping must precede the receipt"
+    || fail "resent_as must already be recorded before the receipt is published"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "resend_required must already be cleared before the receipt is published"
   out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
   assert_contains "$out" "UNSENT: $new_id" "the interrupted letter must stay in the unsent set"
   assert_not_contains "$out" "RESEND REQUIRED" "the obligation must not reappear"
@@ -961,7 +990,7 @@ test_a_crash_before_the_resend_receipt_is_completed_by_the_retry() {
   out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject again --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "a re-sent notice must not be re-sent again"
   assert_contains "$out" "already re-sent as $new_id" "the completed discharge must be refused by name"
-  pass "a crash between the resend bookkeeping and the receipt leaves the letter unsent, and the retry completes it"
+  pass "a crash at the receipt publish leaves the resend bookkeeping durable and the letter unsent, and the retry completes it"
 }
 
 test_link_records_the_owning_task_through_a_supported_verb() {
