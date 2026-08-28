@@ -446,16 +446,17 @@ stale_marker_remove() {  # <window> <state>
   rm -f "$state/.subsuper-stale-$key"
 }
 
-# Pause marker: state/.subsuper-paused-<key> holds the epoch a declared pause was
-# first observed idle. Housekeeping ages it against PAUSE_RESURFACE_SECS (much
-# longer than a wedge) and re-surfaces the pause once per window. Recording is
-# create-if-absent so the timestamp is stable across a churny idle pane (many
-# distinct stale hashes map to one marker), keeping the cadence hash-immune.
+# Pause marker: state/.subsuper-paused-<key> records that the daemon observed a
+# declared pause. Housekeeping shares the watcher's status-file age and
+# .paused-resurfaced-<key> throttle for the bounded re-surface cadence.
 pause_marker_record() {  # <window> <state> - create if absent
-  local win=$1 state=$2 key marker
+  local win=$1 state=$2 key marker watcher_key resurface_marker
   key=$(_stale_key "$(window_to_task "$win" "$state")")
   marker="$state/.subsuper-paused-$key"
   [ -e "$marker" ] || _now > "$marker"
+  watcher_key=$(_stale_key "$win")
+  resurface_marker="$state/.paused-resurfaced-$watcher_key"
+  [ -e "$resurface_marker" ] || _now > "$resurface_marker"
 }
 
 pause_marker_remove() {  # <window> <state>
@@ -474,55 +475,14 @@ clear_pause_tracking() {  # <window> <state>
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
-_FM_DAEMON_PAUSE_CLASS_TASKS=()
-_FM_DAEMON_PAUSE_CLASS_LINES=()
-_FM_DAEMON_PAUSE_CLASSES=()
-
-pause_class_cache_read() {  # <task> <last-status-line> <output-variable>
-  local task=$1 last=$2 output_var=$3 i=0
-  while [ "$i" -lt "${#_FM_DAEMON_PAUSE_CLASS_TASKS[@]}" ]; do
-    if [ "${_FM_DAEMON_PAUSE_CLASS_TASKS[$i]}" = "$task" ] \
-      && [ "${_FM_DAEMON_PAUSE_CLASS_LINES[$i]}" = "$last" ]; then
-      printf -v "$output_var" '%s' "${_FM_DAEMON_PAUSE_CLASSES[$i]}"
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  return 1
-}
-
-pause_class_cache_write() {  # <task> <last-status-line> <pause-class>
-  local task=$1 last=$2 pause_class=$3 i=0
-  while [ "$i" -lt "${#_FM_DAEMON_PAUSE_CLASS_TASKS[@]}" ]; do
-    if [ "${_FM_DAEMON_PAUSE_CLASS_TASKS[$i]}" = "$task" ]; then
-      _FM_DAEMON_PAUSE_CLASS_LINES[$i]=$last
-      _FM_DAEMON_PAUSE_CLASSES[$i]=$pause_class
-      return
-    fi
-    i=$((i + 1))
-  done
-  _FM_DAEMON_PAUSE_CLASS_TASKS[${#_FM_DAEMON_PAUSE_CLASS_TASKS[@]}]=$task
-  _FM_DAEMON_PAUSE_CLASS_LINES[${#_FM_DAEMON_PAUSE_CLASS_LINES[@]}]=$last
-  _FM_DAEMON_PAUSE_CLASSES[${#_FM_DAEMON_PAUSE_CLASSES[@]}]=$pause_class
-}
-
-reconcile_pause_tracking() {  # <window> <state> <last-status-line> [pause-class]
-  local win=$1 state=$2 last=$3 pause_class=${4:-} task key marker watcher_key
+reconcile_pause_tracking() {  # <window> <state> <last-status-line>
+  local win=$1 state=$2 last=$3 pause_class task key marker watcher_key
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_stale_key "$win")
   if status_is_paused "$last"; then
-    if [ -z "$pause_class" ]; then
-      if pause_class_cache_read "$task" "$last" pause_class; then
-        :
-      elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
-        pause_class=paused
-      else
-        pause_class=$(crew_absorb_class "$task")
-      fi
-    fi
-    pause_class_cache_write "$task" "$last" "$pause_class"
+    pause_class=$(crew_absorb_class "$task")
     if [ "$pause_class" = paused ]; then
       stale_marker_remove "$win" "$state"
       pause_marker_record "$win" "$state"
@@ -1007,7 +967,8 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs pause_class
+  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local watcher_key resurface_marker resurface_age
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1073,7 +1034,7 @@ housekeeping() {  # <state>
   # so it is rechecked on a much longer cadence than a wedge (PAUSE_RESURFACE_SECS)
   # and never escalated as one - but it MUST re-surface, so a forgotten pause cannot
   # rot invisibly. Past the window: busy (resumed) or gone -> drop; still idle and
-  # still declaring the pause -> escalate a recheck digest and reset the marker so
+  # still declaring the pause -> escalate a recheck digest and reset the throttle so
   # the window repeats.
   pause_secs=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
   for marker in "$state"/.subsuper-paused-*; do
@@ -1089,20 +1050,23 @@ housekeeping() {  # <state>
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
-    age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
-    [ "$age" -ge "$pause_secs" ] || continue
+    watcher_key=$(_stale_key "$win")
+    resurface_marker="$state/.paused-resurfaced-$watcher_key"
+    age=$(_file_age "$state/$task.status")
+    resurface_age=$(_file_age "$resurface_marker")
+    [ "$age" -ge "$pause_secs" ] && [ "$resurface_age" -ge "$pause_secs" ] || continue
     stale_window_is_busy "$win" "$state"
     case "$?" in
-      0) pause_class_cache_write "$task" "$last" none; rm -f "$marker" ;;
-      2) pause_class_cache_write "$task" "$last" none; rm -f "$marker" ;;
+      0) rm -f "$marker" ;;
+      2) rm -f "$marker" ;;
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
-          pause_class=$(crew_absorb_class "$task")
-          reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
-          if [ "$pause_class" = paused ]; then
+          reconcile_pause_tracking "$win" "$state" "$last"
+          if [ -e "$marker" ]; then
             escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
             _now > "$marker"
+            _now > "$resurface_marker"
           fi
         else
           rm -f "$marker"
@@ -1295,7 +1259,7 @@ handle_wake() {  # <reason> <state>
       if [ "$kind" = "stale" ]; then
         task=$(window_to_task "$arg" "$state")
         last=$(last_status_line "$state/$task.status")
-        reconcile_pause_tracking "$arg" "$state" "$last" paused
+        reconcile_pause_tracking "$arg" "$state" "$last"
       fi
       log "self-handle (paused): $reason -> $distilled"
       ;;
@@ -1325,7 +1289,7 @@ handle_wake() {  # <reason> <state>
           stale_marker_remove "$arg" "$state"
         else
           if [ -n "$last" ] && status_is_paused "$last"; then
-            reconcile_pause_tracking "$arg" "$state" "$last" none
+            reconcile_pause_tracking "$arg" "$state" "$last"
           else
             pause_marker_remove "$arg" "$state"
             stale_marker_record "$arg" "$state"

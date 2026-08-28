@@ -165,8 +165,11 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
       && printf '%s' "$status_line" > "$state/.subsuper-seen-status-$key"
     [ "$case_name" = paused ] \
       && echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key"
+    make_fake_crew_state "$fakebin" >/dev/null
 
     (
+      export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+      export FM_FAKE_CREW_STATE='state: paused - source: status-log - awaiting an external dependency'
       kill() { printf 'kill %s\n' "$*" >> "$action_log"; }
       fm_backend_send_text_submit() { printf 'interrupt %s\n' "$*" >> "$action_log"; }
       LOG="$dir/daemon.log" FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
@@ -246,68 +249,38 @@ test_handle_wake_paused_records_pause_marker() {
   pass "handle_wake on a paused stale records a pause marker, drops the wedge marker, and does not escalate"
 }
 
-test_handle_wake_paused_uses_shared_run_state() {
-  local dir state fakebin key win pane first_seen
-  dir=$(make_supercase handle-paused-active-run)
+test_daemon_paused_uses_shared_state_with_inherited_marker() {
+  local dir state fakebin key watcher_key win
+  dir=$(make_supercase inherited-paused-run-state)
   state="$dir/state"
   fakebin="$dir/fakebin"
   make_fake_crew_state "$fakebin" >/dev/null
-  win="sess:fm-active-w10"
-  pane="$dir/pane.txt"
-  printf 'idle mid-validation\n' > "$pane"
-  fm_write_meta "$state/active-w10.meta" "window=$win" "kind=ship" "backend=tmux"
-  printf 'paused: waiting on the captain to merge PR 1\n' > "$state/active-w10.status"
-  key=$(printf '%s' "active-w10" | tr ':/.' '___')
-  first_seen=$(( $(date +%s) - 500 ))
-  printf '%s\n' "$first_seen" > "$state/.subsuper-stale-$key"
-  afk_enter "$state"
-  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (running)' \
-    handle_wake "stale: $win" "$state"
-  [ ! -e "$state/.subsuper-paused-$key" ] \
-    || fail "an active run-step received declared-pause tracking"
-  [ "$(cat "$state/.subsuper-stale-$key" 2>/dev/null || true)" = "$first_seen" ] \
-    || fail "an active run-step lost its existing wedge age"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (running)' \
-    FM_STALE_ESCALATE_SECS=240 FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
-  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 \
-    || fail "an active run-step did not retain ordinary wedge aging"
-
-  dir=$(make_supercase handle-paused-monitoring-run)
-  state="$dir/state"
-  fakebin="$dir/fakebin"
-  make_fake_crew_state "$fakebin" >/dev/null
-  win="sess:fm-monitor-w10"
-  pane="$dir/pane.txt"
-  printf 'idle awaiting merge\n' > "$pane"
-  fm_write_meta "$state/monitor-w10.meta" "window=$win" "kind=ship" "backend=tmux"
-  printf 'paused: waiting on the captain to merge PR 1\n' > "$state/monitor-w10.status"
-  key=$(printf '%s' "monitor-w10" | tr ':/.' '___')
-  printf '%s\n' "$first_seen" > "$state/.subsuper-stale-$key"
+  win="sess:fm-inherited-w10"
+  fm_write_meta "$state/inherited-w10.meta" "window=$win" "kind=ship" "backend=tmux"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$state/inherited-w10.status"
+  key=$(printf '%s' "inherited-w10" | tr ':/.' '___')
+  watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
+  : > "$state/.paused-$watcher_key"
   afk_enter "$state"
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE='state: paused - source: run-step+status-log - waiting on the captain to merge PR 1' \
-    handle_wake "stale: $win" "$state"
+    FM_PAUSE_RESURFACE_SECS=999999 housekeeping "$state"
   [ -e "$state/.subsuper-paused-$key" ] \
-    || fail "a monitoring run-step did not receive declared-pause tracking"
+    || fail "the shared paused verdict did not receive bounded pause tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] \
-    || fail "a monitoring run-step retained wedge tracking"
-  [ ! -s "$state/.subsuper-escalations" ] \
-    || fail "a monitoring run-step's declared wait escalated immediately"
-  printf '%s\n' "$first_seen" > "$state/.subsuper-paused-$key"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    || fail "the shared paused verdict retained wedge tracking"
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
-    FM_PAUSE_RESURFACE_SECS=240 FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
+    FM_PAUSE_RESURFACE_SECS=999999 housekeeping "$state"
   [ ! -e "$state/.subsuper-paused-$key" ] \
-    || fail "a fixing run-step retained declared-pause tracking"
+    || fail "an inherited watcher marker overrode the shared working verdict"
+  [ ! -e "$state/.paused-$watcher_key" ] \
+    || fail "an inherited watcher pause marker survived the shared working verdict"
   [ -e "$state/.subsuper-stale-$key" ] \
-    || fail "a fixing run-step did not resume ordinary wedge aging"
+    || fail "the shared working verdict did not resume ordinary wedge aging"
   [ ! -s "$state/.subsuper-escalations" ] \
-    || fail "a stale pause was re-surfaced after the run entered fixing"
-  pass "away supervision refreshes shared run-step pause precedence"
+    || fail "an inherited watcher pause escalated during reconciliation"
+  pass "away supervision revalidates inherited pause markers"
 }
 
 test_handle_wake_paused_signal_records_pause_marker() {
@@ -356,15 +329,19 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
 }
 
 test_housekeeping_migrates_watcher_pause_marker() {
-  local dir state key win
+  local dir state fakebin key win
   dir=$(make_supercase migrate-watcher-pause)
   state="$dir/state"
+  fakebin="$dir/fakebin"
   win="sess:fm-held-w10-migrate"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-migrate.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/held-w10-migrate.status"
   key=$(printf '%s' "$win" | tr '.:/' '___')
   : > "$state/.paused-$key"
-  FM_STATE_OVERRIDE="$state" housekeeping "$state"
+  make_fake_crew_state "$fakebin" >/dev/null
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: paused - source: status-log - awaiting the upstream release' \
+    housekeeping "$state"
   key=$(printf '%s' "held-w10-migrate" | tr '.:/' '___')
   [ -e "$state/.subsuper-paused-$key" ] || fail "watcher pause marker was not migrated into daemon tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "watcher pause migration left a wedge marker behind"
@@ -407,17 +384,26 @@ test_housekeeping_seeds_pause_marker_from_status() {
 }
 
 # housekeeping re-surfaces a stale declared pause only past PAUSE_RESURFACE_SECS,
-# as an awaiting-external recheck (never a wedge), and RESETS the marker so the
+# as an awaiting-external recheck (never a wedge), and RESETS the throttle so the
 # window repeats rather than firing once.
 test_housekeeping_paused_resurfaces_and_resets() {
-  local dir state fakebin win pane key age
+  local dir state fakebin win pane key watcher_key back age
   dir=$(make_supercase paused-resurface)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w11"; pane="$dir/pane.txt"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w11.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
-  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
+  : > "$state/.subsuper-paused-$key"
+  : > "$state/.paused-resurfaced-$watcher_key"
+  back=$(( $(date +%s) - 5000 ))
+  if [ "$(uname)" = Darwin ]; then
+    touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" \
+      "$state/held-w11.status" "$state/.paused-resurfaced-$watcher_key"
+  else
+    touch -m -d "@$back" "$state/held-w11.status" "$state/.paused-resurfaced-$watcher_key"
+  fi
   make_fake_crew_state "$fakebin" >/dev/null
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
@@ -426,8 +412,8 @@ test_housekeeping_paused_resurfaces_and_resets() {
   grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause was not re-surfaced as an awaiting-external recheck"
   grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "declared pause was mislabeled a possible wedge"
   [ -e "$state/.subsuper-paused-$key" ] || fail "pause marker cleared instead of reset for the next window"
-  age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
-  [ "$age" -lt 60 ] || fail "pause marker was not reset to now on re-surface (age ${age}s)"
+  age=$(_file_age "$state/.paused-resurfaced-$watcher_key")
+  [ "$age" -lt 60 ] || fail "pause re-surface throttle was not reset (age ${age}s)"
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
 }
 
@@ -1939,7 +1925,7 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_handle_wake_paused_records_pause_marker
-test_handle_wake_paused_uses_shared_run_state
+test_daemon_paused_uses_shared_state_with_inherited_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
 test_housekeeping_migrates_watcher_pause_marker
