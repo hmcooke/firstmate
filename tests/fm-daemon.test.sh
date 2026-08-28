@@ -250,12 +250,14 @@ test_handle_wake_paused_records_pause_marker() {
 }
 
 test_daemon_paused_uses_shared_state_with_inherited_marker() {
-  local dir state fakebin key watcher_key win
+  local dir state fakebin key watcher_key win pane first_seen
   dir=$(make_supercase inherited-paused-run-state)
   state="$dir/state"
   fakebin="$dir/fakebin"
   make_fake_crew_state "$fakebin" >/dev/null
   win="sess:fm-inherited-w10"
+  pane="$dir/pane.txt"
+  printf 'Working...\n' > "$pane"
   fm_write_meta "$state/inherited-w10.meta" "window=$win" "kind=ship" "backend=tmux"
   printf 'paused: waiting on the captain to merge PR 1\n' > "$state/inherited-w10.status"
   key=$(printf '%s' "inherited-w10" | tr ':/.' '___')
@@ -269,18 +271,35 @@ test_daemon_paused_uses_shared_state_with_inherited_marker() {
     || fail "the shared paused verdict did not receive bounded pause tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] \
     || fail "the shared paused verdict retained wedge tracking"
-  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
     FM_PAUSE_RESURFACE_SECS=999999 housekeeping "$state"
   [ ! -e "$state/.subsuper-paused-$key" ] \
     || fail "an inherited watcher marker overrode the shared working verdict"
   [ ! -e "$state/.paused-$watcher_key" ] \
     || fail "an inherited watcher pause marker survived the shared working verdict"
-  [ -e "$state/.subsuper-stale-$key" ] \
-    || fail "the shared working verdict did not resume ordinary wedge aging"
+  [ ! -e "$state/.subsuper-stale-$key" ] \
+    || fail "pause migration started wedge aging without an idle observation"
   [ ! -s "$state/.subsuper-escalations" ] \
     || fail "an inherited watcher pause escalated during reconciliation"
-  pass "away supervision revalidates inherited pause markers"
+
+  printf 'idle prompt $\n' > "$pane"
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    handle_wake "stale: $win" "$state"
+  [ -e "$state/.subsuper-stale-$key" ] \
+    || fail "a later idle observation did not start ordinary wedge aging"
+  first_seen=$(cat "$state/.subsuper-stale-$key")
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    FM_STALE_ESCALATE_SECS=240 FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
+  [ "$(cat "$state/.subsuper-stale-$key" 2>/dev/null || true)" = "$first_seen" ] \
+    || fail "wedge aging did not stay anchored to the later idle observation"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a newly idle worker inherited stale age from busy reconciliation"
+  pass "away supervision starts wedge aging only after an idle observation"
 }
 
 test_handle_wake_paused_signal_records_pause_marker() {

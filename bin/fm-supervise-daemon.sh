@@ -486,7 +486,6 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
     else
       rm -f "$marker" "$state/.paused-$watcher_key" \
         "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key"
-      stale_marker_record "$win" "$state"
     fi
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"
@@ -1064,6 +1063,8 @@ housekeeping() {  # <state>
             escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
             _now > "$marker"
             _now > "$resurface_marker"
+          else
+            stale_marker_record "$win" "$state"
           fi
         else
           rm -f "$marker"
@@ -1257,6 +1258,8 @@ handle_wake() {  # <reason> <state>
         task=$(window_to_task "$arg" "$state")
         last=$(last_status_line "$state/$task.status")
         reconcile_pause_tracking "$arg" "$state" "$last"
+        [ -e "$state/.subsuper-paused-$(_stale_key "$task")" ] \
+          || stale_marker_record "$arg" "$state"
       fi
       log "self-handle (paused): $reason -> $distilled"
       ;;
@@ -1287,6 +1290,8 @@ handle_wake() {  # <reason> <state>
         else
           if [ -n "$last" ] && status_is_paused "$last"; then
             reconcile_pause_tracking "$arg" "$state" "$last"
+            [ -e "$state/.subsuper-paused-$(_stale_key "$task")" ] \
+              || stale_marker_record "$arg" "$state"
           else
             pause_marker_remove "$arg" "$state"
             stale_marker_record "$arg" "$state"
