@@ -899,6 +899,71 @@ test_a_corrected_notice_discharges_the_resend_obligation_through_send() {
   pass "send --resends discharges the resend obligation in the receipt's own success boundary"
 }
 
+test_a_landed_letter_is_adopted_even_when_its_bytes_now_fail_the_gate() {
+  local home store fakebin out id number
+  read -r home store fakebin <<< "$(fixture adopt-past-gate | tr '\n' ' ')"
+  printf 'ordinary question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject first --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  # A crash after the forge create and before any local record: the issue is
+  # open at the peer, and the outbox bytes would fail today's gate.
+  rm -f "$home/state/letterbox/sent/$id.receipt" "$home/state/letterbox/claims/$id.json"
+  jq '.card = (.card + "\nsee ~/notes")' "$home/state/letterbox/outbox/$id.json" > "$home/o.new" \
+    && cat "$home/o.new" > "$home/state/letterbox/outbox/$id.json"
+  printf 'second letter\n' > "$home/body2.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1) \
+    || fail "the next send must succeed: $out"
+  assert_contains "$out" "adopted existing letter $id as issue $number" "a landed letter must be adopted, not gated"
+  assert_not_contains "$out" "UNSENDABLE" "adoption transmits nothing, so the gate must not apply to it"
+  assert_present "$home/state/letterbox/sent/$id.receipt" "adoption must complete the receipt"
+  assert_present "$home/state/letterbox/claims/$id.json" "adoption must record the sent claim"
+  [ "$(jq -r '.issue' "$home/state/letterbox/claims/$id.json")" = "$number" ] \
+    || fail "the adopted claim must correlate to the existing issue"
+  [ "$(grep -c "\[letterbox\] fact-lookup $id" "$store/issues.json")" = 1 ] || fail "no duplicate may be created"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_not_contains "$out" "UNSENDABLE" "an adopted letter is no longer unsent"
+  pass "an outbox record whose issue already landed is adopted before any gate is applied"
+}
+
+test_a_crash_before_the_resend_receipt_is_completed_by_the_retry() {
+  local home store fakebin out rc id number new_id
+  read -r home store fakebin <<< "$(fixture resend-crash | tr '\n' ' ')"
+  printf 'notice\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  inject_reply "$store" "$number" archie-20260824T141902Z-3b71c40d "$id" unable "not acceptable"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
+  printf 'fixed\n' > "$home/fixed.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id") \
+    || fail "the corrected notice must send: $out"
+  new_id=$(printf '%s\n' "$out" | sed -n 's/^sent \([^ ]*\) .*/\1/p')
+  # The crash: the resend bookkeeping landed, the receipt did not.
+  rm -f "$home/state/letterbox/sent/$new_id.receipt"
+  [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "$new_id" ] \
+    || fail "the bookkeeping must precede the receipt"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "UNSENT: $new_id" "the interrupted letter must stay in the unsent set"
+  assert_not_contains "$out" "RESEND REQUIRED" "the obligation must not reappear"
+  : > "$home/empty.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class ping --subject p --file "$home/empty.txt" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "the retry send must succeed: $out"
+  assert_contains "$out" "adopted existing letter $new_id" "the retry must adopt the corrected notice"
+  assert_present "$home/state/letterbox/sent/$new_id.receipt" "the retry must complete the receipt"
+  [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "$new_id" ] \
+    || fail "the discharge must survive the retry"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "the obligation must stay cleared"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject again --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a re-sent notice must not be re-sent again"
+  assert_contains "$out" "already re-sent as $new_id" "the completed discharge must be refused by name"
+  pass "a crash between the resend bookkeeping and the receipt leaves the letter unsent, and the retry completes it"
+}
+
 test_link_records_the_owning_task_through_a_supported_verb() {
   local home store fakebin out rc id
   read -r home store fakebin <<< "$(fixture link-task | tr '\n' ' ')"
@@ -2157,6 +2222,8 @@ test_a_notice_ack_is_the_terminal_reply_that_closes_the_exchange
 test_protocol_unable_is_legal_for_a_notice_and_a_parse_refusal
 test_consuming_an_unable_notice_closes_and_records_the_resend_obligation
 test_a_corrected_notice_discharges_the_resend_obligation_through_send
+test_a_landed_letter_is_adopted_even_when_its_bytes_now_fail_the_gate
+test_a_crash_before_the_resend_receipt_is_completed_by_the_retry
 test_link_records_the_owning_task_through_a_supported_verb
 test_a_refused_card_with_no_usable_id_is_unanswerable_not_owed
 test_an_ack_on_any_other_class_leaves_the_exchange_open

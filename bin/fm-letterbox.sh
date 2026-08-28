@@ -373,6 +373,7 @@ cmd_status() {
     printf '  poll: not armed; run: fm-letterbox.sh arm\n'
   fi
   local id claim reason owed=0 sent_open=0 unsent=0 resend=0 unanswerable=0
+  workdir
   for id in $(unsent_ids); do
     unsent=$((unsent + 1))
     if reason=$(outbox_unsendable_reason "$id"); then
@@ -438,19 +439,23 @@ cmd_read() {
 # title-matched lookup: adopt the existing issue, or create it if it never
 # landed. Re-delivery is therefore a no-op and never a duplicate letter.
 #
-# A record whose recovered bytes can no longer pass the scan or the grammar is
-# refused for retry but NEVER blocks the letter being sent now: it is reported,
-# left in the outbox where status keeps naming it, and skipped. Only a lookup
-# failure stops the send, because creating without an authoritative miss is
-# exactly the duplicate this reconciliation exists to prevent.
+# The adoption lookup runs FIRST. Adoption is a read plus local records and
+# transmits nothing, so a letter whose issue already landed is adopted whatever
+# its recovered bytes would pass today; gating it would only strand an open
+# obligation at the peer. The scan and grammar gate applies to the CREATE path
+# alone: a record whose recovered bytes can no longer pass it is refused for
+# retry but NEVER blocks the letter being sent now - it is reported, left in the
+# outbox where status keeps naming it, and skipped. Only a lookup failure stops
+# the send, because creating without an authoritative miss is exactly the
+# duplicate this reconciliation exists to prevent.
 reconcile_unsent() {
   local id class title number url out reason resends
   for id in $(unsent_ids); do
-    if reason=$(outbox_unsendable_reason "$id"); then
-      printf 'UNSENDABLE: %s (%s); the outbox record is kept and skipped\n' "$id" "$reason" >&2
+    class=$(jq -r '.class // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
+    if ! lb_class_allowed "$class"; then
+      printf 'UNSENDABLE: %s (invalid class); the outbox record is kept and skipped\n' "$id" >&2
       continue
     fi
-    class=$(jq -r '.class // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
     resends=$(jq -r '.resends // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
     title=$(lb_issue_title "$class" "$id")
     # Both create and find-title answer "<number> <url>", so this script never
@@ -464,17 +469,17 @@ reconcile_unsent() {
     if [ -n "$number" ]; then
       printf 'adopted existing letter %s as issue %s\n' "$id" "$number"
     else
-      workdir
-      jq -r '.card' "$(lb_dir "$STATE" outbox)/$id.json" > "$WORK/resend.md" 2>/dev/null \
-        || die "cannot recover the outbox card for $id"
       # The outbox is durable local state, not immutable and not hash-bound, so
       # the scan that ran before the original transport call is NOT a scan
       # immediately before THIS one. Both gates run again on the exact recovered
-      # bytes, because a server-side rejection would already be too late.
-      require_clean "$WORK/resend.md"
-      require_card_sendable "$WORK/resend.md" request "$id" "$class" "" "the recovered card"
+      # bytes, because a server-side rejection would already be too late, and
+      # the create transmits exactly the bytes that were gated.
+      if reason=$(outbox_unsendable_reason "$id"); then
+        printf 'UNSENDABLE: %s (%s); the outbox record is kept and skipped\n' "$id" "$reason" >&2
+        continue
+      fi
       require_private_channel
-      out=$(transport_write create --title "$title" --body-file "$WORK/resend.md" \
+      out=$(transport_write create --title "$title" --body-file "$WORK/recovered.$id.md" \
         --label "to:${LB_PEER%%.*}") || die "the transport refused the retried letter $id"
       number=${out%% *}
       url=${out#* }
@@ -494,24 +499,26 @@ reconcile_unsent() {
 # completes the receipt, so the obligation is always visible to something.
 #
 # A corrected notice discharges the refused notice's resend obligation HERE, in
-# the same success boundary as its receipt: the receipt is what proves the new
-# letter landed, so resent_as is written immediately after it and from the same
-# outbox record, and a retry that completes the receipt completes this too.
+# the same success boundary as its receipt and BEFORE the receipt for the same
+# reason the sent claim is: the receipt is what removes the letter from
+# unsent_ids, so a death after the bookkeeping but before the receipt leaves
+# the letter there and the retry, which adopts by title, idempotently redoes
+# both from the same outbox record.
 record_receipt() {
   local id=$1 number=$2 url=$3 class=$4 resends=${5-} rc
   lb_claim_create "$STATE" "$id" "$class" "$LB_SELF" "$number" >/dev/null 2>&1
   rc=$?
   # 0 = created here, 1 = already claimed by an earlier attempt; both are fine.
   [ "$rc" -le 1 ] || die "cannot record the sent claim for $id"
-  printf '%s\n%s\n%s\n' "$number" "$url" "$(date -u +%s)" \
-    | fmx_private_artifact_publish_stdin "$(lb_dir "$STATE" sent)" "$id.receipt" 600 \
-    || die "cannot record the receipt for $id"
   if [ -n "$resends" ]; then
     if ! lb_claim_set "$STATE" "$resends" resent_as "$id" \
       || ! lb_claim_set "$STATE" "$resends" resend_required ""; then
       die "letter $id was sent, but the resend of notice $resends could not be recorded; run status"
     fi
   fi
+  printf '%s\n%s\n%s\n' "$number" "$url" "$(date -u +%s)" \
+    | fmx_private_artifact_publish_stdin "$(lb_dir "$STATE" sent)" "$id.receipt" 600 \
+    || die "cannot record the receipt for $id"
 }
 
 # The notice a corrected notice replaces must be one this estate sent, must be
