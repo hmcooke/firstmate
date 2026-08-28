@@ -916,7 +916,7 @@ Before those were taught to the shared edge detector, a bare composer's wrap reg
 Measured as an A/B on the same live pane, the pre-fix classifier returned `pending` and the current one returned `empty`.
 
 The 2026-08-12 rendered-footer transition made `bin/fm-send.sh` exit 0 after the steer executed, and its only stable token shared the selected composer row.
-The current submit contract excludes that row from the pre-Enter baseline so unsent input cannot establish busy, then includes it in the post-Enter transition read after the submitted text has cleared.
+The portable submit regression preserves that observed success while [`docs/herdr-backend.md`](../herdr-backend.md#native-agent-state-submit-confirmation) owns the current content-departure safety contract.
 
 The rest of the lifecycle was driven end to end on that worker:
 
@@ -930,7 +930,7 @@ Other harnesses on Herdr are unaffected by the edge-detector change.
 All seven live panes of the running default session - one Pi, four Claude, two plain shells - classified identically under the pre-fix and current classifiers.
 
 **Cursor delivery confirmation is available on the verified tmux and Herdr paths.**
-Herdr confirms the post-Enter transition from Cursor's stable composer-row token while keeping that row excluded from the pre-Enter baseline.
+The 2026-08-12 Herdr run and 2026-08-13 tmux injection above are the empirical evidence for those paths.
 
 The portable regression is `tests/fm-cursor-harness.test.sh`, the composer captures are pinned in `tests/fm-composer-lib.test.sh`, and the Herdr submit and footer behavior is pinned in `tests/fm-backend-herdr.test.sh`.
 Refresh this harness-dependent proof before accepting a cursor upgrade:

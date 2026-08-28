@@ -723,12 +723,12 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
 
 # fm_backend_submit_enter: submit text already present in the composer through
 # the confirmation owner for a supported away-mode supervisor backend.
-fm_backend_submit_enter() {  # <backend> <target> <retries> <enter-sleep>
+fm_backend_submit_enter() {  # <backend> <target> <retries> <enter-sleep> [expected-text]
   local backend=$1
   shift
   fm_backend_source "$backend" || return 1
   case "$backend" in
-    tmux) fm_backend_tmux_submit_enter "$@" ;;
+    tmux) fm_backend_tmux_submit_enter "$1" "$2" "$3" ;;
     herdr) fm_backend_herdr_submit_enter "$@" ;;
     *) echo "error: no confirmed Enter-only submit implementation for backend '$backend'" >&2; return 1 ;;
   esac

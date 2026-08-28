@@ -1393,7 +1393,7 @@ test_own_unsent_recovery_is_bounded_and_still_alarms() {
   attempts="$dir/enter.log"; : > "$attempts"
   printf '╭─────╮\n│ >   │\n╰─────╯\n' > "$dir/composer"
   touch "$dir/.swallow"
-  escalate_add "$state" "needs-decision: pick C"
+  escalate_add "$state" "needs-decision: captured esc to interrupt"
   afk_enter "$state"
 
   # Every Enter is swallowed from here on, so our digest can never land. Five
@@ -1535,7 +1535,7 @@ test_recovery_rejects_invalid_budget_inputs() {
 }
 
 test_empty_composer_never_retypes_a_matching_unsent_record() {
-  local dir state send_log alarm_log
+  local dir state send_log alarm_log rc
   dir=$(make_supercase own-unsent-delivery-ambiguous)
   state="$dir/state"
   send_log="$dir/send.log"; : > "$send_log"
@@ -1554,7 +1554,26 @@ test_empty_composer_never_retypes_a_matching_unsent_record() {
     fi
   ) || fail "ambiguous-delivery setup flush failed"
   [ -s "$state/.subsuper-inject-unsent" ] || fail "the unconfirmed digest was not recorded"
+  printf '2\n' > "$state/.subsuper-inject-recover-attempts"
   : > "$send_log"
+  (
+    trap 'exit 143' TERM
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'pending'; }
+    _inject_recover_attempts_reset() { kill -TERM "${BASHPID:-$$}"; }
+    LOG="$alarm_log" FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
+      escalate_flush "$state"
+  )
+  rc=$?
+  [ "$rc" -eq 143 ] || fail "ambiguous resolution was not interrupted between buffer clear and state retirement: rc=$rc"
+  [ ! -s "$send_log" ] || fail "an empty composer caused the recorded digest to be retyped"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "the interrupted ambiguous resolution did not clear the buffer first"
+  [ -s "$state/.subsuper-inject-unsent" ] || fail "interruption retired the no-retype guard before resolution completed"
+  [ -s "$state/.subsuper-inject-recover-attempts" ] || fail "interruption retired recovery state before resolution completed"
+  escalate_add "$state" "done: delivered ambiguously"
+  : > "$alarm_log"
   (
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { return 1; }
@@ -1562,8 +1581,8 @@ test_empty_composer_never_retypes_a_matching_unsent_record() {
     fm_backend_send_text_submit() { printf 'send\n' >> "$send_log"; printf 'pending'; }
     LOG="$alarm_log" FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=firstmate:0 \
       escalate_flush "$state"
-  ) || fail "ambiguous-delivery flush failed"
-  [ ! -s "$send_log" ] || fail "an empty composer caused the recorded digest to be retyped"
+  ) || fail "ambiguous-delivery retry flush failed"
+  [ ! -s "$send_log" ] || fail "the interrupted digest was retyped on retry"
   [ ! -s "$state/.subsuper-escalations" ] || fail "the ambiguous delivered digest stayed buffered"
   [ ! -e "$state/.subsuper-inject-unsent" ] || fail "the handled unsent record survived"
   [ ! -e "$state/.subsuper-inject-recover-attempts" ] || fail "the handled recovery budget survived"
@@ -1573,7 +1592,7 @@ test_empty_composer_never_retypes_a_matching_unsent_record() {
     escalate_flush "$state" || fail "an empty handled buffer should be a no-op"
   [ "$(grep -c 'ERROR: away-mode escalation delivery ambiguous' "$alarm_log" 2>/dev/null || true)" -eq 1 ] \
     || fail "ambiguous delivery raised its alarm more than once"
-  pass "an empty composer clears a matching ambiguous digest without retyping and alarms once"
+  pass "ambiguous delivery clears its buffer before retiring the no-retype guard and alarms once"
 }
 
 test_own_unsent_recovery_with_grown_buffer_keeps_new_items() {

@@ -651,11 +651,19 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
+_escalation_buffer_clear() {  # <buffer>
+  local buf=$1 tmp="$1.clear.${BASHPID:-$$}"
+  if ! : > "$tmp" 2>/dev/null || ! mv "$tmp" "$buf" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
 # Flush the escalation buffer as ONE batched, single-line digest to the
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg
+  local state=$1 buf item n msg rc
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(wc -l < "$buf" 2>/dev/null || echo 0)
@@ -664,7 +672,26 @@ escalate_flush() {  # <state>
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  inject_msg "$msg" "$state"
+  rc=$?
+  case "$rc" in
+    0)
+      _escalation_buffer_clear "$buf" || return 1
+      rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
+      return 0
+      ;;
+    2)
+      if ! _escalation_buffer_clear "$buf"; then
+        log "inject deferred: ambiguous-delivery buffer could not be cleared"
+        return 1
+      fi
+      log "ERROR: away-mode escalation delivery ambiguous; refusing to retype the recorded digest and clearing its buffer."
+      _inject_recover_attempts_reset "$state" || return 1
+      rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || return 1
+      rm -f "${buf}.since" "$state/.subsuper-inject-wedged"
+      return 0
+      ;;
+  esac
   return 1
 }
 
@@ -1233,7 +1260,7 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
   fi
   verdict=$(fm_backend_submit_enter "$backend" "$target" \
     "${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}" \
-    "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}")
+    "${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}" "$recovered")
   if [ "$verdict" != empty ]; then
     log "inject recovery: our own unsent digest is still unsubmitted (verdict=$verdict); deferring"
     return 1
@@ -1333,11 +1360,7 @@ inject_msg() {  # <message> [state]
   retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
   if _inject_unsent_matches "$state" "$msg"; then
-    log "ERROR: away-mode escalation delivery ambiguous; refusing to retype the recorded digest and clearing its buffer."
-    rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
-    : > "$state/.subsuper-escalations"
-    rm -f "$state/.subsuper-escalations.since" 2>/dev/null || true
-    return 0
+    return 2
   fi
   # Reaching an affirmatively empty composer ends any previous unsent episode:
   # whatever was stuck is gone, so a fresh digest starts with a full recovery

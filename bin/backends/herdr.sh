@@ -2777,15 +2777,17 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] [composer-mode] -
 # Fallback path, for a harness whose native agent-state is not legibly idle:
 # an idle-to-busy rendered-footer transition ACROSS our Enter proves the
 # harness accepted the submission. The pre-Enter baseline excludes the selected
-# composer region, while the post-Enter read includes the cleared row so a
-# harness-owned status token there can prove that the turn started.
+# composer region, while the post-Enter read includes that row only after its
+# selected content differs from the submitted text.
 # Echoes empty|pending|unknown|send-failed, a subset of the proof-carrying
 # submit vocabulary. Empty means confirmed submitted for every backend; how
 # each backend confirms it is an internal decision, and herdr's is no longer
 # literally "the composer read empty".
-fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
+fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep> [expected-text]
   local target=$1 retries=$2 sleep_s=$3 i=0 verdict baseline confirm_sleep
-  local raw_status footer_baseline=''
+  local expected=${4:-} raw_status footer_baseline='' post_content
+  fm_composer_normalize_spaces_var expected
+  expected=${expected//[$' \t\r\n\v\f']/}
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   raw_status=$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
   baseline=$(fm_backend_herdr_classify_submit_agent_status "$raw_status")
@@ -2804,7 +2806,15 @@ fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
       verdict=$(fm_backend_herdr_composer_state "$target")
       case "$verdict" in
         pending|unknown)
-          if [ "$raw_status" != working ] \
+          post_content=
+          if [ -n "$expected" ] \
+            && post_content=$(fm_backend_herdr_composer_content "$target" 2>/dev/null); then
+            fm_composer_normalize_spaces_var post_content
+            post_content=${post_content//[$' \t\r\n\v\f']/}
+          fi
+          if [ -n "$post_content" ] \
+            && [ "$post_content" != "$expected" ] \
+            && [ "$raw_status" != working ] \
             && [ "$footer_baseline" = idle ] \
             && [ "$(fm_backend_herdr_rendered_busy_state "$target" '' include)" = busy ]; then
             verdict=busy
@@ -2827,7 +2837,7 @@ fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep>
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   fm_backend_herdr_send_literal "$target" "$text" || { printf 'send-failed'; return 0; }
   sleep "$settle"
-  fm_backend_herdr_submit_enter "$target" "$retries" "$sleep_s"
+  fm_backend_herdr_submit_enter "$target" "$retries" "$sleep_s" "$text"
 }
 
 # fm_backend_herdr_kill: remove the task's pane, best-effort (mirrors

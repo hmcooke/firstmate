@@ -218,10 +218,11 @@ A fully unreadable target stops retrying and reports unknown.
 
 Some harnesses never present a legibly idle native baseline at all, so the composer fallback is their only path.
 Herdr reports a Cursor pane `blocked` in every state, and Cursor's mid-turn composer renders its placeholder beside a right-aligned busy token, which is composer content and therefore `pending` on a composer that holds no user text.
-The shared rendered-busy matcher excludes the selected composer region, so pending input can never establish either side of a rendered-footer transition.
-An idle-to-busy footer transition outside the composer still confirms the submit when native state is unavailable and the post-Enter composer is pending or unknown.
+The pre-Enter rendered-busy baseline excludes the selected composer region, so pending input cannot establish the starting side of a transition.
+After Enter, the adapter compares the selected composer content with the submitted text after stripping whitespace, and an equal value remains pending because the text has not left.
+Only a positively different post-Enter composer permits a busy token on that row to confirm the transition, while an idle-to-busy footer outside the composer remains valid under the same proof.
 It is the same semantic signal the native path uses and the same one the tmux submit core reads, so a pane already mid-turn before the text was typed still reports `pending` rather than borrowing another turn as proof of this delivery.
-Cursor's right-aligned status token shares its composer row, so a Cursor steer on Herdr lands but reports delivery unconfirmed rather than treating indistinguishable pending input as proof.
+Cursor's right-aligned status token can therefore confirm a landed steer only after the typed content has positively left the composer.
 The affirmative empty-composer fallback closes the residual possibility of an extremely fast complete turn without reporting its landed Enter as pending or permitting duplicate message text.
 
 `pane read --lines N` can return empty output when N is below the viewport height.
