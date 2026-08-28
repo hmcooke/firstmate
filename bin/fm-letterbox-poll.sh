@@ -120,8 +120,7 @@ emit_error_once() {
 
 clear_error() {
   fmx_private_artifact_dir_device "$ROOT" >/dev/null 2>&1 || return 0
-  # A failed cleanup leaves the prior diagnostic eligible to repeat.
-  rm -f "$ROOT/poll-error" 2>/dev/null || true
+  rm -f "$ROOT/poll-error" 2>/dev/null
 }
 
 if [ -n "$LB_CONFIG_ERROR" ]; then
@@ -195,7 +194,12 @@ fi
 # fm-letterbox.sh clears the record there. Until then the alarm re-surfaces once
 # per window, which is at-least-once for exactly the reason the letter intake is.
 if [ -z "$WRITE_ERROR_CLASS" ]; then
-  clear_error
+  if ! clear_error; then
+    RECOVERY_ERROR="cannot clear the recovered letterbox diagnostic marker"
+    if ! error_raised_within "$RECOVERY_ERROR" 0; then
+      PENDING_ERROR=$RECOVERY_ERROR
+    fi
+  fi
 fi
 
 # Announcements accumulate here and are printed as ONE line at the end, so a
@@ -293,6 +297,10 @@ EOF
   local sid rid rstatus
   while IFS="$SEP" read -r sid rid rstatus; do
     [ -n "$sid" ] && [ -n "$rid" ] && [ -n "$rstatus" ] || continue
+    if ! lb_reply_claim_matches "$STATE" "$rid" "$sid" "$rstatus"; then
+      SUPPRESSIONS_COMPLETE=0
+      continue
+    fi
     if ! lb_claim_set_many "$STATE" "$sid" first_reply_status "$rstatus" first_reply "$rid" >/dev/null 2>&1; then
       # The reply claim is the durable winner; this cache may safely be rebuilt from it.
       :

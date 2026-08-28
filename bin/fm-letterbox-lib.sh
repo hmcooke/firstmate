@@ -447,10 +447,11 @@ lb_card_validate() {
       [ "$LB_F_TO" = "$LB_SELF" ] || return 2
       ;;
     reply)
-      [ "$LB_F_FROM" = "$LB_PEER" ] || return 2
+      [ "$LB_F_FROM" = "$LB_PEER" ] && [ "$LB_F_TO" = "$LB_SELF" ] || return 2
       ;;
     *) lb_refuse bad-kind; return 1 ;;
   esac
+  lb_card_seen body || { lb_refuse missing-body; return 1; }
 
   # A higher v is refused by name and never silently downgraded, because a v2
   # card may mean something this parser would misread.
@@ -473,7 +474,6 @@ lb_card_validate() {
       lb_refuse unknown-field; return 1
     fi
   else
-    [ -z "$LB_F_TO" ] || [ "$LB_F_TO" = "$LB_SELF" ] || { lb_refuse unknown-recipient; return 1; }
     lb_status_allowed "$LB_F_STATUS" || { lb_refuse unknown-status; return 1; }
     lb_id_valid "$LB_F_IN_REPLY_TO" || { lb_refuse bad-correlation; return 1; }
     if lb_card_seen class || lb_card_seen subject || lb_card_seen expires; then
@@ -714,17 +714,28 @@ lb_claim_set_number() {
 # between creating the reply claim and writing the cache, the winner is derived
 # here from the reply claim, so a later terminal reply can never overtake it.
 # Prints "<reply-id> <status>" or nothing.
+lb_reply_claim_matches() {
+  local state=$1 reply=$2 sent=$3 status=$4 path
+  path=$(lb_claim_path "$state" "$reply")
+  lb_claim_exists "$state" "$reply" || return 1
+  jq -e --arg r "$reply" --arg s "$sent" --arg status "$status" \
+    'type == "object"
+     and .id == $r
+     and .class == "reply"
+     and .in_reply_to == $s
+     and .status == $status
+     and (.refusal // "") == ""' "$path" >/dev/null 2>&1
+}
+
 lb_first_reply() {
   local state=$1 sent=$2 winner status dir claim
   winner=$(lb_claim_field "$state" "$sent" first_reply) || return 2
   if [ -n "$winner" ]; then
     status=$(lb_claim_field "$state" "$sent" first_reply_status) || return 2
-    if [ -z "$status" ]; then
-      status=$(lb_claim_field "$state" "$winner" status) || return 2
+    if [ -n "$status" ] && lb_reply_claim_matches "$state" "$winner" "$sent" "$status"; then
+      printf '%s %s\n' "$winner" "$status"
+      return 0
     fi
-    [ -n "$status" ] || return 2
-    printf '%s %s\n' "$winner" "$status"
-    return 0
   fi
   dir=$(lb_claim_dir "$state")
   for claim in "$dir"/*.json; do

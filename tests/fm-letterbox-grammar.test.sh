@@ -133,6 +133,47 @@ SH
   pass "serialization cannot mask a body-read failure with its closing fence write"
 }
 
+test_body_block_presence_and_empty_serializer_round_trips() {
+  local dir out
+  dir="$TMP_ROOT/body-presence"; mkdir -p "$dir"
+  write_request "$dir/request.md"
+  awk '$0 == "body: |" { skip=1; next } skip && $0 == "```" { skip=0 } !skip { print }' \
+    "$dir/request.md" > "$dir/request-bodyless.md"
+  refusal_case "a request with no body block" missing-body "$dir/request-bodyless.md"
+
+  printf 'reply content\n' > "$dir/reply-body.txt"
+  cat > "$dir/write-reply.sh" <<'SH'
+lb_card_reply_write "$1" archie-20260824T141902Z-3b71c40d \
+  firstmate-20260824T140311Z-9f2c1ab4 answered 2026-08-24T14:19:02Z "$2"
+SH
+  lb_run archie firstmate.shipyard "$dir/write-reply.sh" "$dir/reply.md" "$dir/reply-body.txt" \
+    || fail "the reply serializer must produce a valid card"
+  awk '$0 == "body: |" { skip=1; next } skip && $0 == "```" { skip=0 } !skip { print }' \
+    "$dir/reply.md" > "$dir/reply-bodyless.md"
+  refusal_case "a reply with no body block" missing-body "$dir/reply-bodyless.md"
+
+  : > "$dir/empty.txt"
+  cat > "$dir/empty-roundtrip.sh" <<'SH'
+lb_card_request_write "$1" firstmate-20260824T140311Z-9f2c1ab4 \
+  ping liveness 2026-08-24T14:03:11Z "" "$3" || exit 1
+lb_card_reply_write "$2" firstmate-20260824T141902Z-3b71c40d \
+  archie-20260824T140311Z-9f2c1ab4 ack 2026-08-24T14:19:02Z "$3" || exit 1
+LB_SELF=archie
+LB_PEER=firstmate.shipyard
+lb_card_parse "$1" "$NOW" || { printf 'REQUEST-REFUSED %s\n' "$LB_REFUSAL"; exit 1; }
+[ -z "$LB_F_BODY" ] || exit 1
+lb_card_parse "$2" "$NOW" || { printf 'REPLY-REFUSED %s\n' "$LB_REFUSAL"; exit 1; }
+[ -z "$LB_F_BODY" ] || exit 1
+printf 'request-empty reply-empty\n'
+SH
+  out=$(lb_run firstmate.shipyard archie "$dir/empty-roundtrip.sh" \
+    "$dir/empty-request.md" "$dir/empty-reply.md" "$dir/empty.txt") \
+    || fail "both serializers must emit an accepted empty body block: $out"
+  [ "$out" = "request-empty reply-empty" ] \
+    || fail "empty request and reply body blocks must both round-trip (got: $out)"
+  pass "body blocks are required while empty request and reply blocks remain valid"
+}
+
 test_prose_outside_the_fence_is_never_parsed() {
   local dir out
   dir="$TMP_ROOT/prose"; mkdir -p "$dir"
@@ -687,6 +728,7 @@ SH
 test_card_round_trips_through_serialise_and_parse
 test_serializer_preserves_the_fence_after_an_unterminated_body
 test_serializer_propagates_a_body_read_failure
+test_body_block_presence_and_empty_serializer_round_trips
 test_prose_outside_the_fence_is_never_parsed
 test_issue_title_is_generated_and_excludes_the_subject
 test_card_not_addressed_here_is_ignored_not_answered

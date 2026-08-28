@@ -196,13 +196,13 @@ SH
   chmod +x "$fakebin/gh-axi"
 
   # A gated fault injector for the LOCAL claim write. It is inert unless
-  # LB_MKTEMP_ALLOW is set, and even then it only touches the claim temp
+  # a fault-control variable is set, and even then it only touches the claim temp
   # template, so a test can let the forge write land and fail exactly the claim
   # record that follows it - the one crash state the close transition must never
   # leave half-written. Everything else execs the real mktemp.
   cat > "$fakebin/mktemp" <<SH
 #!/usr/bin/env bash
-if [ -n "\${LB_MKTEMP_ALLOW:-}" ]; then
+if [ -n "\${LB_MKTEMP_ALLOW:-}\${LB_MKTEMP_FAIL_AT:-}" ]; then
   for a in "\$@"; do
     case "\$a" in
       *fm-letterbox-claim*)
@@ -210,7 +210,11 @@ if [ -n "\${LB_MKTEMP_ALLOW:-}" ]; then
         [ -f "\$LB_MKTEMP_COUNTER" ] && n=\$(cat "\$LB_MKTEMP_COUNTER")
         n=\$((n + 1))
         printf '%s\\n' "\$n" > "\$LB_MKTEMP_COUNTER"
-        [ "\$n" -le "\$LB_MKTEMP_ALLOW" ] || exit 1
+        if [ -n "\${LB_MKTEMP_FAIL_AT:-}" ]; then
+          [ "\$n" -ne "\$LB_MKTEMP_FAIL_AT" ] || exit 1
+        else
+          [ "\$n" -le "\$LB_MKTEMP_ALLOW" ] || exit 1
+        fi
         ;;
     esac
   done
@@ -265,7 +269,7 @@ run_poll() {
 # written it. FAKE_ISSUED lets a test pin the card's timestamp.
 inject_letter() {
   local store=$1 id=$2 class=${3:-fact-lookup} subject=${4:-hermes cron toolset scope}
-  local body=${5:-Answer from your own config, not from memory.} to=${6:-$SELF}
+  local body=${5-Answer from your own config, not from memory.} to=${6-$SELF}
   local n card
   n=$(cat "$store/next")
   printf '%s\n' "$((n + 1))" > "$store/next"
@@ -287,15 +291,16 @@ inject_letter() {
 
 # Inject a peer reply comment on an existing issue.
 inject_reply() {
-  local store=$1 number=$2 reply_id=$3 correlate=$4 status=${5:-answered} body=${6:-Cron runs the CLI toolset.}
-  local card cid
+  local store=$1 number=$2 reply_id=$3 correlate=$4 status=${5:-answered} body=${6-Cron runs the CLI toolset.}
+  local to=${7-$SELF} card cid
   card=$(
     printf 'A reply.\n\n'
     printf '```letterbox/v1\n'
-    printf 'kind: reply\nv: 1\nid: %s\nin-reply-to: %s\nfrom: %s\nto: %s\n' \
-      "$reply_id" "$correlate" "$PEER" "$SELF"
+    printf 'kind: reply\nv: 1\nid: %s\nin-reply-to: %s\nfrom: %s\n' \
+      "$reply_id" "$correlate" "$PEER"
+    [ -z "$to" ] || printf 'to: %s\n' "$to"
     printf 'status: %s\nissued: %s\nbody: |\n' "$status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%s\n' "$body" | sed 's/^/  /'
+    [ -z "$body" ] || printf '%s\n' "$body" | sed 's/^/  /'
     printf '```\n'
   )
   [ -f "$store/comments-$number.json" ] || printf '[]\n' > "$store/comments-$number.json"
@@ -407,6 +412,30 @@ test_poll_reports_a_configuration_fault_once() {
   out=$(run_poll "$home" "$home/forge" "$fakebin")
   [ -z "$out" ] || fail "the same configuration fault must be announced once, not every cycle (got: $out)"
   pass "a configuration fault in an opted-in home is surfaced once, then rate-limited"
+}
+
+test_failed_diagnostic_cleanup_cannot_suppress_a_later_fault_episode() {
+  local home store fakebin out
+  read -r home store fakebin <<< "$(fixture diagnostic-recovery | tr '\n' ' ')"
+  sed 's/FM_LETTERBOX_TRANSPORT=github/FM_LETTERBOX_TRANSPORT=carrier-pigeon/' "$home/.env" \
+    > "$home/env.new" && mv "$home/env.new" "$home/.env"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "unsupported transport carrier-pigeon" "the first fault episode must be announced"
+
+  sed 's/FM_LETTERBOX_TRANSPORT=carrier-pigeon/FM_LETTERBOX_TRANSPORT=github/' "$home/.env" \
+    > "$home/env.new" && mv "$home/env.new" "$home/.env"
+  install_failing_rm_for "$fakebin" "$home/state/letterbox/poll-error"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "cannot clear the recovered letterbox diagnostic marker" \
+    "a failed episode reset must be surfaced"
+
+  rm -f "$fakebin/rm"
+  sed 's/FM_LETTERBOX_TRANSPORT=github/FM_LETTERBOX_TRANSPORT=carrier-pigeon/' "$home/.env" \
+    > "$home/env.new" && mv "$home/env.new" "$home/.env"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "unsupported transport carrier-pigeon" \
+    "the next occurrence must start a new diagnostic episode"
+  pass "failed diagnostic cleanup cannot suppress a later fault episode"
 }
 
 # ---------------------------------------------------------------------------
@@ -556,6 +585,67 @@ test_poll_ignores_a_letter_addressed_elsewhere() {
   assert_absent "$home/state/letterbox/claims/archie-20260824T140311Z-9f2c1ab4.json" \
     "a letter addressed elsewhere must not even be claimed"
   pass "a letter addressed to another estate is ignored, never answered"
+}
+
+test_poll_ignores_replies_without_this_estates_exact_recipient() {
+  local home store fakebin out id number missing_id other_id
+  read -r home store fakebin <<< "$(fixture reply-not-ours | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  missing_id=archie-20260824T150000Z-0c1ea11e
+  other_id=archie-20260824T150001Z-0c1ea11f
+  inject_reply "$store" "$number" "$missing_id" "$id" answered answer ""
+  inject_reply "$store" "$number" "$other_id" "$id" answered answer someone.else
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "replies not addressed here must be ignored silently (got: $out)"
+  assert_absent "$home/state/letterbox/inbox/$missing_id.json" "a reply with no recipient must not be stashed"
+  assert_absent "$home/state/letterbox/claims/$missing_id.json" "a reply with no recipient must not be claimed"
+  assert_absent "$home/state/letterbox/inbox/$other_id.json" "a reply addressed elsewhere must not be stashed"
+  assert_absent "$home/state/letterbox/claims/$other_id.json" "a reply addressed elsewhere must not be claimed"
+  pass "replies are routed only by an exact authoritative recipient"
+}
+
+test_cards_without_a_body_block_are_refused_on_request_and_reply_paths() {
+  local home store fakebin out id number reply_id
+  read -r home store fakebin <<< "$(fixture bodyless-request | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  number=$(inject_letter "$store" "$id" fact-lookup q "")
+  jq --argjson n "$number" \
+    'map(if .number == $n then .body |= sub("body: \\|\\n"; "") else . end)' \
+    "$store/issues.json" > "$store/issues.new" && mv "$store/issues.new" "$store/issues.json"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused $id missing-body" "a request with no body block must be refused by name"
+  assert_absent "$home/state/letterbox/inbox/$id.json" "a bodyless request must not be stashed as accepted"
+
+  read -r home store fakebin <<< "$(fixture bodyless-reply | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T150000Z-0c1ea11e
+  inject_reply "$store" "$number" "$reply_id" "$id" answered ""
+  jq 'map(.body |= sub("body: \\|\\n"; ""))' "$store/comments-$number.json" \
+    > "$store/comments.new" && mv "$store/comments.new" "$store/comments-$number.json"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused $reply_id missing-body for $id" \
+    "a reply with no body block must be refused by name"
+  assert_absent "$home/state/letterbox/inbox/$reply_id.json" "a bodyless reply must not be stashed as accepted"
+  pass "requests and replies without a body block are refused"
+}
+
+test_an_empty_ping_body_block_survives_serialization_and_sender_validation() {
+  local home store fakebin out
+  read -r home store fakebin <<< "$(fixture empty-ping | tr '\n' ' ')"
+  : > "$home/empty.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class ping --subject liveness --file "$home/empty.txt") \
+    || fail "an empty ping must serialize, validate, and send: $out"
+  assert_contains "$out" "sent firstmate-" "the empty ping must pass the sender's receiver-equivalent parser"
+  [ "$(jq -r 'length' "$store/issues.json")" = 1 ] || fail "the valid empty ping must reach the forge once"
+  pass "an empty ping body block round-trips through sender validation"
 }
 
 test_poll_announces_a_refused_card_once() {
@@ -2280,7 +2370,7 @@ test_the_first_terminal_reply_survives_a_crash_before_it_is_cached() {
 inject_malformed_comment() {
   local store=$1 number=$2 cid=$3 ago=${4:-120} body
   # shellcheck disable=SC2016 # Backticks are the literal card fence, not a substitution.
-  body=$(printf '```letterbox/v1\nkind: reply\nv: 1\nid: not an id\nin-reply-to: x\nfrom: archie\nstatus: answered\nissued: %s\nbody: |\n  x\n```\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  body=$(printf '```letterbox/v1\nkind: reply\nv: 1\nid: not an id\nin-reply-to: x\nfrom: archie\nto: firstmate.shipyard\nstatus: answered\nissued: %s\nbody: |\n  x\n```\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
   [ -f "$store/comments-$number.json" ] || printf '[]\n' > "$store/comments-$number.json"
   jq --argjson i "$cid" --arg b "$body" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '. + [{id: $i, body: $b, user: {login: "archie"}, created_at: $at}]' \
@@ -2479,9 +2569,11 @@ test_a_failed_deferred_claim_cannot_advance_the_cursor() {
   inject_reply "$store" "$number" "$reply_id" "$id" answered "the answer"
   set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
   printf '0\n' > "$home/mktemp.count"
-  out=$(run_poll "$home" "$store" "$fakebin" LB_MKTEMP_ALLOW=1 LB_MKTEMP_COUNTER="$home/mktemp.count")
+  out=$(run_poll "$home" "$store" "$fakebin" LB_MKTEMP_FAIL_AT=2 LB_MKTEMP_COUNTER="$home/mktemp.count")
   assert_contains "$out" "reply $id answered" "the reply must be announced before its deferred claim"
   assert_absent "$home/state/letterbox/claims/$reply_id.json" "the injected failure must prevent the reply claim"
+  [ -z "$(jq -r '.first_reply' "$home/state/letterbox/claims/$id.json")" ] \
+    || fail "a failed reply claim must not publish the derived winner cache"
   if [ -f "$home/state/letterbox/cursor" ]; then
     jq -e --arg n "$number" 'has($n) | not' "$home/state/letterbox/cursor" >/dev/null \
       || fail "a failed deferred claim must not advance the cursor past its announcement"
@@ -2489,7 +2581,7 @@ test_a_failed_deferred_claim_cannot_advance_the_cursor() {
   out=$(run_poll "$home" "$store" "$fakebin")
   assert_contains "$out" "reply $id answered" "the unclaimed reply must be announced again"
   assert_present "$home/state/letterbox/claims/$reply_id.json" "the retry must take the reply claim"
-  pass "cursor publication waits for every deferred suppression write it depends on"
+  pass "reply claim publication precedes its winner cache and the cursor"
 }
 
 test_close_reply_array_building_cannot_mask_a_failed_stage() {
@@ -2680,6 +2772,7 @@ fi
 test_poll_unconfigured_is_a_hard_noop
 test_poll_partial_configuration_stays_inert
 test_poll_reports_a_configuration_fault_once
+test_failed_diagnostic_cleanup_cannot_suppress_a_later_fault_episode
 test_arm_generates_the_shim_and_registers_it
 test_registered_shim_survives_the_watchers_validation
 test_supervision_is_required_with_only_the_letterbox_shim
@@ -2688,6 +2781,9 @@ test_retire_fails_and_names_every_registration_artifact_left_behind
 test_poll_stashes_claims_and_announces_a_new_letter
 test_second_sighting_of_the_same_letter_produces_nothing
 test_poll_ignores_a_letter_addressed_elsewhere
+test_poll_ignores_replies_without_this_estates_exact_recipient
+test_cards_without_a_body_block_are_refused_on_request_and_reply_paths
+test_an_empty_ping_body_block_survives_serialization_and_sender_validation
 test_poll_announces_a_refused_card_once
 test_poll_refuses_credential_shaped_content_before_stashing_it
 test_send_writes_the_outbox_before_the_transport_call
