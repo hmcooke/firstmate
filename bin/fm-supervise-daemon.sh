@@ -372,12 +372,12 @@ classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
-  if [ -n "$last" ] && status_is_paused "$last"; then
+  if [ -n "$last" ] && status_is_paused "$last" \
+    && crew_is_paused "$task"; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
     # so this is not a wedge. The caller records a pause marker (long re-surface
-    # cadence in housekeeping) rather than a wedge stale marker. Cheap: reuses the
-    # status line already read, no fm-crew-state.sh call, mirroring the daemon's
-    # existing status-log classification.
+    # cadence in housekeeping) rather than a wedge stale marker. The shared
+    # current-state reader owns whether the run phase permits the declared wait.
     printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
     return
   fi
@@ -474,15 +474,63 @@ clear_pause_tracking() {  # <window> <state>
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
-reconcile_pause_tracking() {  # <window> <state> <last-status-line>
-  local win=$1 state=$2 last=$3 task key marker watcher_key
+_FM_DAEMON_PAUSE_CLASS_TASKS=()
+_FM_DAEMON_PAUSE_CLASS_LINES=()
+_FM_DAEMON_PAUSE_CLASSES=()
+
+pause_class_cache_read() {  # <task> <last-status-line> <output-variable>
+  local task=$1 last=$2 output_var=$3 i=0
+  while [ "$i" -lt "${#_FM_DAEMON_PAUSE_CLASS_TASKS[@]}" ]; do
+    if [ "${_FM_DAEMON_PAUSE_CLASS_TASKS[$i]}" = "$task" ] \
+      && [ "${_FM_DAEMON_PAUSE_CLASS_LINES[$i]}" = "$last" ]; then
+      printf -v "$output_var" '%s' "${_FM_DAEMON_PAUSE_CLASSES[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+pause_class_cache_write() {  # <task> <last-status-line> <pause-class>
+  local task=$1 last=$2 pause_class=$3 i=0
+  while [ "$i" -lt "${#_FM_DAEMON_PAUSE_CLASS_TASKS[@]}" ]; do
+    if [ "${_FM_DAEMON_PAUSE_CLASS_TASKS[$i]}" = "$task" ]; then
+      _FM_DAEMON_PAUSE_CLASS_LINES[$i]=$last
+      _FM_DAEMON_PAUSE_CLASSES[$i]=$pause_class
+      return
+    fi
+    i=$((i + 1))
+  done
+  _FM_DAEMON_PAUSE_CLASS_TASKS[${#_FM_DAEMON_PAUSE_CLASS_TASKS[@]}]=$task
+  _FM_DAEMON_PAUSE_CLASS_LINES[${#_FM_DAEMON_PAUSE_CLASS_LINES[@]}]=$last
+  _FM_DAEMON_PAUSE_CLASSES[${#_FM_DAEMON_PAUSE_CLASSES[@]}]=$pause_class
+}
+
+reconcile_pause_tracking() {  # <window> <state> <last-status-line> [pause-class]
+  local win=$1 state=$2 last=$3 pause_class=${4:-} task key marker watcher_key
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_stale_key "$win")
   if status_is_paused "$last"; then
-    stale_marker_remove "$win" "$state"
-    pause_marker_record "$win" "$state"
+    if [ -z "$pause_class" ]; then
+      if pause_class_cache_read "$task" "$last" pause_class; then
+        :
+      elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
+        pause_class=paused
+      else
+        pause_class=$(crew_absorb_class "$task")
+      fi
+    fi
+    pause_class_cache_write "$task" "$last" "$pause_class"
+    if [ "$pause_class" = paused ]; then
+      stale_marker_remove "$win" "$state"
+      pause_marker_record "$win" "$state"
+    else
+      rm -f "$marker" "$state/.paused-$watcher_key" \
+        "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key"
+      stale_marker_record "$win" "$state"
+    fi
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"
   fi
@@ -1008,7 +1056,7 @@ housekeeping() {  # <state>
     last=$(last_status_line "$state/$task.status")
     if [ -n "$last" ] && status_is_paused "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
-      continue
+      [ -e "$state/.subsuper-paused-$key" ] && continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}" ] || continue
@@ -1241,8 +1289,9 @@ handle_wake() {  # <reason> <state>
       # transitioned working->paused is not still wedge-aged. Only stale produces
       # this action.
       if [ "$kind" = "stale" ]; then
-        stale_marker_remove "$arg" "$state"
-        pause_marker_record "$arg" "$state"
+        task=$(window_to_task "$arg" "$state")
+        last=$(last_status_line "$state/$task.status")
+        reconcile_pause_tracking "$arg" "$state" "$last" paused
       fi
       log "self-handle (paused): $reason -> $distilled"
       ;;
@@ -1271,8 +1320,12 @@ handle_wake() {  # <reason> <state>
         if [ "$_clear_wedge" = 1 ]; then
           stale_marker_remove "$arg" "$state"
         else
-          pause_marker_remove "$arg" "$state"
-          stale_marker_record "$arg" "$state"
+          if [ -n "$last" ] && status_is_paused "$last"; then
+            reconcile_pause_tracking "$arg" "$state" "$last" none
+          else
+            pause_marker_remove "$arg" "$state"
+            stale_marker_record "$arg" "$state"
+          fi
         fi
       fi
       log "self-handle: $reason -> $distilled"

@@ -121,9 +121,9 @@ status_is_captain_relevant() {
 }
 
 # 0 if a status line's leading verb is the pause verb (paused: <reason>). A pure
-# read of the line itself, so the daemon's classify_stale can reuse the last line
-# it already read without a fm-crew-state.sh call. Matches only the verb before the
-# first colon, so a reason mentioning "paused" elsewhere does not false-match.
+# read of the line itself, so callers can identify a candidate before consulting
+# the shared current-state predicate. Matches only the verb before the first colon,
+# so a reason mentioning "paused" elsewhere does not false-match.
 status_is_paused() {  # <status-line>
   local line=$1 verb
   [ -n "$line" ] || return 1
