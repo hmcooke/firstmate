@@ -26,9 +26,10 @@
 #       proving the watcher's own absorb-only-when-provably-working predicate
 #       benefits from the fix in both directions.
 #   (l) declared pause vs a WAITING run-step: a crew that declared an external
-#       wait while the run only MONITORS ci reports paused (run-step+status-log)
-#       and classes `paused` for the supervisors' shared absorb predicate, while
-#       running/fixing/gated/coarse phases keep the run-step's own state.
+#       wait while the run MONITORS ci, including after checks-green or no-CI
+#       readiness, reports paused (run-step+status-log) and classes `paused` for
+#       the supervisors' shared absorb predicate, while running/fixing/gated/
+#       coarse phases keep the run-step's own state.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -515,6 +516,25 @@ test_ci_monitoring_no_checks_terminal_surfaces_done() {
   assert_contains "$out" "state: done" "terminal no-checks ci-monitor run -> done"
   assert_contains "$out" "checks green" "terminal no-checks ci-monitor detail mentions checks green"
   pass "terminal no-checks ci-monitor marker surfaces done"
+}
+
+test_ci_monitoring_no_checks_declared_pause_surfaces_ready_wait() {
+  reset_fakes
+  local d; d=$(new_case ci-nochecks-paused)
+  make_repo_on_branch "$d/wt" fm/feat-cinocheckspaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cinocheckspaused.meta" "window=fm:fm-feat-cinocheckspaused" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\npaused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cinocheckspaused.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cinocheckspaused)"
+  FM_FAKE_CI_LOGS="no CI checks reported - still monitoring until merged or closed"
+  local out; out=$(run_crew_state "$d" feat-cinocheckspaused)
+  assert_contains "$out" "state: paused" "declared no-CI merge wait must read as paused"
+  assert_contains "$out" "source: run-step+status-log" "declared no-CI merge wait names both sources"
+  assert_contains "$out" "waiting on the captain to merge PR 1" "declared no-CI merge wait keeps its reason"
+  assert_contains "$out" "checks green" "declared no-CI merge wait keeps checks-ready detail"
+  assert_contains "$out" "PR ready for review" "declared no-CI merge wait keeps review readiness"
+  assert_contains "$out" "https://github.com/o/r/pull/2" "declared no-CI merge wait keeps the recorded PR"
+  pass "a declared no-CI merge wait preserves ready-for-review facts"
 }
 
 test_ci_monitoring_green_then_rearm_stays_working() {
@@ -1553,6 +1573,7 @@ test_ci_ready_done_log_beats_monitoring_run
 test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
 test_ci_monitoring_no_checks_terminal_surfaces_done
+test_ci_monitoring_no_checks_declared_pause_surfaces_ready_wait
 test_ci_monitoring_green_then_rearm_stays_working
 test_ci_monitoring_no_checks_yet_stays_working
 test_ci_monitoring_still_waiting_stays_working

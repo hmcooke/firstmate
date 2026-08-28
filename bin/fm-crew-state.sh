@@ -19,8 +19,8 @@
 #   state: <working|parked|done|blocked|paused|failed|unknown> · source: <run-step|run-step+status-log|pane|status-log|remote-endpoint|none> · <detail>
 #
 # `run-step+status-log` is the one verdict both sources produce together: a crew
-# that DECLARED an external wait while its run-step is only monitoring CI (step 3
-# below).
+# that DECLARED an external wait while its run-step is in the CI monitor phase,
+# including after checks-green or no-CI readiness is visible (step 3 below).
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta. A meta
@@ -45,16 +45,19 @@
 #      the active step is ci, `axi status` alone cannot tell "still waiting on
 #      checks" from "checks green, waiting on merge" (see nm_ci_checks_state) -
 #      a ci-step log-tail check overrides working -> done once checks read
-#      green, so a green PR is never silently read as still-validating.
+#      green, so a green PR without a declared wait is never silently read as
+#      still-validating.
 #   3. Reconcile the status log against that run. A DECLARED external wait
 #      (`paused: <reason>`) outranks the run-step ONLY while the run is merely
 #      waiting - the ci monitor phase, which holds the PR open until it is merged
-#      or closed, unless its latest log marker reports active repair - and is then
-#      reported as paused · run-step+status-log, so an
-#      idle pane waiting on a captain's merge is not escalated as a possible
-#      wedge. A running or fixing step, a gate awaiting the crew's response, and a
-#      coarse runs-list verdict with no visible phase all keep the run-step's own
-#      state: a crew cannot declare itself paused out of work it must drive.
+#      or closed, including the checks-green and no-CI readiness promotion,
+#      unless its latest log marker reports active repair - and is then reported
+#      as paused · run-step+status-log with the declared reason and readiness
+#      facts, so an idle pane waiting on a captain's merge is not escalated as a
+#      possible wedge. A running or fixing step, a gate awaiting the crew's
+#      response, and a coarse runs-list verdict with no visible phase all keep the
+#      run-step's own state: a crew cannot declare itself paused out of work it
+#      must drive.
 #      Separately, if the log's last line says needs-decision/blocked but the
 #      run-step shows the run moved on, the log is deterministically stale and is
 #      flagged superseded. A genuinely parked run plus a needs-decision log agree,
@@ -590,13 +593,21 @@ if [ "$HAVE_RUN" = 1 ]; then
   # fixing step, a gate awaiting its response, and a coarse runs-list verdict that
   # exposes no phase at all each keep their own state. CI_STEP_STATUS=running is
   # a provable waiting phase only when the latest CI log marker does not report
-  # active repair, and RUN_STATE is still working here, so a green PR that became
-  # done above is likewise unaffected.
-  if [ "$RUN_STATE" = working ] && [ "$CI_STEP_STATUS" = running ] \
+  # active repair. A checks-green or no-CI marker promotes RUN_STATE to done for
+  # current-state readiness, but the CI phase remains the same external monitor.
+  # The worker's terminal `done: PR <url> checks green` line remains the
+  # captain-facing ready signal, while this paused detail retains the run's
+  # readiness facts and recorded PR for readers of the current-state line.
+  if [ "$CI_STEP_STATUS" = running ] \
     && [ "$CI_LOG_STATE" != repairing ] \
     && status_is_paused "$LOG_LINE"; then
-    emit paused run-step+status-log \
-      "$(status_line_note "$LOG_LINE")${SEP}run monitoring CI until merged or closed"
+    PAUSE_DETAIL="$(status_line_note "$LOG_LINE")${SEP}run monitoring CI until merged or closed"
+    if [ "$CI_LOG_STATE" = green ]; then
+      PAUSE_DETAIL="$PAUSE_DETAIL${SEP}$RUN_DETAIL"
+      RUN_PR=$(strip_quotes "$(nm_field pr)")
+      [ -n "$RUN_PR" ] && PAUSE_DETAIL="$PAUSE_DETAIL${SEP}PR $RUN_PR"
+    fi
+    emit paused run-step+status-log "$PAUSE_DETAIL"
   fi
 
   # Reconcile the status log. A needs-decision/blocked log line that the run-step
