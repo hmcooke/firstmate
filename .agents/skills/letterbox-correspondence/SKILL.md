@@ -42,7 +42,7 @@ Three consequences, and none of them is optional:
 | Verb | What it means | What to do |
 |---|---|---|
 | `new <id> <class> <from>` | A letter arrived and is stashed. | Classify and act, below. |
-| `reply <id> <status>` | The peer sent a terminal reply to a letter this estate sent. | Read it, use it, then `bin/fm-letterbox.sh close <id>`. |
+| `reply <id> <status>` | The peer sent a terminal reply to a letter this estate sent. | Read it, use it, then `bin/fm-letterbox.sh close <id>`; an `unable` reply to a notice closes that exchange but leaves a durable resend obligation described below. |
 | `refused <id> <class>` | An inbound letter with a usable id failed the grammar or the credential scan and was NOT stashed. | `bin/fm-letterbox.sh reply <id> --status unable` naming the fault class. Never guess at what it meant. |
 | `refused <reply-id> <class> for <sent-id>` | The peer's reply to `<sent-id>` was refused, either at parse or by the credential scan, and was NOT stashed. | It cannot be answered in correlation and `close` refuses an answer that was never read, so `<sent-id>` stays open on purpose. Send `bin/fm-letterbox.sh send --class notice` naming `<reply-id>` and `<class>`, so the peer can answer cleanly; the `unanswered` backstop keeps raising `<sent-id>` until a clean reply is consumed. |
 | `refused issue-<n> <class>` | A card with no usable id failed the grammar. | It cannot be answered in correlation either. Send a `notice` naming `issue-<n>` and the fault class. |
@@ -54,15 +54,18 @@ Three consequences, and none of them is optional:
 
 A status legal for one class is not legal for another, and both the sender and the requester enforce it.
 
-| Class | Legal terminal statuses |
+| Class | Understood terminal answer statuses |
 |---|---|
 | `ping` | `answered` |
-| `notice` | `ack` only - it is terminal and required |
-| `fact-lookup`, `capability-query` | `answered`, `unable`, `declined` |
-| `work-proposal` | `accepted-for-review`, `declined`, `unable` |
+| `notice` | `ack` when understood - it is terminal and required |
+| `fact-lookup`, `capability-query` | `answered`, `declined` |
+| `work-proposal` | `accepted-for-review`, `declined` |
 
-`ack` is the universal non-terminal "received, working" status everywhere except `notice`, where it is the single legal reply.
+`ack` is the universal non-terminal "received, working" status everywhere except `notice`, where it is the understood and terminal answer.
 `expired` is a lifecycle outcome and is legal for any class.
+`unable` is a protocol-level refusal, not an answer, and is legal for every class, including the synthetic `refused` class used when parsing failed.
+A notice answered `unable` was not acknowledged: close it because the refusal is terminal, then send a corrected notice under a new id.
+`close` records `resend_required=true` on that notice's claim, and `status` keeps printing `RESEND REQUIRED` until the corrected notice id is recorded as `resent_as` and `resend_required` is cleared through `lb_claim_set`.
 A reply whose status its letter's class forbids is refused as `status-not-valid-for-class` and is never consumed as the answer.
 
 ## Multiple replies: the first terminal one wins
@@ -75,13 +78,13 @@ The poll records the winner on the sent claim and `close` consumes exactly that 
 
 Every v1 class is chosen so that **no letter can cause anything irreversible on this estate**.
 
-| Class | Asks for | Reply statuses |
+| Class | Asks for | Understood answer statuses |
 |---|---|---|
 | `ping` | Liveness only. Carries no content. | `answered` |
-| `notice` | One-way information. | `ack`, which is TERMINAL for this class and REQUIRED, so the sender has something to consume and can close the letter |
-| `fact-lookup` | An answer from what this estate already knows or can read **without changing anything**. | `answered`, `unable`, `declined` |
-| `capability-query` | This estate's own current state or capability on a named topic. | `answered`, `unable`, `declined` |
-| `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined`, `unable` - **never a claim that it is done** |
+| `notice` | One-way information. | `ack`, which is TERMINAL and REQUIRED when understood; `unable` is the terminal protocol-refusal exception and requires a corrected notice under a new id |
+| `fact-lookup` | An answer from what this estate already knows or can read **without changing anything**. | `answered`, `declined` |
+| `capability-query` | This estate's own current state or capability on a named topic. | `answered`, `declined` |
+| `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined` - **never a claim that it is done** |
 
 `fact-lookup` and `capability-query` authorise **read-only** work only.
 If answering one would change anything, the answer is `unable` or the work goes through ordinary intake and authority first.

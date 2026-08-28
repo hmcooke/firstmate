@@ -17,8 +17,8 @@
 #   lb_id_new / lb_id_valid     - card identity generation and shape validation
 #   lb_class_allowed <class>    - the v1 request-class allowlist
 #   lb_status_allowed <status>  - the reply-status set, terminal and not
-#   lb_status_allowed_for_class <status> <class> - the per-class allowlist the
-#                                 v1 grammar defines; notice takes ack only
+#   lb_status_allowed_for_class <status> <class> - the per-class understood
+#                                 answer allowlist plus protocol-level outcomes
 #   lb_status_terminal <status> [class] - whether a reply status ends the
 #                                 exchange; ack is terminal for class notice
 #   lb_card_parse <file>        - parse AND validate one card; 0 accepted,
@@ -184,19 +184,23 @@ lb_status_allowed() {
 # required one. Both the sender and the requester validate through this.
 #
 # ack is the universal non-terminal "received, working" status, except on notice
-# where it is the single legal - and terminal - reply. expired is a lifecycle
-# outcome rather than an answer, so any class may end that way.
+# where it is the single understood - and terminal - answer. expired is a
+# lifecycle outcome rather than an answer, so any class may end that way.
+# unable is a protocol-level refusal rather than an answer, so it is legal for
+# every class, including the synthetic refused class used when parsing failed.
+# An unable notice is terminal but is not the required acknowledgement: the
+# sender closes it and sends a corrected notice under a new id.
 lb_status_allowed_for_class() {
   local status=${1-} class=${2-}
   lb_status_allowed "$status" || return 1
-  [ "$status" != expired ] || return 0
+  case "$status" in expired|unable) return 0 ;; esac
   case "$class" in
     notice) [ "$status" = ack ] ;;
     ping) case "$status" in ack|answered) return 0 ;; esac; return 1 ;;
     fact-lookup|capability-query)
-      case "$status" in ack|answered|unable|declined) return 0 ;; esac; return 1 ;;
+      case "$status" in ack|answered|declined) return 0 ;; esac; return 1 ;;
     work-proposal)
-      case "$status" in ack|accepted-for-review|declined|unable) return 0 ;; esac; return 1 ;;
+      case "$status" in ack|accepted-for-review|declined) return 0 ;; esac; return 1 ;;
     # An unknown or unrecorded class cannot be validated against the table, so
     # only the universal statuses are accepted rather than the whole union.
     *) case "$status" in ack) return 0 ;; esac; return 1 ;;
@@ -514,6 +518,9 @@ lb_card_reply_write() {
 #   replied reply_id              our terminal reply, recorded when posted
 #   consumed                      reply ids already consumed (requester side),
 #                                 which is what makes a replayed reply a no-op
+#   first_reply first_reply_status the first terminal peer reply and its status
+#   resend_required resent_as     an unable notice still needs a corrected
+#                                 notice under a new id, and the id that did so
 #   resurfaced                    epoch of the last stale re-announcement
 
 lb_claim_dir() {
@@ -538,7 +545,8 @@ lb_claim_create() {
     --argjson issue "$issue" --argjson claimed "$(date -u +%s)" \
     --arg refusal "$refusal" \
     '{id:$id,class:$class,from:$from,issue:$issue,claimed:$claimed,
-      refusal:$refusal,task:"",replied:"",reply_id:"",resurfaced:0,consumed:[]}' \
+      refusal:$refusal,task:"",replied:"",reply_id:"",first_reply:"",
+      first_reply_status:"",resend_required:"",resent_as:"",resurfaced:0,consumed:[]}' \
     > "$tmp" 2>/dev/null || ! jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
     rm -f -- "$tmp"
     return 2

@@ -28,12 +28,9 @@
 #   missing dependency                  -> one rate-limited diagnostic line
 #   a refused write recorded by
 #   fm-letterbox.sh                     -> raised as an error item, and READS
-#       CONTINUE: a refused write never disables intake. A "transport" class
-#       record (the visibility check itself could not run) is raised once and
-#       cleared by the first successful read; a "visibility" class record (the
-#       channel repository is confirmed not private) is never cleared by a
-#       read, only by a write that lands, and is re-raised once per
-#       FM_LETTERBOX_STALE_SECS window so an exposed channel cannot go quiet
+#       CONTINUE: a refused write never disables intake. Neither the "transport"
+#       class nor the "visibility" class is cleared by a read; both re-alarm once
+#       per FM_LETTERBOX_STALE_SECS window until a write lands
 #   a new peer letter                   -> secret-scan the body, stash the card
 #       to state/letterbox/inbox/<id>.json, atomically claim
 #       state/letterbox/claims/<id>.json, and name it on the one output line
@@ -193,10 +190,10 @@ fi
 # busy cycle still costs exactly one wake.
 ITEMS=0
 LINE=
+WAKE_ITEM_MAX=3
 
 announce() {
   ITEMS=$((ITEMS + 1))
-  [ "$ITEMS" -le 3 ] || return 0
   if [ -z "$LINE" ]; then LINE=$1; else LINE="$LINE; $1"; fi
 }
 
@@ -222,7 +219,7 @@ queue_resurface() {
 }
 
 queue_first_reply() {
-  PENDING_FIRST_REPLY="$PENDING_FIRST_REPLY$1	$2
+  PENDING_FIRST_REPLY="$PENDING_FIRST_REPLY$1	$2	$3
 "
 }
 
@@ -244,9 +241,10 @@ EOF
   done <<EOF
 $PENDING_RESURFACE
 EOF
-  local sid rid
-  while IFS="	" read -r sid rid; do
-    [ -n "$sid" ] && [ -n "$rid" ] || continue
+  local sid rid rstatus
+  while IFS="	" read -r sid rid rstatus; do
+    [ -n "$sid" ] && [ -n "$rid" ] && [ -n "$rstatus" ] || continue
+    lb_claim_set "$STATE" "$sid" first_reply_status "$rstatus" >/dev/null 2>&1 || true
     lb_claim_set "$STATE" "$sid" first_reply "$rid" >/dev/null 2>&1 || true
   done <<EOF
 $PENDING_FIRST_REPLY
@@ -266,6 +264,7 @@ COUNT=$(jq -r 'length' "$OPEN_JSON" 2>/dev/null) || COUNT=0
 case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
 i=0
 while [ "$i" -lt "$COUNT" ]; do
+  [ "$ITEMS" -lt "$WAKE_ITEM_MAX" ] || break
   RAW="$WORK/body.$i"
   jq -r --argjson i "$i" '.[$i].body' "$OPEN_JSON" > "$RAW" 2>/dev/null || { i=$((i + 1)); continue; }
   NUMBER=$(jq -r --argjson i "$i" '.[$i].number' "$OPEN_JSON" 2>/dev/null)
@@ -357,6 +356,7 @@ case "$FETCH_MAX" in ''|*[!0-9]*) FETCH_MAX=5 ;; esac
 
 for receipt in "$SENT"/*.receipt; do
   [ -e "$receipt" ] || continue
+  [ "$ITEMS" -lt "$WAKE_ITEM_MAX" ] || break
   [ "$FETCHES" -lt "$FETCH_MAX" ] || break
   SENT_ID=$(basename "$receipt" .receipt)
   lb_id_valid "$SENT_ID" || continue
@@ -389,9 +389,14 @@ for receipt in "$SENT"/*.receipt; do
   # oldest first, so the first terminal reply in this scan is the winner, and
   # once one is recorded on the sent claim no later reply is ever consumed.
   FIRST_REPLY=$(lb_claim_field "$STATE" "$SENT_ID" first_reply)
+  COMMENTS_COMPLETE=1
   j=0
   while [ "$j" -lt "$CN" ]; do
     [ -z "$FIRST_REPLY" ] || break
+    if [ "$ITEMS" -ge "$WAKE_ITEM_MAX" ]; then
+      COMMENTS_COMPLETE=0
+      break
+    fi
     CRAW="$WORK/comment.$SENT_NUMBER.$j"
     jq -r --argjson j "$j" '.[$j].body' "$COMMENTS" > "$CRAW" 2>/dev/null || { j=$((j + 1)); continue; }
     lb_card_parse "$CRAW"
@@ -431,7 +436,7 @@ for receipt in "$SENT"/*.receipt; do
             | fmx_private_artifact_publish_stdin "$INBOX" "$LB_F_ID.json" 600; then
             announce "reply $SENT_ID $LB_F_STATUS"
             queue_claim "$LB_F_ID" reply "$LB_F_FROM" "$SENT_NUMBER" ""
-            queue_first_reply "$SENT_ID" "$LB_F_ID"
+            queue_first_reply "$SENT_ID" "$LB_F_ID" "$LB_F_STATUS"
             FIRST_REPLY=$LB_F_ID
           fi
         else
@@ -450,6 +455,7 @@ for receipt in "$SENT"/*.receipt; do
   # an interrupted scan is simply redone next cycle. It is staged here and
   # published with the other suppressing writes, after the announcement. A
   # stamp inside this cycle's own second is never recorded (see above).
+  [ "$COMMENTS_COMPLETE" -eq 1 ] || continue
   [ -n "$UPDATED_EPOCH" ] && [ "$UPDATED_EPOCH" -lt "$NOW" ] || continue
   jq --arg n "$SENT_NUMBER" --arg u "$UPDATED" '.[$n] = $u' "$CURSOR_JSON" > "$CURSOR_JSON.new" 2>/dev/null \
     && mv -f "$CURSOR_JSON.new" "$CURSOR_JSON" 2>/dev/null || true
@@ -476,6 +482,7 @@ PENDING_CURSOR=$CURSOR_JSON
 # against the same clock read the cursor used.
 for claim in "$CLAIMS"/*.json; do
   [ -e "$claim" ] || continue
+  [ "$ITEMS" -lt "$WAKE_ITEM_MAX" ] || break
   CID=$(basename "$claim" .json)
   # A card whose own id was unusable is claimed under a synthetic key so it is
   # announced once, but no correlated reply can ever be addressed to it, so
@@ -519,11 +526,7 @@ if [ "$ITEMS" -eq 0 ]; then
   exit 0
 fi
 
-if [ "$ITEMS" -gt 3 ]; then
-  printf 'letterbox %s items: %s; +%s more\n' "$ITEMS" "$LINE" "$((ITEMS - 3))"
-else
-  printf 'letterbox %s items: %s\n' "$ITEMS" "$LINE"
-fi
+printf 'letterbox %s items: %s\n' "$ITEMS" "$LINE"
 
 # CLAIM-LAST. Only now that the announcement has been printed may anything that
 # suppresses a future announcement be written. A crash above this line re-runs

@@ -56,28 +56,57 @@ shift
 # value" rather than "the first argument".
 path=
 expr='.'
+paginate=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --jq) expr=$2; shift 2 ;;
-    --paginate) shift ;;
+    --paginate) paginate=1; shift ;;
     -*) shift ;;
     *) [ -n "$path" ] || path=$1; shift ;;
   esac
 done
 [ -n "$path" ] || exit 1
+per_page=${path##*per_page=}
+per_page=${per_page%%&*}
+case "$per_page" in ''|*[!0-9]*) per_page=30 ;; esac
+
+emit_pages() {
+  local data=$1 kind=$2 total offset=0 page=1 page_json fail_after
+  total=$(printf '%s\n' "$data" | jq -r 'length') || return 1
+  while [ "$offset" -lt "$total" ] || [ "$page" -eq 1 ]; do
+    if [ "${FAKE_GH_FAIL_MATCH:-}" = "$kind" ]; then
+      fail_after=${FAKE_GH_FAIL_AFTER_PAGE:-0}
+      case "$fail_after" in ''|*[!0-9]*) fail_after=0 ;; esac
+      [ "$fail_after" -eq 0 ] || [ "$page" -le "$fail_after" ] || return 1
+    fi
+    page_json=$(printf '%s\n' "$data" \
+      | jq -c --argjson start "$offset" --argjson end "$((offset + per_page))" '.[$start:$end]') \
+      || return 1
+    printf '%s\n' "$page_json" | jq -c -r "$expr" || return 1
+    [ "$paginate" -eq 1 ] || break
+    offset=$((offset + per_page))
+    page=$((page + 1))
+    [ "$offset" -lt "$total" ] || break
+  done
+}
+
 case "$path" in
   */issues/*/comments*)
     n=${path#*/issues/}; n=${n%%/*}
     [ -f "$S/comments-$n.json" ] || printf '[]\n' > "$S/comments-$n.json"
-    jq -c -r "$expr" "$S/comments-$n.json"
+    data=$(jq -c '.' "$S/comments-$n.json") || exit 1
+    emit_pages "$data" comments
     ;;
   *issues?state=open*)
-    jq '[.[] | select(.state == "open")]' "$S/issues.json" | jq -c -r "$expr"
+    data=$(jq -c '[.[] | select(.state == "open")]' "$S/issues.json") || exit 1
+    emit_pages "$data" issues
     ;;
   *issues*state=open*)
-    jq '[.[] | select(.state == "open")]' "$S/issues.json" | jq -c -r "$expr"
+    data=$(jq -c '[.[] | select(.state == "open")]' "$S/issues.json") || exit 1
+    emit_pages "$data" issues
     ;;
   *issues?state=all*)
+    [ ! -e "$S/fail-find-title" ] || exit 1
     jq -c -r "$expr" "$S/issues.json"
     ;;
   repos/*)
@@ -111,6 +140,7 @@ case "${1:-}" in
     sub=${2:-}; shift 2
     case "$sub" in
       create)
+        [ ! -e "$S/fail-create" ] || exit 1
         title=; body=; repo=
         while [ "$#" -gt 0 ]; do
           case "$1" in
@@ -281,6 +311,17 @@ sole_sent_id() {
     [ -e "$f" ] || continue
     f=${f##*/}
     printf '%s\n' "${f%.receipt}"
+    return 0
+  done
+  return 1
+}
+
+sole_outbox_id() {
+  local f
+  for f in "$1"/state/letterbox/outbox/*.json; do
+    [ -e "$f" ] || continue
+    f=${f##*/}
+    printf '%s\n' "${f%.json}"
     return 0
   done
   return 1
@@ -554,6 +595,28 @@ test_send_adopts_an_existing_letter_instead_of_duplicating_it() {
   pass "a send interrupted before its receipt adopts the existing letter; re-delivery is a no-op"
 }
 
+test_send_stops_when_reconciliation_lookup_fails() {
+  local home store fakebin out rc id before after
+  read -r home store fakebin <<< "$(fixture reconcile-lookup-failure | tr '\n' ' ')"
+  printf 'first letter\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject first --file "$home/body.txt" >/dev/null \
+    || fail "the first send must succeed"
+  id=$(sole_sent_id "$home") || fail "the first send must leave a receipt"
+  rm -f "$home/state/letterbox/sent/$id.receipt"
+  : > "$store/fail-find-title"
+  before=$(jq -r 'length' "$store/issues.json")
+  printf 'second letter\n' > "$home/body2.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a failed reconciliation lookup must abort the send"
+  assert_contains "$out" "cannot determine whether unsent letter $id already exists" \
+    "a lookup failure must remain unknown rather than becoming an authoritative miss"
+  after=$(jq -r 'length' "$store/issues.json")
+  [ "$before" = "$after" ] || fail "a lookup failure must not create a duplicate or a new letter"
+  assert_absent "$home/state/letterbox/sent/$id.receipt" \
+    "the interrupted letter must remain in the unsent set for a later retry"
+  pass "a reconciliation lookup failure aborts without creating a duplicate letter"
+}
+
 test_send_refuses_credential_shaped_content_before_any_write() {
   local home store fakebin out rc secret
   read -r home store fakebin <<< "$(fixture send-scan | tr '\n' ' ')"
@@ -585,8 +648,13 @@ test_send_refuses_an_unlisted_class_and_a_host_path() {
   out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/path.txt" 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "a host path must not be sendable"
   assert_contains "$out" "absolute host path" "the refusal must name the host path"
-  [ ! -s "$store/calls.log" ] || fail "neither refusal may reach the transport"
-  pass "the sender enforces the same class allowlist and host-path rule as the receiver"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" \
+    --expires 2026-99-99T99:99:99Z 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an impossible calendar instant must not be sendable"
+  assert_contains "$out" "must name a real ISO 8601 UTC instant" \
+    "the sender must validate the calendar instant, not only its shape"
+  [ ! -s "$store/calls.log" ] || fail "none of the refusals may reach the transport"
+  pass "the sender enforces class, host-path, and real-expiry validation before transport"
 }
 
 # ---------------------------------------------------------------------------
@@ -741,6 +809,54 @@ test_a_notice_ack_is_the_terminal_reply_that_closes_the_exchange() {
   jq -e --argjson n "$number" 'map(select(.number == $n)) | first | .state == "closed"' \
     "$store/issues.json" >/dev/null || fail "consuming the ack must close the notice"
   pass "a notice's ack is terminal and required, and closing it preserves the open-issue invariant"
+}
+
+test_protocol_unable_is_legal_for_a_notice_and_a_parse_refusal() {
+  local home store fakebin out notice_id refused_id notice_number refused_number
+  read -r home store fakebin <<< "$(fixture protocol-unable | tr '\n' ' ')"
+  notice_id=archie-20260824T140311Z-9f2c1ab4
+  refused_id=archie-20260824T140411Z-0badcafe
+  notice_number=$(inject_letter "$store" "$notice_id" notice "an announcement" "information")
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  printf 'the notice could not be accepted\n' > "$home/unable.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" reply "$notice_id" --status unable --file "$home/unable.txt") \
+    || fail "a protocol-level unable must be legal for a notice: $out"
+  assert_grep "status: unable" "$store/comments-$notice_number.json" \
+    "the unable notice reply must reach the forge"
+
+  refused_number=$(inject_letter "$store" "$refused_id" merge-pr "not a v1 class" "body")
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused $refused_id unknown-class" "the parse refusal must be surfaced"
+  out=$(run_lb "$home" "$store" "$fakebin" reply "$refused_id" --status unable --file "$home/unable.txt") \
+    || fail "a protocol-level unable must be legal for a parse-refused card: $out"
+  assert_grep "status: unable" "$store/comments-$refused_number.json" \
+    "the parse-refusal unable reply must reach the forge"
+  pass "unable is a protocol-level refusal accepted for notices and parse-refused cards"
+}
+
+test_consuming_an_unable_notice_closes_and_records_the_resend_obligation() {
+  local home store fakebin out id number reply_id
+  read -r home store fakebin <<< "$(fixture notice-unable-resend | tr '\n' ' ')"
+  printf 'The notice that may need correction.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T141902Z-3b71c40d
+  inject_reply "$store" "$number" "$reply_id" "$id" unable "the notice could not be accepted"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id unable" "an unable notice is terminal and must wake the requester"
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
+  jq -e --argjson n "$number" 'map(select(.number == $n)) | first | .state == "closed"' \
+    "$store/issues.json" >/dev/null || fail "consuming the unable reply must close the notice"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = true ] \
+    || fail "the claim must durably record that a corrected notice is still required"
+  assert_grep "$reply_id" <(jq -r '.consumed[]' "$home/state/letterbox/claims/$id.json") \
+    "the unable reply must still be consumed exactly like another terminal reply"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "RESEND REQUIRED: $id notice" \
+    "the handling interface must keep the corrected-notice obligation visible"
+  pass "an unable notice closes while its corrected-notice resend remains durable and visible"
 }
 
 test_an_ack_on_any_other_class_leaves_the_exchange_open() {
@@ -968,6 +1084,49 @@ test_a_retried_outbox_card_is_host_path_checked_before_transport() {
   pass "a retried outbox card is host-path checked on its exact recovered bytes before the transport call"
 }
 
+test_a_retried_outbox_card_must_pass_the_complete_sender_grammar() {
+  local mode home store fakebin out rc id number before after huge
+  for mode in higher-version forbidden-authority wrong-recipient oversized-body; do
+    read -r home store fakebin <<< "$(fixture "retry-grammar-$mode" | tr '\n' ' ')"
+    printf 'ordinary question\n' > "$home/body.txt"
+    run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject first --file "$home/body.txt" >/dev/null \
+      || fail "the seed send must succeed for $mode"
+    id=$(sole_sent_id "$home") || fail "the seed send must leave a receipt for $mode"
+    number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+    rm -f "$home/state/letterbox/sent/$id.receipt"
+    jq --argjson n "$number" 'map(select(.number != $n))' "$store/issues.json" > "$store/i.new" \
+      && mv "$store/i.new" "$store/issues.json"
+    case "$mode" in
+      higher-version)
+        jq '.card |= sub("v: 1"; "v: 2")' "$home/state/letterbox/outbox/$id.json" > "$home/o.new"
+        ;;
+      forbidden-authority)
+        jq --arg replacement $'authority: captain\nsubject: first' \
+          '.card |= sub("subject: first"; $replacement)' \
+          "$home/state/letterbox/outbox/$id.json" > "$home/o.new"
+        ;;
+      wrong-recipient)
+        jq '.card |= sub("to: archie"; "to: another-estate")' \
+          "$home/state/letterbox/outbox/$id.json" > "$home/o.new"
+        ;;
+      oversized-body)
+        huge=$(awk 'BEGIN { while (i++ < 9000) printf "x" }')
+        jq --arg body "$huge" '.card |= sub("  ordinary question"; ("  " + $body))' \
+          "$home/state/letterbox/outbox/$id.json" > "$home/o.new"
+        ;;
+    esac
+    mv "$home/o.new" "$home/state/letterbox/outbox/$id.json"
+    before=$(jq -r 'length' "$store/issues.json")
+    printf 'second letter\n' > "$home/body2.txt"
+    out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "a recovered $mode card must be refused"
+    assert_contains "$out" "recovered" "the recovered-card refusal must be explicit for $mode"
+    after=$(jq -r 'length' "$store/issues.json")
+    [ "$before" = "$after" ] || fail "a recovered $mode card must not reach the forge"
+  done
+  pass "every recovered outbox card passes the full sender grammar and addressing checks"
+}
+
 test_send_refuses_every_absolute_host_path_form() {
   local home store fakebin out rc form
   read -r home store fakebin <<< "$(fixture blocker3 | tr '\n' ' ')"
@@ -1060,14 +1219,14 @@ test_only_the_first_terminal_reply_is_consumed() {
 test_a_status_the_class_forbids_is_refused_on_both_paths() {
   local home store fakebin out rc id number
   read -r home store fakebin <<< "$(fixture high8 | tr '\n' ' ')"
-  # Sender path: a notice may only be acked.
+  # Sender path: a notice may not be answered.
   id=archie-20260824T140311Z-9f2c1ab4
   inject_letter "$store" "$id" notice "the peer announces something" "for information" >/dev/null
   run_poll "$home" "$store" "$fakebin" >/dev/null
   printf 'an answer\n' > "$home/reply.txt"
   : > "$store/calls.log"
   out=$(run_lb "$home" "$store" "$fakebin" reply "$id" --status answered --file "$home/reply.txt" 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "a notice must not be answered; ack is its only legal reply"
+  [ "$rc" -ne 0 ] || fail "a notice must not be answered; answered is not an understood notice status"
   assert_contains "$out" "not a legal reply to a notice letter" "the refusal must name the class"
   [ "$(grep -c 'issue comment' "$store/calls.log")" = 0 ] || fail "nothing may be posted"
   run_lb "$home" "$store" "$fakebin" reply "$id" --status ack --file "$home/reply.txt" >/dev/null \
@@ -1089,8 +1248,37 @@ test_a_status_the_class_forbids_is_refused_on_both_paths() {
   pass "a class/status combination the protocol forbids is refused on the sender and requester paths"
 }
 
+test_unannounced_overflow_is_left_for_the_next_poll() {
+  local home store fakebin out id number rid i
+  read -r home store fakebin <<< "$(fixture refusal-overflow | tr '\n' ' ')"
+  printf 'a notice\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject n --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  i=1
+  while [ "$i" -le 4 ]; do
+    rid=$(printf 'archie-20260824T15%02d00Z-%08x' "$i" "$i")
+    inject_reply "$store" "$number" "$rid" "$id" answered "not a legal notice answer"
+    i=$((i + 1))
+  done
+  set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "archie-20260824T150100Z-00000001" "the first refusal must be announced"
+  assert_contains "$out" "archie-20260824T150300Z-00000003" "the third refusal must be announced"
+  assert_not_contains "$out" "archie-20260824T150400Z-00000004" \
+    "the fourth refusal must not be hidden behind an anonymous overflow count"
+  assert_not_contains "$out" "+1 more" "nothing unannounced may be described as already handled"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "archie-20260824T150400Z-00000004" \
+    "the unannounced fourth refusal must remain discoverable on the next poll"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "all four announced refusals must then be suppressed (got: $out)"
+  pass "wake overflow is deferred unsuppressed and surfaced by the next poll"
+}
+
 test_reads_are_paginated_beyond_one_page() {
-  local home store fakebin out id number i cid card
+  local home store fakebin out id number i cid target now
   read -r home store fakebin <<< "$(fixture medium9 | tr '\n' ' ')"
   printf 'question\n' > "$home/body.txt"
   run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
@@ -1112,7 +1300,61 @@ test_reads_are_paginated_beyond_one_page() {
   assert_contains "$out" "reply $id answered" \
     "a terminal reply beyond the first page must still be seen"
   run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "close must succeed on a page-two reply"
-  pass "comment reads are paginated, so a terminal reply past page one is not stranded"
+
+  read -r home store fakebin <<< "$(fixture medium9-open | tr '\n' ' ')"
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq -n --arg at "$now" \
+    '[range(1; 121) as $n | {number:$n,title:("ordinary-" + ($n|tostring)),body:"ordinary prose",
+      state:"open",user:{login:"someone"},updated_at:$at}]' > "$store/issues.json"
+  printf '121\n' > "$store/next"
+  target=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$target" fact-lookup q "page two" >/dev/null
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "new $target" "an open letter beyond the first issue page must still be seen"
+  pass "both comment and open-issue reads expose records beyond the first page"
+}
+
+test_a_paginated_read_failure_is_never_accepted_as_partial_data() {
+  local home store fakebin out rc id number i cid at
+  read -r home store fakebin <<< "$(fixture pagination-failure | tr '\n' ' ')"
+  printf 'question\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" >/dev/null \
+    || fail "the send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq --arg at "$at" '. + [range(2; 102) as $n |
+    {number:$n,title:("ordinary-" + ($n|tostring)),body:"ordinary prose",state:"open",
+     user:{login:"someone"},updated_at:$at}]' "$store/issues.json" > "$store/i.new" \
+    && mv "$store/i.new" "$store/issues.json"
+  out=$(env PATH="$fakebin:$BASE_PATH" FM_LETTERBOX_REPO="$CHANNEL" FAKE_STORE="$store" \
+    FAKE_GH_FAIL_MATCH=issues FAKE_GH_FAIL_AFTER_PAGE=1 \
+    "$ROOT/bin/fm-letterbox-transport-github.sh" list-open 2>/dev/null); rc=$?
+  [ "$rc" -ne 0 ] || fail "an issue pagination failure after page one must fail the read"
+  [ -z "$out" ] || fail "a failed paginated issue read must expose no partial array"
+
+  printf '[]\n' > "$store/comments-$number.json"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    cid=$((i + 100))
+    jq --argjson id "$cid" --arg at "$at" \
+      '. + [{id:$id,body:"ordinary prose",user:{login:"archie"},created_at:$at}]' \
+      "$store/comments-$number.json" > "$store/c.new" && mv "$store/c.new" "$store/comments-$number.json"
+    i=$((i + 1))
+  done
+  inject_reply "$store" "$number" archie-20260824T141902Z-3b71c40d "$id" answered "page two answer"
+  set_issue_updated_at "$store" "$number" "$(past_stamp 120)"
+  out=$(run_poll "$home" "$store" "$fakebin" \
+    FAKE_GH_FAIL_MATCH=comments FAKE_GH_FAIL_AFTER_PAGE=1)
+  [ -z "$out" ] || fail "a partial comment read must be treated as no data (got: $out)"
+  if [ -f "$home/state/letterbox/cursor" ]; then
+    jq -e --arg n "$number" 'has($n) | not' "$home/state/letterbox/cursor" >/dev/null \
+      || fail "a partial comment read must not advance that issue's cursor"
+  fi
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "reply $id answered" \
+    "the next complete read must still see the reply beyond the failed page"
+  pass "pagination failures expose no partial data and never advance the reply cursor"
 }
 
 # ---------------------------------------------------------------------------
@@ -1352,6 +1594,33 @@ test_a_transport_write_error_survives_a_successful_read_until_a_write_lands() {
   pass "a transport write-error survives a successful read and retires only when a write lands"
 }
 
+test_title_adoption_does_not_clear_a_write_error() {
+  local home store fakebin out rc id number card at
+  read -r home store fakebin <<< "$(fixture adoption-write-error | tr '\n' ' ')"
+  printf 'false\n' > "$store/private"
+  printf 'first notice\n' > "$home/body.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject first --file "$home/body.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "the first write must be refused while the channel is public"
+  assert_present "$home/state/letterbox/write-error" "the refused write must leave its durable alarm"
+  id=$(sole_outbox_id "$home") || fail "the refused write must leave an outbox record"
+  card=$(jq -r '.card' "$home/state/letterbox/outbox/$id.json")
+  number=$(cat "$store/next")
+  printf '%s\n' "$((number + 1))" > "$store/next"
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq --argjson n "$number" --arg t "[letterbox] notice $id" --arg b "$card" --arg at "$at" \
+    '. + [{number:$n,title:$t,body:$b,state:"open",user:{login:"shipyard"},updated_at:$at}]' \
+    "$store/issues.json" > "$store/i.new" && mv "$store/i.new" "$store/issues.json"
+  printf 'true\n' > "$store/private"
+  : > "$store/fail-create"
+  printf 'second notice\n' > "$home/body2.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "the new create is deliberately failed after adoption"
+  assert_contains "$out" "adopted existing letter $id" "the interrupted letter must be adopted by title"
+  assert_present "$home/state/letterbox/write-error" \
+    "a read-only title adoption must not clear an earlier write alarm"
+  pass "only a confirmed write clears a write-error; title adoption never does"
+}
+
 test_a_lost_wake_does_not_lose_the_write_error_alarm() {
   local home store fakebin out
   read -r home store fakebin <<< "$(fixture write-lostwake | tr '\n' ' ')"
@@ -1542,6 +1811,7 @@ test_poll_announces_a_refused_card_once
 test_poll_refuses_credential_shaped_content_before_stashing_it
 test_send_writes_the_outbox_before_the_transport_call
 test_send_adopts_an_existing_letter_instead_of_duplicating_it
+test_send_stops_when_reconciliation_lookup_fails
 test_send_refuses_credential_shaped_content_before_any_write
 test_send_refuses_an_unlisted_class_and_a_host_path
 test_write_refuses_when_the_channel_is_not_private
@@ -1551,6 +1821,8 @@ test_close_closes_then_records_the_consumed_reply_and_dedupes_a_replay
 test_reply_refuses_a_letter_this_estate_sent
 test_close_refuses_without_a_terminal_reply_and_refuses_a_received_letter
 test_a_notice_ack_is_the_terminal_reply_that_closes_the_exchange
+test_protocol_unable_is_legal_for_a_notice_and_a_parse_refusal
+test_consuming_an_unable_notice_closes_and_records_the_resend_obligation
 test_an_ack_on_any_other_class_leaves_the_exchange_open
 test_a_letter_announced_but_not_yet_claimed_is_announced_again
 test_a_claimed_letter_is_not_reannounced_when_its_stash_is_removed
@@ -1562,12 +1834,15 @@ test_close_never_records_a_consumed_reply_it_could_not_close
 test_death_between_the_sent_claim_and_the_receipt_stays_reconcilable
 test_a_retried_outbox_card_is_rescanned_before_transport
 test_a_retried_outbox_card_is_host_path_checked_before_transport
+test_a_retried_outbox_card_must_pass_the_complete_sender_grammar
 test_send_refuses_every_absolute_host_path_form
 test_a_card_with_an_unknown_kind_is_refused_not_ignored
 test_a_parse_refused_reply_is_named_before_the_cursor_advances
 test_only_the_first_terminal_reply_is_consumed
 test_a_status_the_class_forbids_is_refused_on_both_paths
+test_unannounced_overflow_is_left_for_the_next_poll
 test_reads_are_paginated_beyond_one_page
+test_a_paginated_read_failure_is_never_accepted_as_partial_data
 test_stale_letter_is_resurfaced_once_per_window
 test_a_linked_live_task_suppresses_the_stale_backstop
 test_a_replied_letter_is_not_resurfaced
@@ -1579,6 +1854,7 @@ test_status_reports_activation_and_what_is_owed
 test_status_on_an_unconfigured_home_says_inert
 test_a_visibility_refusal_keeps_alarming_while_reads_continue
 test_a_transport_write_error_survives_a_successful_read_until_a_write_lands
+test_title_adoption_does_not_clear_a_write_error
 test_a_lost_wake_does_not_lose_the_write_error_alarm
 test_a_scan_refused_reply_names_the_sent_letter_and_keeps_it_open
 test_a_sent_letter_with_a_consumed_reply_is_not_resurfaced

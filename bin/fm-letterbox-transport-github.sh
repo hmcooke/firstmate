@@ -85,6 +85,35 @@ require_private() {
   esac
 }
 
+paginated_json() {
+  local path=$1 query=$2 tmp rc
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-github.XXXXXX") || return 1
+  if gh api --paginate "$path" --jq "$query" 2>/dev/null > "$tmp"; then
+    jq -s '.' "$tmp" 2>/dev/null
+    rc=$?
+  else
+    rc=$?
+  fi
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
+find_title_number() {
+  local title=$1 tmp rc
+  tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-github.XXXXXX") || return 1
+  if gh api "repos/$REPO/issues?state=all&sort=created&direction=desc&per_page=100" \
+    --jq '[.[] | select(has("pull_request") | not) | {number, title}]' \
+    2>/dev/null > "$tmp"; then
+    jq -r --arg t "$title" '[.[] | select(.title == $t) | .number] | first // empty' \
+      "$tmp" 2>/dev/null
+    rc=$?
+  else
+    rc=$?
+  fi
+  rm -f -- "$tmp"
+  return "$rc"
+}
+
 # A write refused for visibility must never be retried past the refusal, so
 # every write verb funnels through this one gate.
 gate_write() {
@@ -110,10 +139,10 @@ case "$VERB" in
     # view and the stale backstop's input, so an unrecorded 100-item cap would
     # silently drop letters out of both. --jq emits one object per line per page
     # and jq -s reassembles the pages into the single array the caller expects.
-    gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
-      --jq '.[] | select(has("pull_request") | not)
-             | {number, title, body: (.body // ""), author: (.user.login // ""), updated: (.updated_at // "")}' \
-      2>/dev/null | jq -s '.' 2>/dev/null || exit 1
+    paginated_json "repos/$REPO/issues?state=open&per_page=100" \
+      '.[] | select(has("pull_request") | not)
+       | {number, title, body: (.body // ""), author: (.user.login // ""), updated: (.updated_at // "")}' \
+      || exit 1
     ;;
 
   comments)
@@ -123,18 +152,15 @@ case "$VERB" in
     # seen, while the cursor would still advance past the issue's updated_at and
     # suppress the refetch. Comments stay in oldest-first order across pages,
     # which is what "first terminal reply wins" depends on.
-    gh api --paginate "repos/$REPO/issues/$NUMBER/comments?per_page=100" \
-      --jq '.[] | {id: (.id | tostring), body: (.body // ""), author: (.user.login // ""), created: (.created_at // "")}' \
-      2>/dev/null | jq -s '.' 2>/dev/null || exit 1
+    paginated_json "repos/$REPO/issues/$NUMBER/comments?per_page=100" \
+      '.[] | {id: (.id | tostring), body: (.body // ""), author: (.user.login // ""), created: (.created_at // "")}' \
+      || exit 1
     ;;
 
   find-title)
     TITLE=${1-}
     [ -n "$TITLE" ] || die "letterbox transport: find-title needs a title"
-    NUMBER=$(gh api "repos/$REPO/issues?state=all&sort=created&direction=desc&per_page=100" \
-      --jq '[.[] | select(has("pull_request") | not) | {number, title}]' 2>/dev/null \
-      | jq -r --arg t "$TITLE" '[.[] | select(.title == $t) | .number] | first // empty' 2>/dev/null) \
-      || exit 1
+    NUMBER=$(find_title_number "$TITLE") || exit 1
     case "$NUMBER" in
       ''|*[!0-9]*) exit 0 ;;
     esac
@@ -168,9 +194,7 @@ case "$VERB" in
     # The letter did land; only its URL was not printed in a shape this adapter
     # recognises. Resolve the number the same way a retry would, by exact title,
     # rather than reporting a failure that would cause a duplicate letter.
-    NUMBER=$(gh api "repos/$REPO/issues?state=all&sort=created&direction=desc&per_page=100" \
-      --jq '[.[] | select(has("pull_request") | not) | {number, title}]' 2>/dev/null \
-      | jq -r --arg t "$TITLE" '[.[] | select(.title == $t) | .number] | first // empty' 2>/dev/null)
+    NUMBER=$(find_title_number "$TITLE") || NUMBER=
     case "$NUMBER" in
       ''|*[!0-9]*)
         printf '%s\n' "letterbox transport: create returned no issue URL and the letter could not be found by title" >&2

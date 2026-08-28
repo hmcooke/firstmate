@@ -123,17 +123,19 @@ A reply is a comment on the same issue and correlates through `in-reply-to`, whi
 
 ### Classes
 
-| Class | Asks for | Reply statuses |
+| Class | Asks for | Understood answer statuses |
 |---|---|---|
 | `ping` | Liveness only; carries no content. | `answered` |
-| `notice` | One-way information. | `ack`, which is terminal for this class and required |
-| `fact-lookup` | An answer from what the receiver already knows or can read without changing anything. | `answered`, `unable`, `declined` |
-| `capability-query` | The receiver's own current state or capability on a named topic. | `answered`, `unable`, `declined` |
-| `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined`, `unable` |
+| `notice` | One-way information. | `ack`, which is terminal for this class and required when the notice was understood |
+| `fact-lookup` | An answer from what the receiver already knows or can read without changing anything. | `answered`, `declined` |
+| `capability-query` | The receiver's own current state or capability on a named topic. | `answered`, `declined` |
+| `work-proposal` | "I suggest you consider doing X." | `accepted-for-review`, `declined` |
 
-The status column is an **allowlist, not a suggestion**: both the sender and the requester refuse a status its letter's class does not permit, so a `notice` cannot be "answered" and a `work-proposal` cannot be "answered" either.
-`ack` is the universal non-terminal "received, working" status everywhere except `notice`, where it is the single legal and terminal reply.
+The understood-answer column is an **allowlist, not a suggestion**: both the sender and the requester refuse an answer status its letter's class does not permit, so a `notice` cannot be "answered" and a `work-proposal` cannot be "answered" either.
+`ack` is the universal non-terminal "received, working" status everywhere except `notice`, where it is the understood and terminal answer.
 `expired` is a lifecycle outcome and is legal for any class.
+`unable` is a protocol-level refusal rather than an answer and is therefore legal for every class, including a card whose class could not be parsed.
+An `unable` reply to a notice is terminal, so the requester consumes it and closes the letter, but it does not acknowledge the notice and the sender must send a corrected notice under a new id.
 
 Multiple replies are legal on the wire, and the **first terminal reply wins**.
 The poll records the winner on the sent letter's claim and ignores every later reply, so a handling turn is never given two conflicting answers.
@@ -189,11 +191,6 @@ A refused write never stops the read path: intake, reply detection and the backs
 A successful read does **not** retire the record, for either error class.
 A read proves the transport is back; it proves nothing about whether the alarm was ever delivered, and the watcher appends the durable wake only after the poll exits, so a death in that gap would otherwise let a retiring read erase the last evidence that a write was refused.
 The one acknowledgement this side can observe is a write that lands, which proves both that the condition cleared and that someone acted on it.
-
-A refused write never disables reads: the poll keeps taking in letters, detecting replies and running the backstop with the record in place.
-The record's first line is its class, so the poll decides structurally rather than by reading the prose.
-A `transport` record (the visibility check itself could not run) is raised once and cleared by the first successful poll read.
-A `visibility` record (the repository is confirmed not private) is never cleared by a read, only by a write that lands, and is re-raised once per `FM_LETTERBOX_STALE_SECS` window so an exposed channel cannot go quiet after a single wake.
 
 ## Home-local state
 
