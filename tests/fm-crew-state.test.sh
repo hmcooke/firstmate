@@ -591,6 +591,27 @@ EOF
   pass "a fresh issue after an earlier green reading is not masked"
 }
 
+test_ci_monitoring_repair_declared_pause_stays_working() {
+  reset_fakes
+  local d; d=$(new_case ci-repair-paused)
+  make_repo_on_branch "$d/wt" fm/feat-cirepairpaused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-cirepairpaused.meta" "window=fm:fm-feat-cirepairpaused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: waiting on the captain to merge PR 1\n' > "$d/state/feat-cirepairpaused.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-cirepairpaused)"
+  FM_FAKE_CI_LOGS=$(cat <<'EOF'
+all CI checks passed - still monitoring until merged or closed
+base branch advanced (aaaaaaa..bbbbbbb), re-arming CI monitor timeout
+issues detected: merge conflict - auto-fixing (attempt 2/10)...
+EOF
+)
+  local out; out=$(run_crew_state "$d" feat-cirepairpaused)
+  assert_contains "$out" "state: working" "active CI repair must outrank a declared pause"
+  assert_contains "$out" "source: run-step" "active CI repair remains run-step sourced"
+  assert_not_contains "$out" "state: paused" "active CI repair must not read as a declared wait"
+  pass "active CI repair outranks a declared pause"
+}
+
 test_ci_ready_done_log_relapse_stays_working() {
   reset_fakes
   local d; d=$(new_case ci-ready-then-relapse)
@@ -1536,6 +1557,7 @@ test_ci_monitoring_green_then_rearm_stays_working
 test_ci_monitoring_no_checks_yet_stays_working
 test_ci_monitoring_still_waiting_stays_working
 test_ci_monitoring_green_then_new_issue_stays_working
+test_ci_monitoring_repair_declared_pause_stays_working
 test_ci_ready_done_log_relapse_stays_working
 test_ci_fixing_after_green_stays_working
 test_top_level_fixing_ci_running_after_green_stays_working

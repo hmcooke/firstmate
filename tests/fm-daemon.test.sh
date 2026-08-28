@@ -280,6 +280,8 @@ test_handle_wake_paused_uses_shared_run_state() {
   fakebin="$dir/fakebin"
   make_fake_crew_state "$fakebin" >/dev/null
   win="sess:fm-monitor-w10"
+  pane="$dir/pane.txt"
+  printf 'idle awaiting merge\n' > "$pane"
   fm_write_meta "$state/monitor-w10.meta" "window=$win" "kind=ship" "backend=tmux"
   printf 'paused: waiting on the captain to merge PR 1\n' > "$state/monitor-w10.status"
   key=$(printf '%s' "monitor-w10" | tr ':/.' '___')
@@ -294,7 +296,18 @@ test_handle_wake_paused_uses_shared_run_state() {
     || fail "a monitoring run-step retained wedge tracking"
   [ ! -s "$state/.subsuper-escalations" ] \
     || fail "a monitoring run-step's declared wait escalated immediately"
-  pass "away supervision follows shared run-step pause precedence"
+  printf '%s\n' "$first_seen" > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working - source: run-step - validating (fixing)' \
+    FM_PAUSE_RESURFACE_SECS=240 FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
+  [ ! -e "$state/.subsuper-paused-$key" ] \
+    || fail "a fixing run-step retained declared-pause tracking"
+  [ -e "$state/.subsuper-stale-$key" ] \
+    || fail "a fixing run-step did not resume ordinary wedge aging"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a stale pause was re-surfaced after the run entered fixing"
+  pass "away supervision refreshes shared run-step pause precedence"
 }
 
 test_handle_wake_paused_signal_records_pause_marker() {
@@ -405,8 +418,11 @@ test_housekeeping_paused_resurfaces_and_resets() {
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  make_fake_crew_state "$fakebin" >/dev/null
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
-    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: paused - source: status-log - holding for the upstream tool release' \
+    FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
   grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause was not re-surfaced as an awaiting-external recheck"
   grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "declared pause was mislabeled a possible wedge"
   [ -e "$state/.subsuper-paused-$key" ] || fail "pause marker cleared instead of reset for the next window"

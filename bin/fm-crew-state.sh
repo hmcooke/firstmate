@@ -49,7 +49,8 @@
 #   3. Reconcile the status log against that run. A DECLARED external wait
 #      (`paused: <reason>`) outranks the run-step ONLY while the run is merely
 #      waiting - the ci monitor phase, which holds the PR open until it is merged
-#      or closed - and is then reported as paused · run-step+status-log, so an
+#      or closed, unless its latest log marker reports active repair - and is then
+#      reported as paused · run-step+status-log, so an
 #      idle pane waiting on a captain's merge is not escalated as a possible
 #      wedge. A running or fixing step, a gate awaiting the crew's response, and a
 #      coarse runs-list verdict with no visible phase all keep the run-step's own
@@ -349,7 +350,8 @@ nm_effective_ci_step_status() {
 # actual PR #252 run). Reads the ci step's log tail via `axi logs` and scans it
 # for the MOST RECENT recognized marker (the log is append-only/chronological,
 # so the last match is current): green with nothing red after it means CI is
-# green right now, still only waiting on merge/close.
+# green right now, active repair is distinct from a pending external check, and
+# otherwise the run is still waiting on CI.
 nm_ci_checks_state() {
   local run_id log_tail marker
   run_id=$(strip_quotes "$(nm_field id)")
@@ -361,7 +363,8 @@ nm_ci_checks_state() {
     | tail -1)
   case "$marker" in
     *"checks passed"*|*"no CI checks reported - still monitoring"*) printf 'green' ;;
-    *"no CI checks reported yet"*|*"checks failed"*|*"issues detected"*|*"CI checks running"*|*"base branch advanced"*"re-arming CI monitor timeout"*) printf 'not-ready' ;;
+    *"checks failed"*|*"issues detected"*) printf 'repairing' ;;
+    *"no CI checks reported yet"*|*"CI checks running"*|*"base branch advanced"*"re-arming CI monitor timeout"*) printf 'not-ready' ;;
     *) printf 'unknown' ;;
   esac
 }
@@ -569,9 +572,10 @@ if [ "$HAVE_RUN" = 1 ]; then
     elif [ "$CI_STEP_STATUS" = fixing ]; then
       CI_LOG_STATE=not-ready
     fi
-    if [ "$CI_LOG_STATE" != not-ready ]; then
-      emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR"
-    fi
+    case "$CI_LOG_STATE" in
+      not-ready|repairing) ;;
+      *) emit "done" status-log "$(status_line_note "$LOG_LINE")${SEP}run still monitoring PR" ;;
+    esac
   fi
 
   # A DECLARED external wait outranks a run-step that is only WAITING. While the
@@ -584,12 +588,12 @@ if [ "$HAVE_RUN" = 1 ]; then
   # The run-step stays authoritative everywhere else, because a crew cannot
   # declare itself paused out of work it is supposed to be driving: a running or
   # fixing step, a gate awaiting its response, and a coarse runs-list verdict that
-  # exposes no phase at all each keep their own state. CI_STEP_STATUS is the one
-  # provable waiting phase this reader has (nm_effective_ci_step_status, which
-  # already reports `fixing` rather than `running` whenever the pipeline is
-  # actively repairing), and RUN_STATE is still working here, so a green PR that
-  # became done above is likewise unaffected.
+  # exposes no phase at all each keep their own state. CI_STEP_STATUS=running is
+  # a provable waiting phase only when the latest CI log marker does not report
+  # active repair, and RUN_STATE is still working here, so a green PR that became
+  # done above is likewise unaffected.
   if [ "$RUN_STATE" = working ] && [ "$CI_STEP_STATUS" = running ] \
+    && [ "$CI_LOG_STATE" != repairing ] \
     && status_is_paused "$LOG_LINE"; then
     emit paused run-step+status-log \
       "$(status_line_note "$LOG_LINE")${SEP}run monitoring CI until merged or closed"
