@@ -149,7 +149,7 @@ family_for_basename() {
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-task-delivery.test.sh|\
     fm-tmux-submit-busy.test.sh|fm-trace-context-lib.test.sh|\
-    fm-transition-lib.test.sh|\
+    fm-transition-lib.test.sh|fm-letterbox-grammar.test.sh|\
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
       printf '%s\n' pure-contract-unit
       ;;
@@ -209,6 +209,7 @@ family_for_basename() {
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
       ;;
+    fm-letterbox.test.sh|\
     fm-pr-check-security.test.sh|fm-pr-merge.test.sh|fm-review-diff.test.sh|\
     fm-teardown.test.sh|fm-x-mode.test.sh)
       printf '%s\n' pr-forge
@@ -427,6 +428,8 @@ tests/fm-herdr-session-cleanup.test.sh 6700
 tests/fm-herdr-version-floor-live-e2e.test.sh 17
 tests/fm-inactive-reconcile.test.sh 40478
 tests/fm-kimi-harness.test.sh 13770
+tests/fm-letterbox-grammar.test.sh 569
+tests/fm-letterbox.test.sh 34794
 tests/fm-lint-workflows.test.sh 807
 tests/fm-muse-harness.test.sh 25369
 tests/fm-muse-signals-live-e2e.test.sh 18

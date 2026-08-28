@@ -5,8 +5,9 @@
 # First, always warn if the firstmate primary checkout (FM_ROOT) is on a named
 # non-default branch, because that means firstmate-on-itself work landed in the
 # primary instead of an isolated worktree.
-# Then, if a task is in flight (a state/<id>.meta exists) or X-mode relay
-# polling is active (state/x-watch.check.sh exists) and supervision is not
+# Then, if a task is in flight (a state/<id>.meta exists), X-mode relay polling
+# is active (state/x-watch.check.sh exists), or letterbox polling is active
+# (state/letterbox.check.sh exists) and supervision is not
 # healthy, prints a loud, clearly delimited banner so the agent cannot skim past
 # it in the tool output of whatever it was doing - the one channel every harness
 # has. Supervision health is MODEL-AWARE (fm_watcher_supervision_verdict in
@@ -150,7 +151,7 @@ fi
 
 # Compute supervision need and watcher-beacon freshness via the shared
 # grace-based predicate (bin/fm-supervision-lib.sh). Act when work, an event
-# source, or an X-mode relay poll needs supervision.
+# source, an X-mode relay poll, or a letterbox poll needs supervision.
 fm_supervision_status "$STATE" "$GRACE"
 in_flight=$FM_SUP_IN_FLIGHT
 sources=$FM_SUP_SOURCES
@@ -161,7 +162,7 @@ watcher_healthy=$FM_WATCHER_VERDICT_OK
 watcher_down_reason=$FM_WATCHER_VERDICT_REASON
 if [ "$needed" = false ]; then
   # Leave the unhealthy state (nothing riding on the watcher): clear so a later
-  # work or X-mode need + stale combination is a fresh episode even if the
+  # work, X-mode or letterbox need + stale combination is a fresh episode even if the
   # beacon is still absent with the same key string.
   [ "$READ_ONLY" -eq 1 ] || fm_guard_clear_stale_banner
   exit 0
@@ -207,8 +208,10 @@ if [ "$watcher_healthy" = false ]; then
         printf '●  %s task(s) in flight, but %s.\n' "$in_flight" "$watcher_cause"
       elif [ "$sources" -gt 0 ]; then
         printf '●  %s process-event source(s) registered, but %s.\n' "$sources" "$watcher_cause"
-      else
+      elif [ -f "$STATE/x-watch.check.sh" ]; then
         printf '●  X-mode relay polling needs supervision, but %s.\n' "$watcher_cause"
+      else
+        printf '●  Letterbox polling needs supervision, but %s.\n' "$watcher_cause"
       fi
       if [ "$READ_ONLY" -eq 1 ]; then
         printf '●  This read-only session should report the lapse, not repair it.\n'

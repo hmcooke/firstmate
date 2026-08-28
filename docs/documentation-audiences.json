@@ -157,6 +157,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/letterbox-correspondence/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/process-event-sources/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -274,6 +278,10 @@
     },
     {
       "path": "docs/launch-prefix.md",
+      "audience": "operator-current"
+    },
+    {
+      "path": "docs/letterbox.md",
       "audience": "operator-current"
     },
     {
