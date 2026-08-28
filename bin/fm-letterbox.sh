@@ -16,20 +16,32 @@
 #   fm-letterbox.sh status
 #       Local-only report: activation, whether the poll is armed and registered,
 #       unanswered letters, letters this estate sent whose terminal reply it has
-#       not yet consumed, and any outbox record whose transport call never
-#       completed. Makes no API call.
+#       not yet consumed, any outbox record whose transport call never completed
+#       (with its refusal reason when it can no longer be sent), and refused
+#       cards with no usable id, which no command can answer and are listed as
+#       UNANSWERABLE rather than owed. Makes no API call.
 #   fm-letterbox.sh list
 #       Local-only listing of every stashed letter and reply with its state.
 #   fm-letterbox.sh read <id>
 #       Print one stashed card from the inbox.
 #   fm-letterbox.sh send --class <c> --subject <s> --file <f> [--expires <iso>]
+#                        [--resends <notice-id>]
 #       Send one letter. The id is chosen and recorded in the outbox BEFORE the
 #       transport call, so a retry adopts the existing issue by title-matched id
 #       instead of creating a second one. The body file is read exactly once,
 #       and the assembled card is validated as a whole immediately before it is
-#       recorded or transmitted.
+#       recorded or transmitted. --resends names a notice this estate sent that
+#       the peer answered "unable": the new letter must itself be a notice, and
+#       its id is recorded as resent_as on that claim in the same success
+#       boundary as the receipt, which discharges the RESEND REQUIRED obligation.
+#       An earlier outbox record that can no longer pass the scan or the grammar
+#       is reported as UNSENDABLE and left in place; it never blocks a new send.
 #   fm-letterbox.sh reply <id> --status <s> --file <f>
 #       Reply to a received letter. The responder NEVER closes the issue.
+#   fm-letterbox.sh link <id> --task <task-id>
+#       Record the ordinary firstmate task that now owns a received letter's
+#       obligation, so the stale backstop stops re-surfacing it while that task
+#       is alive. This is the supported way to set task on a claim.
 #   fm-letterbox.sh close <id>
 #       Requester-side receipt: close the issue, which is idempotent, and then
 #       record the consumed terminal reply id, so a crash between the two
@@ -76,7 +88,7 @@ die() {
 }
 
 usage() {
-  sed -n '2,48p' "$0" | sed -e 's/^# \{0,1\}//'
+  sed -n '2,64p' "$0" | sed -e 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -188,13 +200,14 @@ transport_write() {
 # not accept is never emitted either. The field-level gate below gives a fresh
 # send its readable messages; this one is what is trusted, and it runs after
 # every read of mutable input has already happened.
-#   require_card_sendable <file> <kind> <id> <class-or-status> [in-reply-to] [label]
-require_card_sendable() {
-  local file=$1 kind=$2 expected_id=$3 expected=$4 correlate=${5-} what=${6:-the card} size self peer rc reason
+#   card_unsendable_reason <file> <kind> <id> <class-or-status> [in-reply-to]
+# Prints one reason and returns 0 when the card must not be transmitted;
+# prints nothing and returns 1 when it may.
+card_unsendable_reason() {
+  local file=$1 kind=$2 expected_id=$3 expected=$4 correlate=${5-} size self peer rc
   size=$(wc -c < "$file" | tr -d ' ')
-  [ "$size" -le 65536 ] || die "$what is implausibly large; refusing to transmit it"
-  lb_has_host_path "$(cat "$file")" \
-    && die "$what names an absolute host path; refusing to transmit it"
+  [ "$size" -le 65536 ] || { printf 'implausibly large\n'; return 0; }
+  if lb_has_host_path "$(cat "$file")"; then printf 'absolute host path\n'; return 0; fi
   self=$LB_SELF
   peer=$LB_PEER
   LB_SELF=$peer
@@ -204,20 +217,46 @@ require_card_sendable() {
   LB_SELF=$self
   LB_PEER=$peer
   if [ "$rc" -ne 0 ]; then
-    reason=${LB_REFUSAL:-invalid-addressing}
-    die "$what fails the v1 grammar ($reason); refusing to transmit it"
+    printf 'fails the v1 grammar (%s)\n' "${LB_REFUSAL:-invalid-addressing}"
+    return 0
   fi
-  [ "$LB_F_KIND" = "$kind" ] || die "$what is not a $kind; refusing to transmit it"
+  [ "$LB_F_KIND" = "$kind" ] || { printf 'not a %s\n' "$kind"; return 0; }
   [ "$LB_F_ID" = "$expected_id" ] && [ "$LB_F_FROM" = "$self" ] && [ "$LB_F_TO" = "$peer" ] \
-    || die "$what does not match its identity or addressing; refusing to transmit it"
+    || { printf 'does not match its identity or addressing\n'; return 0; }
   if [ "$kind" = request ]; then
-    [ "$LB_F_CLASS" = "$expected" ] \
-      || die "$what does not match its recorded class; refusing to transmit it"
+    [ "$LB_F_CLASS" = "$expected" ] || { printf 'does not match its recorded class\n'; return 0; }
   else
     [ "$LB_F_STATUS" = "$expected" ] && [ "$LB_F_IN_REPLY_TO" = "$correlate" ] \
-      || die "$what does not match its status or correlation; refusing to transmit it"
+      || { printf 'does not match its status or correlation\n'; return 0; }
+  fi
+  return 1
+}
+
+require_card_sendable() {
+  local reason
+  if reason=$(card_unsendable_reason "$@"); then
+    die "the card $reason; refusing to transmit it"
   fi
   return 0
+}
+
+# Why an outbox record can no longer be retried, or nothing when it can. Runs
+# the same two gates the retry runs, on the exact recovered bytes, without
+# dying, so status can report the record and send can step past it.
+outbox_unsendable_reason() {
+  local id=$1 class card reason
+  class=$(jq -r '.class // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
+  lb_class_allowed "$class" || { printf 'invalid class\n'; return 0; }
+  workdir
+  card="$WORK/recovered.$id.md"
+  jq -r '.card // ""' "$(lb_dir "$STATE" outbox)/$id.json" > "$card" 2>/dev/null \
+    || { printf 'unreadable outbox record\n'; return 0; }
+  if lb_scan_refuses "$card"; then printf 'credential-shaped content (%s)\n' "$LB_SCAN_REASON"; return 0; fi
+  if reason=$(card_unsendable_reason "$card" request "$id" "$class"); then
+    printf '%s\n' "$reason"
+    return 0
+  fi
+  return 1
 }
 
 # Sender-side grammar enforcement. The same refusals the receiver applies, so a
@@ -333,15 +372,25 @@ cmd_status() {
   else
     printf '  poll: not armed; run: fm-letterbox.sh arm\n'
   fi
-  local id claim owed=0 sent_open=0 unsent=0 resend=0
+  local id claim reason owed=0 sent_open=0 unsent=0 resend=0 unanswerable=0
   for id in $(unsent_ids); do
     unsent=$((unsent + 1))
-    printf '  UNSENT: %s (transport call never completed; the next send reconciles it)\n' "$id"
+    if reason=$(outbox_unsendable_reason "$id"); then
+      printf '  UNSENDABLE: %s (%s; the outbox record is kept and never retried, and it does not block other sends)\n' "$id" "$reason"
+    else
+      printf '  UNSENT: %s (transport call never completed; the next send reconciles it)\n' "$id"
+    fi
   done
   for claim in "$(lb_claim_dir "$STATE")"/*.json; do
     [ -e "$claim" ] || continue
     id=$(basename "$claim" .json)
     [ "$(lb_claim_field "$STATE" "$id" class)" != reply ] || continue
+    if ! lb_id_valid "$id"; then
+      unanswerable=$((unanswerable + 1))
+      printf '  UNANSWERABLE: %s %s (no usable card id, so nothing can reply to it; resolve it with a notice naming that key)\n' \
+        "$id" "$(lb_claim_field "$STATE" "$id" refusal)"
+      continue
+    fi
     if [ "$(lb_claim_field "$STATE" "$id" from)" = "$LB_SELF" ]; then
       [ -e "$(lb_dir "$STATE" sent)/$id.receipt" ] || continue
       if [ "$(lb_claim_field "$STATE" "$id" resend_required)" = true ] \
@@ -358,8 +407,8 @@ cmd_status() {
         "$( [ -n "$(lb_claim_field "$STATE" "$id" task)" ] && printf ' -> task %s' "$(lb_claim_field "$STATE" "$id" task)" )"
     fi
   done
-  printf '  %s letter(s) awaiting a reply from this estate, %s sent and awaiting a reply from the peer, %s unsent, %s requiring resend\n' \
-    "$owed" "$sent_open" "$unsent" "$resend"
+  printf '  %s letter(s) awaiting a reply from this estate, %s sent and awaiting a reply from the peer, %s unsent, %s requiring resend, %s unanswerable\n' \
+    "$owed" "$sent_open" "$unsent" "$resend" "$unanswerable"
 }
 
 cmd_list() {
@@ -388,11 +437,21 @@ cmd_read() {
 # was chosen and recorded BEFORE that call, so the recovery is an exact
 # title-matched lookup: adopt the existing issue, or create it if it never
 # landed. Re-delivery is therefore a no-op and never a duplicate letter.
+#
+# A record whose recovered bytes can no longer pass the scan or the grammar is
+# refused for retry but NEVER blocks the letter being sent now: it is reported,
+# left in the outbox where status keeps naming it, and skipped. Only a lookup
+# failure stops the send, because creating without an authoritative miss is
+# exactly the duplicate this reconciliation exists to prevent.
 reconcile_unsent() {
-  local id class title number url out
+  local id class title number url out reason resends
   for id in $(unsent_ids); do
+    if reason=$(outbox_unsendable_reason "$id"); then
+      printf 'UNSENDABLE: %s (%s); the outbox record is kept and skipped\n' "$id" "$reason" >&2
+      continue
+    fi
     class=$(jq -r '.class // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
-    lb_class_allowed "$class" || die "the outbox record for $id has an invalid class; refusing to reconcile it"
+    resends=$(jq -r '.resends // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
     title=$(lb_issue_title "$class" "$id")
     # Both create and find-title answer "<number> <url>", so this script never
     # has to know what a forge URL looks like.
@@ -421,7 +480,7 @@ reconcile_unsent() {
       url=${out#* }
       printf 'retried letter %s as issue %s\n' "$id" "$number"
     fi
-    record_receipt "$id" "$number" "$url" "$class"
+    record_receipt "$id" "$number" "$url" "$class" "$resends"
   done
 }
 
@@ -433,8 +492,13 @@ reconcile_unsent() {
 # path is blind to it (claim absent). With this order a death between the two
 # leaves the letter in unsent_ids, where the next send adopts it by title and
 # completes the receipt, so the obligation is always visible to something.
+#
+# A corrected notice discharges the refused notice's resend obligation HERE, in
+# the same success boundary as its receipt: the receipt is what proves the new
+# letter landed, so resent_as is written immediately after it and from the same
+# outbox record, and a retry that completes the receipt completes this too.
 record_receipt() {
-  local id=$1 number=$2 url=$3 class=$4 rc
+  local id=$1 number=$2 url=$3 class=$4 resends=${5-} rc
   lb_claim_create "$STATE" "$id" "$class" "$LB_SELF" "$number" >/dev/null 2>&1
   rc=$?
   # 0 = created here, 1 = already claimed by an earlier attempt; both are fine.
@@ -442,22 +506,48 @@ record_receipt() {
   printf '%s\n%s\n%s\n' "$number" "$url" "$(date -u +%s)" \
     | fmx_private_artifact_publish_stdin "$(lb_dir "$STATE" sent)" "$id.receipt" 600 \
     || die "cannot record the receipt for $id"
+  if [ -n "$resends" ]; then
+    if ! lb_claim_set "$STATE" "$resends" resent_as "$id" \
+      || ! lb_claim_set "$STATE" "$resends" resend_required ""; then
+      die "letter $id was sent, but the resend of notice $resends could not be recorded; run status"
+    fi
+  fi
+}
+
+# The notice a corrected notice replaces must be one this estate sent, must be
+# a notice, and must actually carry the resend obligation, so --resends can
+# never silently clear something else.
+require_resend_target() {
+  local notice=$1 class=$2
+  [ "$class" = notice ] || die "--resends is only valid for a notice; the corrected letter must be class notice"
+  lb_id_valid "$notice" || die "not a letter id: $notice"
+  lb_claim_exists "$STATE" "$notice" || die "no claimed letter $notice in this home"
+  [ "$(lb_claim_field "$STATE" "$notice" from)" = "$LB_SELF" ] \
+    || die "$notice was received, not sent, by this estate; only a sent notice can be re-sent"
+  [ "$(lb_claim_field "$STATE" "$notice" class)" = notice ] \
+    || die "$notice is not a notice; only a refused notice carries a resend obligation"
+  [ -z "$(lb_claim_field "$STATE" "$notice" resent_as)" ] \
+    || die "$notice was already re-sent as $(lb_claim_field "$STATE" "$notice" resent_as)"
+  [ "$(lb_claim_field "$STATE" "$notice" resend_required)" = true ] \
+    || die "$notice does not require a resend"
 }
 
 cmd_send() {
-  local class='' subject='' file='' expires='' id title out number url body
+  local class='' subject='' file='' expires='' resends='' id title out number url body
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --class) need_value "$@"; class=$2; shift 2 ;;
       --subject) need_value "$@"; subject=$2; shift 2 ;;
       --file) need_value "$@"; file=$2; shift 2 ;;
       --expires) need_value "$@"; expires=$2; shift 2 ;;
+      --resends) need_value "$@"; resends=$2; shift 2 ;;
       *) die "unknown send flag $1" ;;
     esac
   done
   require_active
   lb_class_allowed "$class" \
     || die "class ${class:-<none>} is not in the v1 allowlist (ping, notice, fact-lookup, capability-query, work-proposal)"
+  [ -z "$resends" ] || require_resend_target "$resends" "$class"
   [ -n "$subject" ] || die "send needs --subject"
   [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ] || die "send needs a readable --file"
   if [ -n "$expires" ]; then
@@ -494,9 +584,9 @@ cmd_send() {
   # shellcheck disable=SC2016 # A jq filter, expanded by jq.
   lb_json_publish "$(lb_dir "$STATE" outbox)" "$id.json" \
     --arg id "$id" --arg class "$class" --arg subject "$subject" \
-    --arg expires "$expires" --arg card "$(cat "$WORK/card.md")" \
+    --arg expires "$expires" --arg resends "$resends" --arg card "$(cat "$WORK/card.md")" \
     --argjson issued "$(date -u +%s)" \
-    '{id:$id,class:$class,subject:$subject,expires:$expires,issued:$issued,card:$card}' \
+    '{id:$id,class:$class,subject:$subject,expires:$expires,resends:$resends,issued:$issued,card:$card}' \
     || die "cannot record the outbox entry for $id"
 
   require_private_channel
@@ -505,8 +595,29 @@ cmd_send() {
   number=${out%% *}
   url=${out#* }
   case "$number" in ''|*[!0-9]*) die "the transport returned no issue number; the outbox record is kept for retry" ;; esac
-  record_receipt "$id" "$number" "$url" "$class"
+  record_receipt "$id" "$number" "$url" "$class" "$resends"
   printf 'sent %s (%s) as %s\n' "$id" "$class" "$url"
+  [ -z "$resends" ] || printf 'recorded %s as the corrected notice for %s\n' "$id" "$resends"
+}
+
+cmd_link() {
+  local id=${1-} task=''
+  shift 2>/dev/null || true
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --task) need_value "$@"; task=$2; shift 2 ;;
+      *) die "unknown link flag $1" ;;
+    esac
+  done
+  require_active
+  lb_id_valid "$id" || die "not a letter id: ${id:-<none>}"
+  [ -n "$task" ] || die "link needs --task <task-id>"
+  case "$task" in *[!A-Za-z0-9._-]*|.*) die "not a task id: $task" ;; esac
+  lb_claim_exists "$STATE" "$id" || die "no claimed letter $id in this home"
+  [ "$(lb_claim_field "$STATE" "$id" from)" = "$LB_PEER" ] \
+    || die "$id was sent by this estate, not received; only a received letter is owned by a task"
+  lb_claim_set "$STATE" "$id" task "$task" || die "cannot record task $task on $id"
+  printf 'linked %s -> task %s\n' "$id" "$task"
 }
 
 cmd_reply() {
@@ -647,6 +758,7 @@ case "$CMD" in
   read) cmd_read "$@" ;;
   send) cmd_send "$@" ;;
   reply) cmd_reply "$@" ;;
+  link) cmd_link "$@" ;;
   close) cmd_close "$@" ;;
   -h|--help|help) usage 0 ;;
   '') usage 2 ;;

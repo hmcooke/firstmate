@@ -288,33 +288,40 @@ lb_card_seen() {
   return 1
 }
 
-# An absolute host path must never cross the channel: it is how one estate's
+# An absolute host path should not cross the channel: it is how one estate's
 # filesystem shape leaks into the other's records, and on the peer estate a bare
-# path in prose can itself be a delivery instruction. Cards refer to files by
-# role.
+# path in prose can itself be a delivery instruction. "Cards refer to files by
+# role" is a PROTOCOL CONVENTION the peer is expected to follow; this guard
+# exists to catch an accident, not to hold against an adversary.
 #
-# The rule is "a slash that begins a path", which is deliberately wider than
-# "two components separated by whitespace". It catches a root-level path (/etc),
-# a file URI (file:///home/x), and a label-prefixed path (path:/Users/x), all of
-# which an earlier narrower detector accepted and transmitted.
+# HONESTY, in the same register as bin/fm-secret-scan.sh:
+#   - This is DEFENCE IN DEPTH, NOT A BOUNDARY. A regex asked to decide "is this
+#     a filesystem path" in free text will not recognise every way a path can
+#     be written, and no other safety property may rest on it. The bodies it
+#     guards are separately credential-scanned.
+#   - Its stated limit is measured, not assumed: a Windows-style path such as
+#     C:\Users\captain\secret has no forward slash and is NOT recognised.
+#     tests/fm-letterbox-grammar.test.sh pins that as the current outcome, so
+#     strengthening the rule means revisiting this header, docs/letterbox.md and
+#     the letterbox-correspondence skill together.
+#
+# The rule is a conservative "path start": after http and https URLs are
+# stripped, a "~/" or a "/" that is immediately followed by a non-whitespace,
+# non-slash character, where a "/" start is not itself preceded by an
+# alphanumeric. It catches /etc, see /etc/passwd, (/home/x/y), file:///home/x,
+# path:/Users/x, /$HOME/secret, /+cache/file, ~/.ssh/id_rsa and see ~/notes.
+# It leaves relative paths and ordinary prose alone: docs/letterbox, and/or,
+# 24/7, n/a, 2026/08/28, "read / write" and "50 / 2" are all accepted, because
+# a slash inside a word or standing alone between spaces is not a path start.
 #
 # http and https URLs are removed BEFORE the test rather than exempted inside it.
 # A network URL is not a host path and stays legal, but its own path component
 # would otherwise look exactly like one. Every other scheme, file: included, is
-# left in place and therefore refused, which is correct: a file URI IS an
-# absolute host path wearing a scheme.
-#
-# A relative path stays legal because the slash must not follow an alphanumeric:
-# docs/letterbox, and/or and 24/7 are all accepted.
-#
-# What FOLLOWS the slash is not constrained at all. An earlier detector required
-# the first byte after it to be [A-Za-z0-9._-], which accepted /$HOME/secret,
-# /+cache/file and a bare "/" - each a valid absolute form on a real host. Any
-# slash that begins a path is refused, whatever the path's first byte is.
+# left in place and therefore refused: a file URI IS a host path wearing a scheme.
 lb_has_host_path() {
   printf '%s' "$1" \
     | sed -E 's#[Hh][Tt][Tt][Pp][Ss]?://[^[:space:]]*# #g' \
-    | grep -qE '(^|[^A-Za-z0-9._~+-])/'
+    | grep -qE '(^|[^A-Za-z0-9])~?/[^[:space:]/]'
 }
 
 lb_iso_valid() {

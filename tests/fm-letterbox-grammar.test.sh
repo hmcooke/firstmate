@@ -355,53 +355,57 @@ test_every_absolute_host_path_form_is_refused() {
   cat > "$dir/snippet.sh" <<'SH'
 while IFS= read -r value; do
   [ -n "$value" ] || continue
-  if lb_has_host_path "$value"; then printf 'REFUSED %s
-' "$value"; else printf 'accepted %s
-' "$value"; fi
+  if lb_has_host_path "$value"; then printf 'REFUSED %s\n' "$value"; else printf 'accepted %s\n' "$value"; fi
 done < "$1"
 SH
-  {
-    printf '/etc
-'
-    printf 'file:///home/captain/secret
-'
-    printf 'path:/Users/captain/secret
-'
-    printf '/home/captain/secret
-'
-    printf 'the file is at /var/log/thing
-'
-    # shellcheck disable=SC2016 # The literal, unexpanded form is the input under test.
-    printf '/$HOME/secret
-'
-    printf '/+cache/file
-'
-    printf '/
-'
-    printf 'the root is / on every host
-'
-    printf '(/etc/hosts)
-'
-  } > "$dir/refuse.txt"
+  # The refused-forms table: every form the conservative "path start" rule recognises.
+  # shellcheck disable=SC2016 # The literal, unexpanded forms are the input under test.
+  cat > "$dir/refuse.txt" <<'TXT'
+/etc
+/home/captain/secret
+see /etc/passwd
+(/home/x/y)
+file:///home/captain/secret
+path:/Users/captain/secret
+/$HOME/secret
+/+cache/file
+~/.ssh/id_rsa
+see ~/notes
+**/home/x**
+TXT
   out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/refuse.txt") || fail "harness: $out"
-  assert_not_contains "$out" "accepted" "every absolute host path form must be refused"$'
-'"$out"
-  {
-    printf 'See https://example.test/releases/v2 and the docs/letterbox page.
-'
-    printf 'run bin/fm-letterbox.sh status
-'
-    printf 'and/or
-'
-    printf '24/7
-'
-    printf 'n/a
-'
-  } > "$dir/accept.txt"
+  assert_not_contains "$out" "accepted" "every listed absolute host path form must be refused"$'\n'"$out"
+  # The accepted-forms table: relative paths, URLs and ordinary prose with slashes.
+  cat > "$dir/accept.txt" <<'TXT'
+read / write
+50 / 2
+and/or
+24/7
+n/a
+2026/08/28
+docs/letterbox
+run bin/fm-letterbox.sh status
+See https://example.test/releases/v2 and the docs/letterbox page.
+TXT
   out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" "$dir/accept.txt") || fail "harness: $out"
-  assert_not_contains "$out" "REFUSED" "a URL and a relative path are not host paths"$'
-'"$out"
-  pass "root-level, file-URI, label-prefixed and non-alphanumeric-start paths are refused; URLs and relative paths are not"
+  assert_not_contains "$out" "REFUSED" "relative paths, URLs and spaced slashes are not host paths"$'\n'"$out"
+  pass "the host-path guard refuses every listed path start and accepts every listed prose form"
+}
+
+# The guard's stated limit, MEASURED rather than hoped, in the style of the
+# scanner's N7 control: a Windows-style path has no forward slash and is NOT
+# recognised. This pins the current outcome. If the rule is ever strengthened
+# to catch it, this fails on purpose, so the header in bin/fm-letterbox-lib.sh,
+# docs/letterbox.md and the letterbox-correspondence skill are revisited together.
+test_host_path_guard_limit_windows_paths_are_not_recognised() {
+  local dir out
+  dir="$TMP_ROOT/host-limit"; mkdir -p "$dir"
+  cat > "$dir/snippet.sh" <<'SH'
+if lb_has_host_path "$1"; then echo REFUSED; else echo accepted; fi
+SH
+  out=$(lb_run firstmate.shipyard archie "$dir/snippet.sh" 'the file is at C:\Users\captain\secret') || fail "harness: $out"
+  [ "$out" = accepted ] || fail "measured limit changed: a Windows-style path is now recognised ($out); update the header, docs and skill together"
+  pass "measured limit: a Windows-style path passes the host-path guard - defence in depth, not a boundary"
 }
 
 test_a_hyphenated_estate_identity_generates_a_valid_id() {
@@ -642,6 +646,7 @@ test_class_allowlist_is_exactly_v1
 test_a_document_with_no_card_is_ignored_not_refused
 test_unknown_or_missing_kind_is_a_named_refusal
 test_every_absolute_host_path_form_is_refused
+test_host_path_guard_limit_windows_paths_are_not_recognised
 test_a_hyphenated_estate_identity_generates_a_valid_id
 test_scanner_negative_controls
 test_scanner_fails_closed_when_grep_cannot_run

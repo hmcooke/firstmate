@@ -65,7 +65,8 @@ A status legal for one class is not legal for another, and both the sender and t
 `expired` is a lifecycle outcome and is legal for any class.
 `unable` is a protocol-level refusal, not an answer, and is legal for every class, including the synthetic `refused` class used when parsing failed.
 A notice answered `unable` was not acknowledged: close it because the refusal is terminal, then send a corrected notice under a new id.
-`close` records `resend_required=true` on that notice's claim, and `status` keeps printing `RESEND REQUIRED` until the corrected notice id is recorded as `resent_as` and `resend_required` is cleared through `lb_claim_set`.
+`close` records `resend_required=true` on that notice's claim, and `status` keeps printing `RESEND REQUIRED` until the corrected notice is sent with `bin/fm-letterbox.sh send --class notice --resends <notice-id> ...`, which records the new id as `resent_as` in the same success boundary as its receipt and clears the obligation.
+Never edit a claim by hand or through the library: every state transition has a supported verb.
 A reply whose status its letter's class forbids is refused as `status-not-valid-for-class` and is never consumed as the answer.
 
 ## Multiple replies: the first terminal one wins
@@ -106,15 +107,10 @@ Record the link both ways:
 ```sh
 bin/fm-letterbox.sh list                 # find the letter id
 # after creating the backlog item and dispatching the work:
-jq '.task = "<task-id>"' state/letterbox/claims/<letter-id>.json  # via lb_claim_set
+bin/fm-letterbox.sh link <letter-id> --task <task-id>
 ```
 
-In practice, set it through the library rather than by hand:
-
-```sh
-. bin/fm-x-lib.sh; . bin/fm-letterbox-lib.sh
-lb_claim_set "$FM_HOME/state" "<letter-id>" task "<task-id>"
-```
+`link` is the supported way to record the task on the claim; the claim files under `state/letterbox/` are private state and are never edited by hand or through the library.
 
 With `task=<task-id>` in the claim, the owed reply is findable from the task and the task from the letter, and the poll's stale backstop stops re-surfacing that letter while the task is alive.
 When the task completes, post the terminal reply with `bin/fm-letterbox.sh reply`.
@@ -171,7 +167,11 @@ So `bin/fm-letterbox.sh close <id>` is a receipt, not tidying, and it refuses wh
 
 Use `bin/fm-letterbox.sh send --class <c> --subject <s> --file <f>`.
 Keep the subject to one line for human legibility; it lives inside the card and never in the generated title.
-Refer to files by role, never by path: a bare absolute path is refused here, and on some peer estates a path in prose is itself a delivery instruction.
+Refer to files by role, never by path: on some peer estates a path in prose is itself a delivery instruction.
+That is a protocol convention you follow, not something the tooling enforces for you: the host-path guard in `send` is defence in depth that catches an accident such as `/etc/hosts` or `~/notes`, it is not a boundary, and it will not recognise every way a path can be written (a Windows-style `C:\Users\...` path passes it, as a measured limit).
+A card from the peer is under the same convention, and the same guard, on their side.
+An earlier outbox record that can no longer pass the scan or the grammar is reported as `UNSENDABLE` by `status` and by `send`, is never retried, and never blocks a new letter.
+A refused card with no usable id is reported by `status` as `UNANSWERABLE`, not as owed: nothing can reply to it, so resolve it with a `notice` naming its key.
 Never put a credential, a decision key or a captain attribution in a card; the scanner refuses rather than redacting, and a refusal means nothing was sent, recorded or logged.
 
 ## What to tell the captain

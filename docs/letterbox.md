@@ -79,6 +79,7 @@ The watcher then runs it from a hash-validated private snapshot on the ordinary 
 Editing the shim breaks its registration, and the watcher refuses to run it rather than executing unvetted bytes.
 
 `bin/fm-letterbox.sh status` reports activation, whether the poll is armed and registered, and which letters still owe a reply.
+It also names an outbox record that can no longer be retried as `UNSENDABLE` with its reason (such a record is kept, skipped by every later send and never blocks one), and a refused card with no usable id as `UNANSWERABLE` rather than owed, because no command can reply to it.
 `bin/fm-letterbox.sh retire` removes the shim and its registration while keeping every letter, claim and receipt.
 
 ### Supervision
@@ -94,6 +95,8 @@ bin/fm-letterbox.sh list
 bin/fm-letterbox.sh read <letter-id>
 bin/fm-letterbox.sh reply <letter-id> --status answered --file answer.md
 bin/fm-letterbox.sh close <letter-id>
+bin/fm-letterbox.sh link <letter-id> --task <task-id>
+bin/fm-letterbox.sh send --class notice --subject "corrected" --file notice.md --resends <notice-id>
 ```
 
 The **responder never closes**; the **requester** closes once it has consumed a terminal reply.
@@ -163,10 +166,13 @@ Each of these is refused at parse, on both the sending and the receiving side, r
 - A class outside the v1 allowlist.
 - A card version above `1`, refused by name and never silently downgraded.
 - Credential-shaped content in any field.
-- An absolute host path, in **every** form: a root-level path (`/etc`), a file URI (`file:///home/...`), a label-prefixed path (`path:/Users/...`), and a path whose first byte is not alphanumeric (`/$HOME/secret`, `/+cache/file`, a bare `/`), not only a two-component path surrounded by whitespace.
-  Any slash that begins a path is refused, whatever follows it; a slash inside a word (`and/or`, `24/7`, `docs/letterbox`) is not a path start and stays legal.
-  Cards refer to files by role.
-  An http or https URL is not a host path and stays legal, as does a relative path such as `docs/letterbox`.
+- An absolute host path in the forms the guard recognises: a root-level path (`/etc`, `see /etc/passwd`, `(/home/x/y)`), a file URI (`file:///home/...`), a label-prefixed path (`path:/Users/...`), a path whose first byte is not alphanumeric (`/$HOME/secret`, `/+cache/file`), and a home-relative path (`~/.ssh/id_rsa`, `see ~/notes`).
+  The rule is a conservative "path start": a `~/` or a `/` immediately followed by a non-whitespace, non-slash character, where a `/` start is not preceded by an alphanumeric.
+  A slash inside a word (`and/or`, `24/7`, `n/a`, `2026/08/28`, `docs/letterbox`) or standing alone between spaces (`read / write`, `50 / 2`) is not a path start and stays legal, and so does an http or https URL.
+  **This guard is defence in depth, not a boundary.**
+  "Cards refer to files by role" is a protocol convention the peer is expected to follow; the guard exists to catch an accident rather than to hold against an adversary, and it will not recognise every way a path can be written.
+  Its limit is measured rather than assumed: a Windows-style path such as `C:\Users\captain\secret` has no forward slash and passes, and `tests/fm-letterbox-grammar.test.sh` pins that outcome so it cannot quietly become an assumption.
+  The bodies it guards are separately credential-scanned; no other safety property rests on it.
 - Any `decision-key`, answer-to-a-hold, approval or captain-attribution field.
   The letterbox is never bound as a keyed-answer source, so such a field would close nothing even if it were accepted.
 - A body over 8 KiB, which is **refused, not truncated**.

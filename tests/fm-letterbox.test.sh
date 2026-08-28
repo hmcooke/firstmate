@@ -862,6 +862,85 @@ test_consuming_an_unable_notice_closes_and_records_the_resend_obligation() {
   pass "an unable notice closes while its corrected-notice resend remains durable and visible"
 }
 
+test_a_corrected_notice_discharges_the_resend_obligation_through_send() {
+  local home store fakebin out rc id number new_id
+  read -r home store fakebin <<< "$(fixture notice-resends | tr '\n' ' ')"
+  printf 'The notice that needs correction.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  printf 'The corrected notice.\n' > "$home/fixed.txt"
+  # Before the peer has refused it there is nothing to re-send.
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "--resends must refuse a notice that does not require a resend"
+  assert_contains "$out" "does not require a resend" "the refusal must say why"
+  inject_reply "$store" "$number" archie-20260824T141902Z-3b71c40d "$id" unable "not acceptable"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "--resends must refuse a corrected letter that is not a notice"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id") \
+    || fail "the corrected notice must send: $out"
+  new_id=$(printf '%s\n' "$out" | sed -n 's/^sent \([^ ]*\) .*/\1/p')
+  [ -n "$new_id" ] && [ "$new_id" != "$id" ] || fail "the corrected notice must carry a new id (got: $out)"
+  assert_contains "$out" "recorded $new_id as the corrected notice for $id" "send must report the discharge"
+  [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "$new_id" ] \
+    || fail "resent_as must be recorded on the refused notice's claim"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "the resend obligation must be cleared"
+  [ "$(jq -r '.resends' "$home/state/letterbox/outbox/$new_id.json")" = "$id" ] \
+    || fail "the outbox record must carry what it resends, so a retry completes the same discharge"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_not_contains "$out" "RESEND REQUIRED" "a discharged obligation must no longer be reported"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject again --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a notice already re-sent must not be re-sent again through --resends"
+  assert_contains "$out" "already re-sent as $new_id" "the second discharge must be refused by name"
+  pass "send --resends discharges the resend obligation in the receipt's own success boundary"
+}
+
+test_link_records_the_owning_task_through_a_supported_verb() {
+  local home store fakebin out rc id
+  read -r home store fakebin <<< "$(fixture link-task | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$id" work-proposal "p" "a proposal" >/dev/null
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  out=$(run_lb "$home" "$store" "$fakebin" link "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "link without --task must be refused"
+  out=$(run_lb "$home" "$store" "$fakebin" link "$id" --task "../escape" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "link must refuse a task id that is not a plain name"
+  out=$(run_lb "$home" "$store" "$fakebin" link "$id" --task letter-work-1) || fail "link must succeed: $out"
+  assert_contains "$out" "linked $id -> task letter-work-1" "link must report the record"
+  [ "$(jq -r '.task' "$home/state/letterbox/claims/$id.json")" = letter-work-1 ] \
+    || fail "the task must be recorded on the claim"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "OWED: $id work-proposal -> task letter-work-1" "status must show the owning task"
+  printf 'body\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" >/dev/null || fail "send must succeed"
+  out=$(run_lb "$home" "$store" "$fakebin" link "$(sole_sent_id "$home")" --task other 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a letter this estate sent is not owned by a task"
+  pass "link records the owning task on a received letter's claim without touching private state by hand"
+}
+
+test_a_refused_card_with_no_usable_id_is_unanswerable_not_owed() {
+  local home store fakebin out n card
+  read -r home store fakebin <<< "$(fixture unanswerable | tr '\n' ' ')"
+  n=$(cat "$store/next"); printf '%s\n' "$((n + 1))" > "$store/next"
+  # shellcheck disable=SC2016 # Backticks are the literal card fence, not a substitution.
+  card=$(printf '```letterbox/v1\nkind: request\nv: 1\nid: not an id\nfrom: archie\nto: firstmate.shipyard\nclass: ping\nissued: %s\nsubject: s\nbody: |\n```\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  jq --argjson n "$n" --arg b "$card" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + [{number: $n, title: "x", body: $b, state: "open", user: {login: "archie"}, updated_at: $at}]' \
+    "$store/issues.json" > "$store/i.new" && mv "$store/i.new" "$store/issues.json"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "refused issue-$n bad-id" "the malformed card must be announced under its issue key"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "UNANSWERABLE: issue-$n bad-id" "status must list the synthetic key as unanswerable"
+  assert_not_contains "$out" "OWED: issue-$n" "a card nothing can reply to must never be counted as owed"
+  assert_contains "$out" "0 letter(s) awaiting a reply from this estate" "the owed count must exclude it"
+  assert_contains "$out" "1 unanswerable" "the summary must count it separately"
+  pass "a parse-refused card with no usable id is reported as unanswerable rather than as an obligation"
+}
+
 test_an_ack_on_any_other_class_leaves_the_exchange_open() {
   local home store fakebin out id number
   read -r home store fakebin <<< "$(fixture ack-open | tr '\n' ' ')"
@@ -1056,13 +1135,17 @@ test_a_retried_outbox_card_is_rescanned_before_transport() {
   before=$(jq -r 'length' "$store/issues.json")
   printf 'second letter\n' > "$home/body2.txt"
   out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "a retry of tampered outbox bytes must be refused"
+  expect_code 0 "$rc" "a poisoned outbox record must not block an unrelated send"
+  assert_contains "$out" "UNSENDABLE: $id" "the refused retry must be reported by id"
   assert_contains "$out" "credential-shaped content" "the refusal must name the class"
   assert_not_contains "$out" "$secret" "the refusal must never carry the value"
   after=$(jq -r 'length' "$store/issues.json")
-  [ "$before" = "$after" ] || fail "nothing may reach the forge on a refused retry"
+  [ "$((before + 1))" = "$after" ] || fail "only the new letter may reach the forge, never the refused retry"
   grep -rF "$secret" "$store" >/dev/null 2>&1 && fail "no forge state may contain the refused value"
-  pass "a retried outbox card is re-scanned on its exact recovered bytes before the transport call"
+  assert_present "$home/state/letterbox/outbox/$id.json" "the unsendable record must be kept, not discarded"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "UNSENDABLE: $id (credential-shaped content" "status must keep the record and its reason visible"
+  pass "a retried outbox card is re-scanned on its exact recovered bytes, refused, reported and stepped past"
 }
 
 test_a_retried_outbox_card_is_host_path_checked_before_transport() {
@@ -1080,11 +1163,12 @@ test_a_retried_outbox_card_is_host_path_checked_before_transport() {
   before=$(jq -r 'length' "$store/issues.json")
   printf 'second letter\n' > "$home/body2.txt"
   out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "a retry naming a host path must be refused"
-  assert_contains "$out" "absolute host path" "the refusal must name the host path"
+  expect_code 0 "$rc" "a retry naming a host path must not block an unrelated send"
+  assert_contains "$out" "UNSENDABLE: $id (absolute host path" "the refusal must name the host path"
   after=$(jq -r 'length' "$store/issues.json")
-  [ "$before" = "$after" ] || fail "nothing may reach the forge on a refused retry"
-  pass "a retried outbox card is host-path checked on its exact recovered bytes before the transport call"
+  [ "$((before + 1))" = "$after" ] || fail "only the new letter may reach the forge, never the refused retry"
+  grep -F 'file:///home/captain/secret' "$store/issues.json" >/dev/null && fail "the host path must never reach the forge"
+  pass "a retried outbox card is host-path checked on its exact recovered bytes, refused and stepped past"
 }
 
 test_a_retried_outbox_card_must_pass_the_complete_sender_grammar() {
@@ -1122,18 +1206,20 @@ test_a_retried_outbox_card_must_pass_the_complete_sender_grammar() {
     before=$(jq -r 'length' "$store/issues.json")
     printf 'second letter\n' > "$home/body2.txt"
     out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/body2.txt" 2>&1); rc=$?
-    [ "$rc" -ne 0 ] || fail "a recovered $mode card must be refused"
-    assert_contains "$out" "recovered" "the recovered-card refusal must be explicit for $mode"
+    expect_code 0 "$rc" "a recovered $mode card must not block an unrelated send"
+    assert_contains "$out" "UNSENDABLE: $id" "the recovered-card refusal must be explicit for $mode"
     after=$(jq -r 'length' "$store/issues.json")
-    [ "$before" = "$after" ] || fail "a recovered $mode card must not reach the forge"
+    [ "$((before + 1))" = "$after" ] || fail "a recovered $mode card must not reach the forge"
+    grep -F "[letterbox] fact-lookup $id" "$store/issues.json" >/dev/null && fail "the refused $mode retry must not be created"
   done
-  pass "every recovered outbox card passes the full sender grammar and addressing checks"
+  pass "every recovered outbox card passes the full sender grammar and addressing checks, or is skipped and reported"
 }
 
 test_send_refuses_every_absolute_host_path_form() {
   local home store fakebin out rc form
   read -r home store fakebin <<< "$(fixture blocker3 | tr '\n' ' ')"
-  for form in "/etc" "file:///home/captain/secret" "path:/Users/captain/secret" "/home/captain/secret"; do
+  # shellcheck disable=SC2088 # The literal, unexpanded tilde form is the input under test.
+  for form in "/etc" "file:///home/captain/secret" "path:/Users/captain/secret" "/home/captain/secret" "~/.ssh/id_rsa"; do
     printf 'the value lives at %s on that host\n' "$form" > "$home/body.txt"
     : > "$store/calls.log"
     out=$(run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/body.txt" 2>&1); rc=$?
@@ -1141,11 +1227,12 @@ test_send_refuses_every_absolute_host_path_form() {
     assert_contains "$out" "absolute host path" "the refusal must name the host path for $form"
     [ "$(grep -c 'issue create' "$store/calls.log")" = 0 ] || fail "nothing may reach the forge for $form"
   done
-  # The positive control: a network URL and a relative path are not host paths.
-  printf 'See https://example.test/releases/v2 and the docs/letterbox page.\n' > "$home/ok.txt"
+  # The positive control: a network URL, a relative path and ordinary prose
+  # with a spaced slash are not host paths.
+  printf 'See https://example.test/releases/v2 and the docs/letterbox page, read / write, 50 / 2.\n' > "$home/ok.txt"
   run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject q --file "$home/ok.txt" >/dev/null \
-    || fail "a URL and a relative path must remain sendable"
-  pass "root-level, file-URI and label-prefixed absolute paths are all refused; URLs still pass"
+    || fail "a URL, a relative path and a spaced slash must remain sendable"
+  pass "root-level, file-URI, label-prefixed and home-relative paths are all refused; URLs and prose still pass"
 }
 
 test_a_card_with_an_unknown_kind_is_refused_not_ignored() {
@@ -2069,6 +2156,9 @@ test_close_refuses_without_a_terminal_reply_and_refuses_a_received_letter
 test_a_notice_ack_is_the_terminal_reply_that_closes_the_exchange
 test_protocol_unable_is_legal_for_a_notice_and_a_parse_refusal
 test_consuming_an_unable_notice_closes_and_records_the_resend_obligation
+test_a_corrected_notice_discharges_the_resend_obligation_through_send
+test_link_records_the_owning_task_through_a_supported_verb
+test_a_refused_card_with_no_usable_id_is_unanswerable_not_owed
 test_an_ack_on_any_other_class_leaves_the_exchange_open
 test_a_letter_announced_but_not_yet_claimed_is_announced_again
 test_a_claimed_letter_is_not_reannounced_when_its_stash_is_removed
