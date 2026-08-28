@@ -850,6 +850,12 @@ test_teardown_passes_recorded_tab_id_to_zellij_kill() {
     "decision_keys="
   printf '[]\n' > "$dir/responses/1.out"
   printf '[{"tab_id":3,"name":"fm-zghost"}]\n' > "$dir/responses/2.out"
+  # Response 3 is consumed by close-tab-by-id; response 4 answers the post-close
+  # endpoint-presence read (bin/fm-backend.sh's
+  # fm_backend_endpoint_confirmed_gone). A readable pane list with the recorded
+  # pane no longer in it is the positive evidence cleanup needs before it may
+  # erase the durable record.
+  printf '[]\n' > "$dir/responses/4.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -896,6 +902,15 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
   zellij_pane_response "$dir" 1 7 4
   zellij_tab_response "$dir" 2 4 "$child_title"
   printf '[]\n' > "$dir/responses/3.out"
+  # 4 is the child endpoint's post-close presence read; 5-6 model the
+  # secondmate's OWN endpoint already being gone (empty pane and tab lists); 7
+  # is its own post-close presence read. Every one of those empty pane lists is
+  # the positive evidence bin/fm-backend.sh's fm_backend_endpoint_confirmed_gone
+  # requires before cleanup may erase a durable record.
+  printf '[]\n' > "$dir/responses/4.out"
+  printf '[]\n' > "$dir/responses/5.out"
+  printf '[]\n' > "$dir/responses/6.out"
+  printf '[]\n' > "$dir/responses/7.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_ROOT_OVERRIDE="$ROOT" \

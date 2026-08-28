@@ -39,13 +39,16 @@
 #   fm-interrupt     the legacy Claude fm-send --key Escape idle event
 #   fm-recovery      a documented recovery reset after relaunch
 # Classifier-only sources (never written into a record):
-#   endpoint-gone, herdr-native, grok-regex, muse-session-log,
-#   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
-#   kimi-unverified, codex-unverified, capture-failed, no-target
+#   endpoint-gone, endpoint-unreadable, herdr-native, grok-regex,
+#   muse-session-log, cursor-transcript, missing, malformed, gen-mismatch,
+#   source-mismatch, kimi-unverified, codex-unverified, capture-failed,
+#   no-target
 #
 # Classification (fm_busy_classify): busy | idle | unknown | dead, always
 # with the producing source as the second token. Precedence:
-#   1. dead endpoint (fm_busy_classify_live only) -> dead endpoint-gone
+#   1. a POSITIVELY absent endpoint (fm_busy_classify_live only)
+#      -> dead endpoint-gone; an endpoint that could not be observed is
+#      unknown endpoint-unreadable, never dead
 #   2. standalone Kimi before verification       -> unknown kimi-unverified
 #   3. a valid, gen-matching, source-trusted record -> its state and source
 #   4. no record at all: herdr's native busy verdict is trusted as busy
@@ -943,17 +946,29 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
 
 # fm_busy_classify_live: fm_busy_classify behind the one process-level
 # override - a gone endpoint is dead, never busy. Requires fm-backend.sh to
-# be sourced for fm_backend_target_exists.
+# be sourced for fm_backend_target_presence.
+#
+# The override needs POSITIVE evidence: `dead` is what the watcher acts on, so
+# only an endpoint the backend positively reports absent earns it. An endpoint
+# that could not be observed at all - the backend CLI erroring, its server
+# unreachable - is unknown, and the caller falls back to the record and pull
+# sources exactly as it would for any other unclassifiable crew.
 fm_busy_classify_live() {  # <backend> <target> <harness> <id> <state-dir> [expected-label]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 label=${6-}
   if [ -z "$target" ]; then
     printf 'unknown no-target'
     return 0
   fi
-  if ! fm_backend_target_exists "$backend" "$target" "$label" 2>/dev/null; then
-    printf 'dead endpoint-gone'
-    return 0
-  fi
+  case "$(fm_backend_target_presence "$backend" "$target" "$label" 2>/dev/null)" in
+    absent)
+      printf 'dead endpoint-gone'
+      return 0
+      ;;
+    unknown)
+      printf 'unknown endpoint-unreadable'
+      return 0
+      ;;
+  esac
   fm_busy_classify "$backend" "$target" "$harness" "$id" "$state"
 }
 

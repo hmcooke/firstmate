@@ -42,6 +42,13 @@ case "${1:-}" in
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
   list-windows) exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence): one selector alias per line, for one
+    # single-field format per call. This fake models the explicit target these
+    # cases steer as a live pane, matching display-message above.
+    printf '%s\n' '%1' 'sess' 'sess:win'
+    exit 0 ;;
 esac
 exit 0
 SH

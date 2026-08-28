@@ -800,11 +800,15 @@ for meta in "$STATE"/*.meta; do
   target=$(fm_backend_target_of_meta "$meta")
   if [ -n "$window" ]; then
     backend=$(fm_backend_of_meta "$meta")
-    if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
-      printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
-    else
-      printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
-    fi
+    # Tri-state, not a boolean: only a positively observed absence reports
+    # dead, because that line is what sends firstmate into recovery for this
+    # task. An endpoint the backend could not be asked about reports unknown
+    # (bin/fm-backend.sh's fm_backend_target_presence).
+    case "$(fm_backend_target_presence "$backend" "${target:-$window}" "fm-$id")" in
+      present) printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window" ;;
+      absent) printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window" ;;
+      *) printf 'endpoint: unknown (backend=%s window=%s; could not be observed)\n' "$backend" "$window" ;;
+    esac
   else
     printf 'endpoint: unknown (no window recorded)\n'
   fi

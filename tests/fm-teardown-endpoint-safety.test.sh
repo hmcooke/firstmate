@@ -286,6 +286,77 @@ isolated_tmux_window_exists() {  # <dir> <socket> <session> <window>
     | grep -Fqx "$4"
 }
 
+# make_presence_case <name> <mode>: a cleanup fixture whose fake tmux logs every
+# call and drives one outcome for the `list-panes` inventory the endpoint
+# presence read depends on. `unreadable` is a transient failure that proves
+# nothing (the exact shape a permission problem, an over-long socket path, or a
+# protocol mismatch produces); `gone` is a readable inventory that positively
+# omits the recorded window.
+make_presence_case() {  # <name> <mode> -> echoes case dir
+  local dir mode=$2
+  dir=$(make_case "$1")
+  cat > "$dir/fakebin/tmux" <<SH
+#!/usr/bin/env bash
+printf 'tmux' >> "\${FM_RUNTIME_LOG:?}"
+printf ' <%s>' "\$@" >> "\${FM_RUNTIME_LOG:?}"
+printf '\n' >> "\${FM_RUNTIME_LOG:?}"
+if [ "\${1:-}" = list-panes ]; then
+  case '$mode' in
+    unreadable) printf '%s\n' 'permission denied' >&2; exit 1 ;;
+    gone) printf '%s\n' 'other:main' 'other:main.0'; exit 0 ;;
+  esac
+fi
+exit 0
+SH
+  chmod +x "$dir/fakebin/tmux"
+  printf '%s\n' "$dir"
+}
+
+write_presence_meta() {  # <case-dir> <id>
+  fm_write_meta "$1/home/state/$2.meta" \
+    "window=sess:fm-$2" "endpoint_task_id=$2" \
+    "worktree=$1/nonexistent-worktree" "project=$1/nonexistent-project" \
+    "kind=scout" "mode=no-mistakes"
+}
+
+# The consumer half of the tri-state endpoint-presence contract
+# (tests/fm-backend-presence.test.sh owns the classifier half): cleanup may erase
+# a task's durable endpoint record only on POSITIVE evidence the endpoint is
+# gone. An endpoint the backend could not be asked about is not that evidence,
+# and treating it as such is what could retire a record while its worker is
+# still running.
+test_unobservable_endpoint_refuses_record_removal() {
+  local dir id=presence-unknown rc
+
+  dir=$(make_presence_case presence-unknown unreadable)
+  write_presence_meta "$dir" "$id"
+  set +e
+  run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "cleanup completed against an endpoint it could not observe"
+  assert_present "$dir/home/state/$id.meta" "an unobservable endpoint had its durable record erased"
+  grep -q 'not confirmed gone' "$dir/stderr" \
+    || fail "cleanup did not say why it refused: $(cat "$dir/stderr")"
+
+  pass "fm-teardown: an endpoint that cannot be observed refuses record removal instead of assuming it is gone"
+}
+
+# The same gate must not be vacuous: a readable inventory that positively omits
+# the recorded window IS the evidence, and cleanup completes on it.
+test_confirmed_gone_endpoint_completes_cleanup() {
+  local dir id=presence-absent
+
+  dir=$(make_presence_case presence-absent gone)
+  write_presence_meta "$dir" "$id"
+  run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "cleanup refused a positively absent endpoint: $(cat "$dir/stderr")"
+  [ ! -e "$dir/home/state/$id.meta" ] \
+    || fail "cleanup left the durable record behind for a confirmed-gone endpoint"
+
+  pass "fm-teardown: a positively absent endpoint completes cleanup, so the refusal gate is not vacuous"
+}
+
 test_isolated_tmux_invalid_and_valid_cleanup() {
   local dir socket socket_id session='endpoint safety' target_id=target control=control target=fm-target
   local prefix_target=fm-prefix prefix_survivor=fm-prefix2 rc
@@ -371,4 +442,6 @@ test_metadata_lock_serializes_destructive_cleanup
 test_supported_backend_endpoint_records_validate
 test_tmux_empty_target_refuses_without_invocation
 test_recorded_process_identity_cleanup_is_exact
+test_unobservable_endpoint_refuses_record_removal
+test_confirmed_gone_endpoint_completes_cleanup
 test_isolated_tmux_invalid_and_valid_cleanup

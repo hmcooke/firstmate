@@ -36,6 +36,17 @@ case "${1:-}" in
     fi
     exit 0
     ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence): one selector alias per line, for one
+    # single-field format per call. FM_FAKE_TMUX_PANES declares which endpoints
+    # this fixture models as live (newline-separated); unset means none, which
+    # is a readable inventory that omits every target rather than a failed read.
+    if [ -n "${FM_FAKE_TMUX_PANES:-}" ]; then
+      printf '%s\n' "$FM_FAKE_TMUX_PANES"
+    fi
+    exit 0
+    ;;
   display-message)
     case "$*" in
       *'#{cursor_y}'*) printf '0\n' ;;

@@ -819,55 +819,73 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
   esac
 }
 
-# fm_backend_target_exists: cheap, READ-ONLY existence check - does the
-# recorded TARGET endpoint still exist on BACKEND? Never starts a server or
-# session: for herdr this deliberately queries the pane directly instead of
+# --- endpoint presence (the tri-state absence contract) ---------------------
+#
+# fm_backend_target_presence: the single READ-ONLY endpoint-presence contract.
+# It answers one question - is the recorded TARGET endpoint still there on
+# BACKEND? - and prints exactly one of:
+#   present - the observation succeeded and shows the exact recorded endpoint.
+#   absent  - the observation succeeded, was complete in scope, and positively
+#             shows the recorded endpoint gone (or positively identifies that
+#             endpoint id as now belonging to something else).
+#   unknown - the observation could not be completed or could not be trusted:
+#             a CLI error, an unreachable server, an unparseable response, a
+#             missing tool, a malformed target, or an inventory whose scope
+#             cannot cover the endpoint.
+#
+# The rule the whole fleet depends on: absence of evidence is NOT evidence of
+# absence. `absent` is a positive finding and is the only verdict that may
+# license a destructive or reclaiming action; `unknown` must be treated as
+# "still there for all we know" by every consumer. Each adapter conforms to
+# this one vocabulary (bin/backends/<name>.sh's fm_backend_<name>_target_presence)
+# rather than holding a private variant, and a backend with no classifier at
+# all reports unknown, never absent.
+#
+# Never starts a server: for herdr this queries the pane directly instead of
 # going through fm_backend_herdr_target_ready (which auto-starts the herdr
 # server as a side effect via fm_backend_herdr_server_ensure - fine for an
-# operation that is about to use the pane, wrong for a passive liveness
-# probe). A gone tmux window or an unqueryable herdr pane (server down, pane
-# closed), missing zellij pane, or unreadable Orca terminal simply fails, which
-# IS "does not exist" for this purpose.
+# operation that is about to use the pane, wrong for a passive liveness probe).
+fm_backend_target_presence() {  # <backend> <target> [expected-label] -> present|absent|unknown
+  local backend=$1 target=$2 expected_label=${3:-}
+  fm_backend_source "$backend" 2>/dev/null || { printf 'unknown'; return 0; }
+  # An adapter that does not implement the classifier - an older bin/backends/
+  # file paired with a newer dispatcher - answers unknown rather than erroring,
+  # so a partially updated tree refuses instead of guessing.
+  declare -F "fm_backend_${backend}_target_presence" >/dev/null 2>&1 \
+    || { printf 'unknown'; return 0; }
+  case "$backend" in
+    tmux) fm_backend_tmux_target_presence "$target" ;;
+    herdr) fm_backend_herdr_target_presence "$target" ;;
+    zellij) fm_backend_zellij_target_presence "$target" "$expected_label" ;;
+    orca) fm_backend_orca_target_presence "$target" ;;
+    cmux) fm_backend_cmux_target_presence "$target" "$expected_label" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# fm_backend_target_exists: the boolean compatibility view of
+# fm_backend_target_presence, for callers that only need "can I use this
+# endpoint right now" and already fail safe on a no: fm-send.sh and
+# fm-control.sh refuse, the away-mode daemon backs off. Only `present` is a
+# yes - an endpoint that cannot be observed is not usable either - so a caller
+# that must distinguish "gone" from "could not tell" asks for the presence
+# verdict instead.
 # Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
-# primitive so callers that only need a fast alive/dead read (recovery
+# primitive so callers that only need a fast usable/not read (recovery
 # digests, the session-start fleet digest) do not re-derive it inline.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} session pane
-  case "$backend" in
-    tmux)
-      tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
-      ;;
-    herdr)
-      fm_backend_source herdr || return 1
-      session=${target%%:*}
-      pane=${target#*:}
-      [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
-      # fm_backend_herdr_cli (not a raw HERDR_SESSION-only call): verified
-      # empirically (docs/herdr-backend.md "Session targeting") that the bare
-      # env var alone is NOT reliably honored once another herdr server is
-      # already bound on the machine - it silently queries whatever server IS
-      # running instead. fm_backend_herdr_cli appends the required --session
-      # flag on top, so this check is correctly scoped even when the caller's
-      # own ambient session (e.g. the primary firstmate's default session) is
-      # a DIFFERENT one than the target's.
-      fm_backend_herdr_cli "$session" pane get "$pane" >/dev/null 2>&1
-      ;;
-    zellij)
-      fm_backend_source zellij || return 1
-      fm_backend_zellij_target_ready "$target" "$expected_label"
-      ;;
-    orca)
-      fm_backend_source orca || return 1
-      fm_backend_orca_capture "$target" 1 >/dev/null 2>&1
-      ;;
-    cmux)
-      fm_backend_source cmux || return 1
-      fm_backend_cmux_target_ready "$target" "$expected_label"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  [ "$(fm_backend_target_presence "$@")" = present ]
+}
+
+# fm_backend_endpoint_confirmed_gone: the gate a destructive or reclaiming
+# action must pass before it may treat an endpoint as finished with - erasing
+# its durable record, replacing its pane, or handing its worktree back. True
+# only for a positive `absent`; `present` and `unknown` both refuse, so a
+# refused, skipped, or failed close never erases a live task's endpoint
+# identity, and a backend or CLI that cannot be reached never looks like a
+# completed cleanup.
+fm_backend_endpoint_confirmed_gone() {  # <backend> <target> [expected-label]
+  [ "$(fm_backend_target_presence "$@")" = absent ]
 }
 
 # fm_backend_agent_state: the single recovery-grade agent/endpoint state

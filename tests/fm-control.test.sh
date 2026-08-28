@@ -130,6 +130,12 @@ case "${1:-}" in
   list-windows)
     if [ -f "$D/windows" ]; then cat "$D/windows"; fi
     exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence), one selector alias per line. It tracks
+    # $D/windows so emptying that file still models a vanished endpoint.
+    if [ -f "$D/panes" ]; then cat "$D/panes"; fi
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -184,6 +190,7 @@ add_task() {
     [ "$backend" = tmux ] || echo "backend=$backend"
   } > "$home/state/$id.meta"
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
+  printf '%s\n' "$window" > "$dir/fake/panes"
   printf '%s' "$wt" > "$dir/fake/cwd"
 }
 
@@ -633,6 +640,7 @@ test_missing_endpoint_refuses() {
   dir=$(new_case gone)
   add_task "$dir" t1 claude
   : > "$dir/fake/windows"
+  : > "$dir/fake/panes"
   out=$(run_control "$dir" t1 exit); rc=$?
   expect_code 1 "$rc" "a missing endpoint should refuse"
   assert_contains "$out" "recorded endpoint is gone" "the refusal should name the missing endpoint"

@@ -316,6 +316,10 @@ case "\${1:-}" in
     [ "\$target" = "$live" ] && { printf '%%1\n'; exit 0; }
     exit 1
     ;;
+  list-panes)
+    printf '%s\n' '%1' "$live"
+    exit 0
+    ;;
 esac
 exit 1
 SH
@@ -389,6 +393,22 @@ case "${1:-}" in
       printf '%s\n' "$mate_window"
     else
       printf '%s\n' main
+    fi
+    exit 0
+    ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence), one selector alias per line. It tracks
+    # list-windows above, and mode=unreadable fails it the way a transient tmux
+    # problem does - non-zero with no definitive "no server" answer.
+    if [ "$mode" = unreadable ] && [ ! -e "$spawned" ] && [ ! -e "$killed" ]; then
+      printf '%s\n' 'permission denied' >&2
+      exit 1
+    fi
+    if [ -e "$spawned" ] || { [ ! -e "$killed" ] && { [ "$mode" = ambiguous ] || [ "$mode" = shell ]; }; }; then
+      printf '%s\n' '%1' 'firstmate' "firstmate:$mate_window" "firstmate:$mate_window.0"
+    else
+      printf '%s\n' '%0' 'firstmate' 'firstmate:main' 'firstmate:main.0'
     fi
     exit 0
     ;;
@@ -490,17 +510,24 @@ SH
   chmod +x "$fakebin/herdr"
 }
 
-# make_fake_herdr <fakebin> <live-pane>: `herdr pane get <pane>` succeeds only
-# for the given pane id - the exact primitive fm_backend_target_exists uses
-# for a herdr endpoint liveness read. No version/server-start calls: a
-# liveness check must never auto-start a server (fm-backend.sh's contract).
+# make_fake_herdr <fakebin> <live-pane>: `herdr pane get <pane>` answers with
+# the structured response real herdr gives - the echoed pane for the live pane,
+# and a pane_not_found error for anything else - which is the exact primitive
+# the herdr endpoint presence read classifies. Absence needs that positive
+# not-found: a bare non-zero exit would only mean the read failed. No
+# version/server-start calls: a liveness check must never auto-start a server
+# (fm-backend.sh's contract).
 make_fake_herdr() {
   local fakebin=$1 live=$2
   cat > "$fakebin/herdr" <<SH
 #!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = pane ] && [ "\${2:-}" = get ]; then
-  [ "\${3:-}" = "$live" ] && exit 0
+  if [ "\${3:-}" = "$live" ]; then
+    printf '%s\n' '{"result":{"pane":{"pane_id":"$live"}}}'
+    exit 0
+  fi
+  printf '%s\n' '{"ok":false,"error":{"code":"pane_not_found"}}'
   exit 1
 fi
 exit 1
@@ -1295,8 +1322,8 @@ EOF
     "SECONDMATE_LIVENESS: secondmate $SESSION_START_SECOND_MATE_ID: skipped: endpoint probe unreadable (backend=tmux)" \
     "session start did not distinguish transient unreadability from absence"
   [ ! -s "$log" ] || fail "session start touched a transiently unreadable target: $(cat "$log")"
-  assert_contains "$out" "endpoint: dead (backend=tmux window=firstmate:fm-$SESSION_START_SECOND_MATE_ID)" \
-    "the later cheap presence read should preserve the visible offline symptom"
+  assert_contains "$out" "endpoint: unknown (backend=tmux window=firstmate:fm-$SESSION_START_SECOND_MATE_ID; could not be observed)" \
+    "the digest reported an endpoint it could not observe as dead instead of unknown"
   pass "session start: transient tmux unreadability never licenses a relaunch"
 }
 

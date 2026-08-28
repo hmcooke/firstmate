@@ -1909,6 +1909,26 @@ fm_backend_herdr_pane_agent_state() {  # <session> <pane_id>
   esac
 }
 
+# fm_backend_herdr_target_presence: the tri-state endpoint-presence verdict
+# for one recorded "session:pane" target. See bin/fm-backend.sh's
+# fm_backend_target_presence for the shared vocabulary.
+#
+# It is a thin mapping over fm_backend_herdr_pane_presence_state, which already
+# reads only the structured `pane get` response: a structured pane_not_found is
+# the one answer that proves the pane gone, an echoed pane id that round-trips
+# proves it there, and every other response - an unreachable server, an
+# unparseable body, a shape change that stops echoing the id - is a read we
+# could not complete. A malformed target is ambiguity about which endpoint was
+# even asked about, so it stays unknown too, never absence.
+fm_backend_herdr_target_presence() {  # <target> -> present|absent|unknown
+  fm_backend_herdr_parse_target "$1" || { printf 'unknown'; return 0; }
+  case "$(fm_backend_herdr_pane_presence_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
+    present) printf 'present' ;;
+    dead) printf 'absent' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # fm_backend_herdr_tab_is_husk: true (0) only for the two conservative husk
 # states (dead, no-agent) fm_backend_herdr_pane_agent_state can positively
 # confirm; live and unknown both refuse (1), so an inconclusive read never
@@ -2884,18 +2904,13 @@ fm_backend_herdr_kill() {  # <target>
   fi
 }
 
-# fm_backend_herdr_endpoint_confirmed_gone: gate durable-record removal on
-# the exact recorded pane's structured presence
-# (fm_backend_herdr_pane_presence_state), read-only, so a refused, skipped,
-# or failed close never erases a live task's endpoint identity.
-# Only a structured pane_not_found proves the endpoint gone; present and
-# unknown presence refuse after every close path, and a missing or malformed
-# target identity is ambiguity that also refuses, never proof of a gone pane.
+# fm_backend_herdr_endpoint_confirmed_gone: the Herdr arm of the shared
+# confirmed-gone gate (bin/fm-backend.sh's fm_backend_endpoint_confirmed_gone),
+# kept as a named entry point because cleanup also calls it for a child task
+# whose backend it has already resolved. Read-only, so a refused, skipped, or
+# failed close never erases a live task's endpoint identity.
 fm_backend_herdr_endpoint_confirmed_gone() {  # <target>
-  local presence
-  fm_backend_herdr_parse_target "$1" || return 1
-  presence=$(fm_backend_herdr_pane_presence_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")
-  [ "$presence" = dead ]
+  [ "$(fm_backend_herdr_target_presence "$1")" = absent ]
 }
 
 # fm_backend_herdr_classify_agent_status: map a raw `agent get` agent_status

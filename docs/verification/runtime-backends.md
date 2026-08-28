@@ -30,6 +30,51 @@ zsh
 A persistent parent shell waiting for a child remained reported as the parent process, while a shell that directly execed a simple command changed identity with the process itself.
 Pi and pi-signed 0.82.0 were reverified on 2026-07-27 through real isolated `fm-spawn.sh` launches.
 
+### Endpoint presence primitive
+
+Two tmux behaviours behind the inventory-backed endpoint-presence classifier were verified on 2026-08-27 with tmux 3.4 on Linux 6.8.0, on a private socket.
+
+`display-message -t <target>` cannot supply presence in either direction, because tmux resolves a missing target to the active window instead of failing.
+
+```sh
+tmux -L fmrepro new-session -d -s repro -n main
+tmux -L fmrepro display-message -p -t 'repro:nosuchwin' '#{pane_id}'; echo "exit=$?"
+tmux -L fmrepro display-message -p -t 'nosuch:win' '#{pane_id}'; echo "exit=$?"
+tmux -L fmrepro list-windows -t nosuch -F '#{window_name}'; echo "exit=$?"
+```
+
+Observed output:
+
+```text
+%0
+exit=0
+
+exit=0
+can't find session: nosuch
+exit=1
+```
+
+A multi-field format cannot carry a separator, because tmux vis-escapes every control character it prints once the locale is not UTF-8.
+
+```sh
+tmux -L fmrepro list-panes -a -F '#{pane_id}
+#{session_name}:#{window_name}' | od -c | head -2
+LC_ALL=C tmux -L fmrepro list-panes -a -F '#{pane_id}
+#{session_name}:#{window_name}' | od -c | head -2
+LC_ALL=C tmux -L fmrepro list-panes -a -F "#{pane_id}$(printf '\037')#{session_name}:#{window_name}" | od -c | head -2
+```
+
+Observed output:
+
+```text
+0000000   %   0  \n   r   e   p   r   o   :   m   a   i   n  \n
+0000000   %   0   _   r   e   p   r   o   :   m   a   i   n  \n
+0000000   %   0   \   0   3   7   r   e   p   r   o   :   m   a   i   n  \n
+```
+
+The embedded newline came back as `_` and the unit separator as a literal `\037`, so the classifier enumerates one single-field alias format per call instead.
+`tests/fm-backend-tmux-smoke.test.sh` refreshes both facts against the installed binary, and asserts the fallback itself so the rationale cannot go quietly vacuous.
+
 ### Agent liveness name sources
 
 The earlier record that every harness is observed under its own `#{pane_current_command}` no longer holds and has been replaced by the per-harness evidence below.

@@ -155,6 +155,15 @@ case "${1:-}" in
   list-windows)
     [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
     exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence): one selector alias per line, for one
+    # single-field format per call. It tracks FM_FAKE_TMUX_PANE_ALIVE so the
+    # same flag still models a vanished supervisor pane, and answers with the
+    # supervisor target under test plus the legacy default.
+    [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ] || { printf '%s\n' 'permission denied' >&2; exit 1; }
+    printf '%s\n' "${FM_SUPERVISOR_TARGET:-firstmate:0}" 'firstmate:0'
+    exit 0 ;;
   capture-pane)
     # Honor a single-line band capture (-S N -E M, both non-negative) for the
     # composer reader's non-bordered compatibility fallback; otherwise (e.g. its
@@ -242,6 +251,14 @@ case "${1:-}" in
     exit 0 ;;
   capture-pane) cat "$COMPOSER" 2>/dev/null; exit 0 ;;
   list-windows) exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence): one selector alias per line, for one
+    # single-field format per call. This fake models one live pane, reachable
+    # as the supervisor target, the legacy default, and the explicit
+    # `sess:win` target the fm-send cases steer.
+    printf '%s\n' "${FM_SUPERVISOR_TARGET:-firstmate:0}" 'firstmate:0' 'sess:win'
+    exit 0 ;;
   send-keys)
     shift
     text=""; is_enter=0; lit=0

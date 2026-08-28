@@ -2173,6 +2173,32 @@ preflight_firstmate_home_herdr_children() {  # <home>
   done
 }
 
+# teardown_require_endpoint_confirmed_gone: the one gate teardown passes before
+# it may erase a task's durable endpoint records. Absence must be POSITIVELY
+# observed (bin/fm-backend.sh's fm_backend_endpoint_confirmed_gone) - an
+# endpoint that is still there and an endpoint the backend could not be asked
+# about both refuse, because a backend whose CLI errored or whose server is
+# unreachable tells us nothing about whether the worker is still running in it.
+# A refusal is recoverable: every record is retained, so a later rerun can retry
+# the close once it can be completed and observed.
+#
+# Orca is exempt: it owns the worktree as well as the terminal, teardown removes
+# that worktree rather than always closing the terminal itself, and Orca exposes
+# no terminal inventory that could positively prove one gone
+# (docs/orca-backend.md "Endpoint presence"). Gating on a verdict Orca can never
+# supply would refuse every Orca teardown instead of protecting one.
+teardown_require_endpoint_confirmed_gone() {  # <backend> <target> <expected-label> <what>
+  local backend=$1 target=$2 label=$3 what=$4
+  [ "$backend" != orca ] || return 0
+  if ! declare -F fm_backend_endpoint_confirmed_gone >/dev/null 2>&1; then
+    echo "error: endpoint confirmation is unavailable for $what; retaining every durable record" >&2
+    return 1
+  fi
+  fm_backend_endpoint_confirmed_gone "$backend" "$target" "$label" && return 0
+  echo "error: $backend endpoint $target for $what is not confirmed gone after its close was refused, skipped, or failed; retaining every durable record - rerun teardown once the close can be completed and observed" >&2
+  return 1
+}
+
 cleanup_firstmate_home_children() {
   local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen
   sub_state="$home/state"
@@ -2210,10 +2236,18 @@ cleanup_firstmate_home_children() {
         fi
       elif [ "$child_backend" = zellij ]; then
         # Zellij titles are scoped by the owning home tag, so forced secondmate
-        # cleanup must verify child tabs as that child home, not the parent.
+        # cleanup must verify child tabs as that child home, not the parent -
+        # for the confirmed-gone read exactly as for the close itself.
         ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
+        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home \
+          teardown_require_endpoint_confirmed_gone "$child_backend" "$child_t" "fm-$child_id" "child $child_id" ) || return 1
       else
         fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
+        # No expected label here: a cmux child's workspace title carries the
+        # CHILD home's tag, which this parent-scoped read would derive wrongly
+        # and then read as absent. The recorded endpoint ids are correct in
+        # either home, so the confirmed-gone read uses those alone.
+        teardown_require_endpoint_confirmed_gone "$child_backend" "$child_t" "" "child $child_id" || return 1
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
@@ -2507,23 +2541,11 @@ elif [ "$BACKEND" = herdr ] \
      && { [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; }; then
   echo "warning: herdr presentation journal for $ID remains quarantined; no workspace cleanup was attempted" >&2
 fi
-# A refused, skipped, or failed Herdr close must never erase a live task's
-# durable endpoint identity: unless the exact pane is confirmed gone, retain
-# every record and stop before any removal below so a later rerun can retry
-# the locked close. Only a structured not-found proves the pane gone; unknown
-# presence, missing or malformed endpoint identity, and missing confirmation
-# machinery all refuse.
-if [ "$BACKEND" = herdr ]; then
-  fm_backend_source herdr || true
-  if ! declare -F fm_backend_herdr_endpoint_confirmed_gone >/dev/null 2>&1; then
-    echo "error: herdr endpoint confirmation is unavailable for $ID; retaining every durable task record" >&2
-    exit 1
-  fi
-  if ! fm_backend_herdr_endpoint_confirmed_gone "$T"; then
-    echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining every durable task record - rerun teardown once the close can run under the session lock" >&2
-    exit 1
-  fi
-fi
+# A refused, skipped, or failed endpoint close must never erase a live task's
+# durable endpoint identity: stop here, before any removal below, so a later
+# rerun can retry the close. teardown_require_endpoint_confirmed_gone owns the
+# rule and the Orca exemption.
+teardown_require_endpoint_confirmed_gone "$BACKEND" "$T" "fm-$ID" "$ID" || exit 1
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?

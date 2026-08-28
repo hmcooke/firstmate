@@ -105,24 +105,25 @@ BASE_REF=$(resolve_base_ref) \
 # pre-exact permissive kill-window target. Content-addressed from history so the
 # fixture stays historical on default-branch CI and on branches cut after the
 # exact-selector change, where merge-base with main is self-referential.
-resolve_permissive_tmux_kill_ref() {
-  local commit body
-  while IFS= read -r commit; do
-    [ -n "$commit" ] || continue
-    body=$(git -C "$ROOT" show "$commit:bin/backends/tmux.sh" 2>/dev/null) || continue
-    # shellcheck disable=SC2016
-    case "$body" in
-      *'tmux kill-window -t "=$session:=$window"'*) continue ;;
-    esac
-    # shellcheck disable=SC2016
-    case "$body" in
-      *'tmux kill-window -t "$1"'*|*'tmux kill-window -t "$target"'*)
-        printf '%s\n' "$commit"
-        return 0
-        ;;
-    esac
-  done < <(git -C "$ROOT" log --first-parent --format='%H' HEAD -- bin/backends/tmux.sh)
-  return 1
+# install_permissive_tmux_kill <old-bin-root>: give a fixture tree the permissive
+# kill selector the tmux adapter carried before exact selectors landed, by
+# appending a redefinition to its adapter copy (bash takes the last definition).
+#
+# This replaces an earlier fixture that materialized a whole historical
+# bin/backends/tmux.sh by walking git history for one whose source text still
+# contained the permissive form. That pinned implementation bytes, and it also
+# produced a tree whose adapter predated whatever the current dispatcher asks of
+# an adapter - a mismatch that grows with every adapter contract added. What the
+# case actually needs is the permissive FORM, so it states that directly and
+# leaves the rest of the tree internally consistent.
+install_permissive_tmux_kill() {  # <old-bin-root>
+  cat >> "$1/bin/backends/tmux.sh" <<'SH'
+
+fm_backend_tmux_kill() {  # <target>
+  [ -n "${1:-}" ] || return 1
+  tmux kill-window -t "$1" 2>/dev/null || true
+}
+SH
 }
 
 # --- shared: a pre-refactor bin/ shim --------------------------------------
@@ -650,6 +651,12 @@ case "${1:-}" in
     fi
     exit 0 ;;
   list-windows) exit 0 ;;
+  list-panes)
+    # The endpoint-presence inventory (bin/backends/tmux.sh's
+    # fm_backend_tmux_target_presence). It emits one selector alias per line,
+    # so the fake answers with the aliases of the one live pane it models.
+    printf '%s\n' '%1' '@1' '$1' 'sess' 'sess:win' 'sess:1' 'sess:win.0' 'sess:1.0'
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -668,8 +675,8 @@ run_send_case() {  # <bin-root> <fakebin> <log> <home> -- <send args...>
 
 strip_send_preflight() {  # <log>
   local preflight
-  preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
-  awk -v preflight="$preflight" '$0 != preflight { print }' "$1"
+  preflight=$'tmux\x1flist-panes\x1f-a\x1f-F'
+  awk -v preflight="$preflight" 'index($0, preflight) != 1 { print }' "$1"
 }
 
 # The byte-identical old-vs-new tmux log comparison this test used to run
@@ -689,8 +696,8 @@ test_send_tmux_contract() {
   run_send_case "$ROOT" "$fb" "$log" "$home" -- "sess:win" --key Escape
   rc=$?
   expect_code 0 "$rc" "fm-send --key should succeed against a live fake pane"
-  assert_contains "$(cat "$log")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' \
-    "fm-send --key did not verify the explicit tmux target before sending"
+  assert_contains "$(cat "$log")" $'tmux'$'\x1f''list-panes'$'\x1f''-a'$'\x1f''-F' \
+    "fm-send --key did not verify the explicit tmux target against the pane inventory before sending"
   assert_contains "$(cat "$log")" $'\x1f''Escape' "fm-send --key did not send the named key"
   assert_not_contains "$(cat "$log")" $'\x1f''-l'$'\x1f' "fm-send --key must not type literal text"
 
@@ -939,20 +946,17 @@ run_teardown_case() {
 }
 
 test_teardown_conformance_old_vs_new() {
-  local old_bin fb proj wt id old_tmux_ref saved_base_ref
+  local old_bin fb proj wt id saved_base_ref
   local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new
   # Force the post-squash topology inside this case: merge-base with main may
   # equal HEAD on default-branch CI, and that must not make the legacy kill
-  # fixture self-referential. build_old_bin still uses BASE_REF for entrypoints;
-  # only the tmux kill adapter is pinned to the content-historical permissive ref.
+  # fixture self-referential. The legacy arm is therefore the current entrypoint
+  # tree with only its kill selector made permissive again.
   saved_base_ref=$BASE_REF
   BASE_REF=$(git -C "$ROOT" rev-parse HEAD)
-  old_tmux_ref=$(resolve_permissive_tmux_kill_ref) \
-    || { BASE_REF=$saved_base_ref; fail "unable to locate a historical bin/backends/tmux.sh with permissive kill-window selectors"; }
   old_bin=$(build_old_bin teardown-old)
-  git -C "$ROOT" show "$old_tmux_ref:bin/backends/tmux.sh" > "$old_bin/bin/backends/tmux.sh" \
-    || { BASE_REF=$saved_base_ref; fail "could not materialize historical tmux adapter from $old_tmux_ref"; }
   BASE_REF=$saved_base_ref
+  install_permissive_tmux_kill "$old_bin"
   proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/teardown-wt"
   id="teardownconform1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
@@ -984,13 +988,10 @@ test_teardown_conformance_old_vs_new() {
   expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
   assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
     "teardown did not call treehouse return --force <worktree>"
-  # The legacy fixture's adapter comes from BASE_REF, so its selector form is
-  # whatever the merge-base carried: permissive while the exact-selector change
-  # was still on a branch, exact for every branch cut after it landed on main.
-  # Pinning the old form here would make this case pass once and then fail
-  # forever, so the '=' exactness markers are normalized away and the legacy run
-  # is only required to have reached tmux window cleanup for this task. The
-  # exact-selector contract belongs to the current script, asserted below.
+  # The legacy arm's kill is deliberately permissive, so the '=' exactness
+  # markers are normalized away and it is only required to have reached tmux
+  # window cleanup for this task. The exact-selector contract belongs to the
+  # current adapter, asserted below.
   assert_contains "$(tr -d '=' < "$log_old")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
     "legacy teardown fixture did not exercise tmux window cleanup for the task"
   assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"=firstmate:=fm-$id" \

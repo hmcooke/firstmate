@@ -280,14 +280,10 @@ fm_backend_zellij_tab_for_pane() {  # <session> <pane_id>
     | jq -r --argjson p "$pane_id" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1
 }
 
-fm_backend_zellij_pane_exists() {  # <session> <pane_id>
-  local session=$1 pane_id=$2
-  fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null \
-    | jq -e --argjson p "$pane_id" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
-}
-
-# fm_backend_zellij_tab_matches_label: does <tab_id> in <session> carry the
-# tab name firstmate expects for the caller-facing task label <label>?
+# fm_backend_zellij_tab_label_state: does <tab_id> in <session> carry the tab
+# name firstmate expects for the caller-facing task label <label>? Prints
+# match, mismatch, or unreadable - the third answer matters because a tab list
+# that could not be read is not evidence the tab was renamed or reassigned.
 # Checks the home-scoped, tagged title first (fm_backend_zellij_scoped_title
 # - what every NEW tab is created with), then falls back to the legacy
 # untagged bare title (the plain <label>, e.g. "fm-<id>") for a tab created
@@ -301,16 +297,26 @@ fm_backend_zellij_pane_exists() {  # <session> <pane_id>
 # scoped check, the bare check, and the ambiguity count all read the SAME
 # already-fetched JSON), so a caller whose fake-CLI fixture supplies exactly
 # one list-tabs response keeps working unchanged.
-fm_backend_zellij_tab_matches_label() {  # <session> <tab_id> <label>
+fm_backend_zellij_tab_label_state() {  # <session> <tab_id> <label> -> match|mismatch|unreadable
   local session=$1 tab_id=$2 label=$3 scoped tabs count
   scoped=$(fm_backend_zellij_scoped_title "$label")
-  tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
+  tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) \
+    || { printf 'unreadable'; return 0; }
+  printf '%s' "$tabs" | jq -e . >/dev/null 2>&1 || { printf 'unreadable'; return 0; }
   printf '%s' "$tabs" | jq -e --argjson t "$tab_id" --arg want "$scoped" \
-    '[.[]? | select(.tab_id == $t and .name == $want)] | length > 0' >/dev/null 2>&1 && return 0
+    '[.[]? | select(.tab_id == $t and .name == $want)] | length > 0' >/dev/null 2>&1 \
+    && { printf 'match'; return 0; }
   printf '%s' "$tabs" | jq -e --argjson t "$tab_id" --arg want "$label" \
-    '[.[]? | select(.tab_id == $t and .name == $want)] | length > 0' >/dev/null 2>&1 || return 1
+    '[.[]? | select(.tab_id == $t and .name == $want)] | length > 0' >/dev/null 2>&1 \
+    || { printf 'mismatch'; return 0; }
   count=$(printf '%s' "$tabs" | jq -r --arg want "$label" '[.[]? | select(.name == $want)] | length' 2>/dev/null)
-  [ "$count" = "1" ]
+  if [ "$count" = "1" ]; then printf 'match'; else printf 'mismatch'; fi
+}
+
+# The boolean view for callers that only act on a positive match; an unreadable
+# tab list is not a match either, which is what kill and target_ready need.
+fm_backend_zellij_tab_matches_label() {  # <session> <tab_id> <label>
+  [ "$(fm_backend_zellij_tab_label_state "$@")" = match ]
 }
 
 # fm_backend_zellij_create_task: create the task's tab (one terminal pane) in
@@ -370,20 +376,116 @@ fm_backend_zellij_parse_target() {  # <target>
   [ -n "$FM_BACKEND_ZELLIJ_SESSION" ] && [ -n "$FM_BACKEND_ZELLIJ_PANE" ] && [ "$FM_BACKEND_ZELLIJ_PANE" != "$target" ]
 }
 
-# fm_backend_zellij_target_ready: parse the target and verify its session and
-# pane are alive. When the caller knows the owning firstmate task label, verify
-# the pane belongs to that named tab before trusting the numeric pane id.
+# fm_backend_zellij_target_ready: the boolean "usable right now" view of
+# fm_backend_zellij_presence_probe, which owns the whole classification.
+# Deliberately NOT a subshell call: the send/capture paths depend on the
+# probe's parsed FM_BACKEND_ZELLIJ_SESSION/FM_BACKEND_ZELLIJ_PANE in their own
+# shell. Only a proven-present endpoint is ready; an unreadable one is not
+# usable either, but it is reported as unknown rather than gone by the presence
+# view.
 fm_backend_zellij_target_ready() {  # <target> [expected-label]
-  local expected_label=${2:-} tab_id
-  fm_backend_zellij_parse_target "$1" || return 1
-  fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION" || return 1
-  if [ -n "$expected_label" ]; then
-    tab_id=$(fm_backend_zellij_tab_for_pane "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE" 2>/dev/null)
-    [ -n "$tab_id" ] || return 1
-    fm_backend_zellij_tab_matches_label "$FM_BACKEND_ZELLIJ_SESSION" "$tab_id" "$expected_label"
-    return $?
+  fm_backend_zellij_presence_probe "$@"
+  [ "$FM_BACKEND_ZELLIJ_PRESENCE" = present ]
+}
+
+# fm_backend_zellij_no_sessions_answer: 0 when <listing-text> is zellij's own
+# definitive "there are no sessions at all" answer to a failed `list-sessions`.
+# That answer is positive evidence of absence rather than a failed read: a
+# zellij pane cannot outlive its session, and no session means no pane. It is
+# the zellij counterpart of fm_backend_tmux_server_gone_error. Every other
+# non-zero result - a connection error, a read killed by a caller deadline
+# that yields no output, an unrecognisable body - is a read we could not
+# complete, and stays unknown.
+#
+# Zellij is NOT installed on the verification machine, so the exact text zellij
+# emits for this answer is matched defensively by shape rather than pinned to
+# verified output. The failure direction is deliberate: an unmatched answer
+# reads unknown, which refuses, never absent.
+fm_backend_zellij_no_sessions_answer() {  # <listing-text>
+  case "$1" in
+    *"No active zellij sessions found"*) return 0 ;;
+  esac
+  return 1
+}
+
+# fm_backend_zellij_session_exited: 0 when the NON-short `list-sessions`
+# listing marks <session> as EXITED (resurrectable). The short listing still
+# names such a session, but no pane query can succeed against it, so without
+# this read an ended session would answer unknown forever and cleanup could
+# never complete. An EXITED marker on the recorded session is positive
+# evidence the endpoint is gone; a listing that cannot be read, or one in
+# which the session appears without that marker, is not, and returns 1 so the
+# caller stays unknown.
+#
+# Zellij is NOT installed on the verification machine, so the EXITED marker
+# (rendered as "(EXITED - attach to resurrect)" in the documented output) is
+# matched defensively by shape rather than pinned to verified output. The
+# failure direction is deliberate: an unmatched listing reads unknown, which
+# refuses, never absent.
+fm_backend_zellij_session_exited() {  # <session>
+  local listing
+  listing=$(zellij list-sessions --no-formatting 2>/dev/null) || return 1
+  printf '%s\n' "$listing" | awk -v want="$1" '$1 == want && index($0, "EXITED") > 0 { found = 1 } END { exit !found }'
+}
+
+# fm_backend_zellij_presence_probe: the single zellij endpoint classifier. Sets
+# FM_BACKEND_ZELLIJ_PRESENCE to present|absent|unknown, leaving the parsed
+# FM_BACKEND_ZELLIJ_SESSION/FM_BACKEND_ZELLIJ_PANE in place for the two views
+# that sit on top of it: fm_backend_zellij_target_presence (read-only verdict)
+# and fm_backend_zellij_target_ready (the boolean the send/capture paths use,
+# which needs those parsed ids in its own shell).
+#
+# Both zellij reads it depends on - `list-sessions` and `action list-panes
+# --json` - report a failed query and an empty result the same way once their
+# output is piped, so this classifier captures each read's exit status and
+# treats only a SUCCESSFUL read as authoritative. A successful session list
+# that omits the session, or a successful pane list that omits the pane, is
+# positive evidence the recorded endpoint is gone; a failed read, an
+# unparseable body, or a malformed target is a read we could not complete and
+# stays unknown. Two explicit zellij answers are absence rather than failure:
+# a failed session list carrying the no-sessions answer
+# (fm_backend_zellij_no_sessions_answer), and a listed session whose pane read
+# fails while the non-short listing marks it EXITED
+# (fm_backend_zellij_session_exited). When the caller supplies the owning task label, a pane that is
+# live but positively belongs to a differently named tab is absence of THIS
+# endpoint (its numeric id was reused), while an unreadable tab list is not.
+fm_backend_zellij_presence_probe() {  # <target> [expected-label]
+  local expected_label=${2:-} sessions panes tab_id
+  FM_BACKEND_ZELLIJ_PRESENCE=unknown
+  fm_backend_zellij_parse_target "$1" || return 0
+  case "$FM_BACKEND_ZELLIJ_PANE" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if ! sessions=$(zellij list-sessions --short --no-formatting 2>&1); then
+    fm_backend_zellij_no_sessions_answer "$sessions" && FM_BACKEND_ZELLIJ_PRESENCE=absent
+    return 0
   fi
-  fm_backend_zellij_pane_exists "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE"
+  printf '%s\n' "$sessions" | grep -qxF "$FM_BACKEND_ZELLIJ_SESSION" \
+    || { FM_BACKEND_ZELLIJ_PRESENCE=absent; return 0; }
+  if ! panes=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null); then
+    fm_backend_zellij_session_exited "$FM_BACKEND_ZELLIJ_SESSION" && FM_BACKEND_ZELLIJ_PRESENCE=absent
+    return 0
+  fi
+  printf '%s' "$panes" | jq -e . >/dev/null 2>&1 || return 0
+  tab_id=$(printf '%s' "$panes" \
+    | jq -r --argjson p "$FM_BACKEND_ZELLIJ_PANE" '.[]? | select(.id == $p and .is_plugin == false) | .tab_id' 2>/dev/null | head -1)
+  [ -n "$tab_id" ] || { FM_BACKEND_ZELLIJ_PRESENCE=absent; return 0; }
+  if [ -n "$expected_label" ]; then
+    # The tri-state label read, not the boolean: only a positive mismatch is
+    # evidence this endpoint is gone, while a tab list that could not be read
+    # leaves the verdict unknown.
+    case "$(fm_backend_zellij_tab_label_state "$FM_BACKEND_ZELLIJ_SESSION" "$tab_id" "$expected_label")" in
+      match) FM_BACKEND_ZELLIJ_PRESENCE=present ;;
+      mismatch) FM_BACKEND_ZELLIJ_PRESENCE=absent ;;
+    esac
+    return 0
+  fi
+  FM_BACKEND_ZELLIJ_PRESENCE=present
+}
+
+fm_backend_zellij_target_presence() {  # <target> [expected-label] -> present|absent|unknown
+  fm_backend_zellij_presence_probe "$@"
+  printf '%s' "$FM_BACKEND_ZELLIJ_PRESENCE"
 }
 
 # fm_backend_zellij_current_path: the live pane's cwd, or empty on any error.

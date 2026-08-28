@@ -156,6 +156,37 @@ if fm_backend_tmux_resolve_bare_selector "no-such-window-xyz" 2>/dev/null; then
 fi
 pass "real tmux: fm_backend_tmux_resolve_bare_selector fails for a window that does not exist"
 
+# --- endpoint presence against the real binary -------------------------------
+#
+# The presence verdict is read from tmux's own output, so a fake can only
+# confirm the assumption written into the fake. These cases pin it against the
+# real binary, including the fallback that rules `display-message` out as the
+# primitive: tmux answers exit 0 with a real pane id for a window that does not
+# exist, and exit 0 with empty output for a session that does not exist.
+
+presence=$(fm_backend_target_presence tmux "$TARGET")
+[ "$presence" = present ] || fail "a live real tmux window should be present, got '$presence'"
+
+pane_id=$(tmux display-message -p -t "$TARGET" '#{pane_id}')
+presence=$(fm_backend_target_presence tmux "$pane_id")
+[ "$presence" = present ] || fail "a live real tmux pane id should be present, got '$presence'"
+
+tmux display-message -p -t "$SESSION:no-such-window-xyz" '#{pane_id}' >/dev/null 2>&1 \
+  || fail "this tmux does not fall back for a missing window; the presence primitive's rationale needs re-verifying"
+presence=$(fm_backend_target_presence tmux "$SESSION:no-such-window-xyz")
+[ "$presence" = absent ] \
+  || fail "a window that does not exist in a live session should be absent despite tmux's target fallback, got '$presence'"
+
+presence=$(fm_backend_target_presence tmux "no-such-session-xyz:win")
+[ "$presence" = absent ] || fail "a session that does not exist should be absent, got '$presence'"
+
+fm_backend_endpoint_confirmed_gone tmux "$SESSION:no-such-window-xyz" \
+  || fail "a positively absent real tmux window should be confirmed gone"
+if fm_backend_endpoint_confirmed_gone tmux "$TARGET"; then
+  fail "a live real tmux window must never be confirmed gone"
+fi
+pass "real tmux: endpoint presence is inventory-backed, so a window tmux's target fallback resolves elsewhere still reads absent"
+
 # --- kill and recovery-grade missing-window classification ------------------
 
 fm_backend_tmux_kill "$TARGET"
@@ -165,6 +196,8 @@ fi
 state=$(fm_backend_agent_state tmux "$TARGET")
 [ "$state" = missing ] \
   || fail "a real missing window in a readable session should classify as missing, got '$state'"
+presence=$(fm_backend_target_presence tmux "$TARGET")
+[ "$presence" = absent ] || fail "a killed real tmux window should read absent, got '$presence'"
 # Best-effort contract: killing an already-gone window must not error.
 fm_backend_tmux_kill "$TARGET" || fail "fm_backend_tmux_kill on an already-dead target must stay best-effort (never fail)"
 pass "real tmux: kill removes the window and the readable session inventory authoritatively classifies it missing"
