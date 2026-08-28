@@ -194,6 +194,30 @@ case "${1:-}" in
 esac
 SH
   chmod +x "$fakebin/gh-axi"
+
+  # A gated fault injector for the LOCAL claim write. It is inert unless
+  # LB_MKTEMP_ALLOW is set, and even then it only touches the claim temp
+  # template, so a test can let the forge write land and fail exactly the claim
+  # record that follows it - the one crash state the close transition must never
+  # leave half-written. Everything else execs the real mktemp.
+  cat > "$fakebin/mktemp" <<SH
+#!/usr/bin/env bash
+if [ -n "\${LB_MKTEMP_ALLOW:-}" ]; then
+  for a in "\$@"; do
+    case "\$a" in
+      *fm-letterbox-claim*)
+        n=0
+        [ -f "\$LB_MKTEMP_COUNTER" ] && n=\$(cat "\$LB_MKTEMP_COUNTER")
+        n=\$((n + 1))
+        printf '%s\\n' "\$n" > "\$LB_MKTEMP_COUNTER"
+        [ "\$n" -le "\$LB_MKTEMP_ALLOW" ] || exit 1
+        ;;
+    esac
+  done
+fi
+exec $(command -v mktemp) "\$@"
+SH
+  chmod +x "$fakebin/mktemp"
   printf '%s\n' "$fakebin"
 }
 
@@ -860,6 +884,78 @@ test_consuming_an_unable_notice_closes_and_records_the_resend_obligation() {
   assert_contains "$out" "RESEND REQUIRED: $id notice" \
     "the handling interface must keep the corrected-notice obligation visible"
   pass "an unable notice closes while its corrected-notice resend remains durable and visible"
+}
+
+test_a_failed_close_record_leaves_the_obligation_visible_and_retryable() {
+  local home store fakebin out rc id number reply_id
+  read -r home store fakebin <<< "$(fixture close-record-atomic | tr '\n' ' ')"
+  printf 'The notice that may need correction.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T141902Z-3b71c40d
+  inject_reply "$store" "$number" "$reply_id" "$id" unable "the notice could not be accepted"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+
+  # Let the forge close land and fail the local claim record that follows it.
+  printf '0\n' > "$home/mktemp.count"
+  out=$(env PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FAKE_STORE="$store" \
+    LB_MKTEMP_ALLOW=0 LB_MKTEMP_COUNTER="$home/mktemp.count" \
+    "$ROOT/bin/fm-letterbox.sh" close "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a close whose record cannot be written must fail loudly"
+  jq -e --argjson n "$number" 'map(select(.number == $n)) | first | .state == "closed"' \
+    "$store/issues.json" >/dev/null || fail "the forge close must still have landed"
+
+  # Nothing was consumed, so the letter is still reported as awaiting a reply
+  # and the close is simply retryable. Under a half-written record status would
+  # suppress the consumed sent claim and the stale backstop needs an open issue,
+  # so nothing would ask for the retry.
+  [ "$(jq -r '.consumed | length' "$home/state/letterbox/claims/$id.json")" = 0 ] \
+    || fail "a failed close record must consume nothing, or the obligation goes invisible"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "1 sent and awaiting a reply from the peer" \
+    "the letter must stay visible as an outstanding obligation after a failed close record"
+
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the retry must complete the close"
+  assert_grep "$reply_id" <(jq -r '.consumed[]' "$home/state/letterbox/claims/$id.json") \
+    "the retry must consume the reply"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = true ] \
+    || fail "the retry must record the resend obligation in the same rewrite"
+  out=$(run_lb "$home" "$store" "$fakebin" status) || fail "status must succeed: $out"
+  assert_contains "$out" "RESEND REQUIRED: $id notice" \
+    "the corrected-notice obligation must be visible once the record lands"
+  pass "a close whose record fails consumes nothing, stays visible in status, and is retryable"
+}
+
+test_the_close_record_survives_only_one_claim_write() {
+  local home store fakebin id number reply_id consumed resend
+  read -r home store fakebin <<< "$(fixture close-record-single | tr '\n' ' ')"
+  printf 'The notice.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T141902Z-3b71c40d
+  inject_reply "$store" "$number" "$reply_id" "$id" unable "the notice could not be accepted"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+
+  # Allow exactly ONE claim write during the close. This is the assertion that
+  # discriminates: as two sequential writes the consume lands and the resend
+  # flag does not, leaving a closed issue, a consumed reply and no visible
+  # obligation. As one rewrite both halves land together or neither does.
+  printf '0\n' > "$home/mktemp.count"
+  env PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FAKE_STORE="$store" \
+    LB_MKTEMP_ALLOW=1 LB_MKTEMP_COUNTER="$home/mktemp.count" \
+    "$ROOT/bin/fm-letterbox.sh" close "$id" >/dev/null 2>&1
+  consumed=$(jq -r '.consumed | length' "$home/state/letterbox/claims/$id.json")
+  resend=$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")
+  if [ "$consumed" != 0 ] && [ "$resend" != true ]; then
+    fail "half-written close record: the reply is consumed but the resend obligation is invisible (consumed=$consumed resend=$resend)"
+  fi
+  [ "$consumed" = 1 ] && [ "$resend" = true ] \
+    || fail "one claim write must carry both halves (consumed=$consumed resend=$resend)"
+  pass "the close record survives on a single claim write, so it can never be half-written"
 }
 
 test_a_corrected_notice_discharges_the_resend_obligation_through_send() {
@@ -2250,6 +2346,8 @@ test_close_refuses_without_a_terminal_reply_and_refuses_a_received_letter
 test_a_notice_ack_is_the_terminal_reply_that_closes_the_exchange
 test_protocol_unable_is_legal_for_a_notice_and_a_parse_refusal
 test_consuming_an_unable_notice_closes_and_records_the_resend_obligation
+test_a_failed_close_record_leaves_the_obligation_visible_and_retryable
+test_the_close_record_survives_only_one_claim_write
 test_a_corrected_notice_discharges_the_resend_obligation_through_send
 test_a_landed_letter_is_adopted_even_when_its_bytes_now_fail_the_gate
 test_a_crash_before_the_resend_receipt_is_completed_by_the_retry

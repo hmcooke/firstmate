@@ -29,6 +29,10 @@
 #   lb_card_reply_write ...     - serialise a reply card
 #   lb_issue_title <class> <id> - the generated, never authored, issue title
 #   lb_claim_* / lb_claim_field - atomic id claim and claim-record reads
+#   lb_claim_set_many <state> <id> <field> <value>... - set several fields in ONE
+#                                 rewrite, so a crash cannot leave halves that disagree
+#   lb_claim_close_record <state> <id> <resend> [reply...] - the requester's close
+#                                 transition as one rewrite (see its header)
 #   lb_transport <verb> [args]  - dispatch to the configured transport adapter
 #   lb_scan_refuses <file>      - run the credential scanner, refusing on any
 #                                 non-clean result including a scanner failure
@@ -703,6 +707,53 @@ lb_claim_consume() {
   local state=$1 id=$2 reply=$3
   # shellcheck disable=SC2016 # A jq filter, expanded by jq.
   lb_claim_rewrite "$state" "$id" '.consumed = ((.consumed // []) + [$r] | unique)' --arg r "$reply"
+}
+
+# Set several fields in ONE rewrite. Two consecutive lb_claim_set calls are two
+# publications, and a crash or a failure between them leaves a half-written
+# record whose two halves disagree - which is how an obligation goes invisible.
+# Anything that must be true together is written together.
+# Usage: lb_claim_set_many <state> <id> <field> <value> [<field> <value> ...]
+lb_claim_set_many() {
+  local state=$1 id=$2 filter='.' i=0
+  local -a args=()
+  shift 2
+  [ "$#" -ge 2 ] || return 1
+  [ $(( $# % 2 )) -eq 0 ] || return 1
+  while [ "$#" -ge 2 ]; do
+    i=$((i + 1))
+    filter="$filter | .[\$f$i] = \$v$i"
+    args+=(--arg "f$i" "$1" --arg "v$i" "$2")
+    shift 2
+  done
+  lb_claim_rewrite "$state" "$id" "$filter" "${args[@]+"${args[@]}"}"
+}
+
+# The requester's close transition, published as ONE rewrite.
+#
+# close closes the forge issue first, because closing is idempotent and a crash
+# before the local record simply re-closes and retries. What must NOT happen is
+# a half-written local record: consuming the reply while failing to record that
+# a refused notice still needs re-sending leaves a closed issue, a consumed
+# reply and no visible obligation - status suppresses a consumed sent claim and
+# the stale backstop needs an open issue, so nothing asks for the retry.
+#
+# Publishing both facts in one rewrite makes every crash state visible: either
+# the whole record lands, or none of it does and the reply stays unconsumed, so
+# the letter is still reported as awaiting a reply and close can simply be run
+# again.
+lb_claim_close_record() {
+  local state=$1 id=$2 resend=$3 reply list
+  shift 3
+  list='[]'
+  if [ "$#" -gt 0 ]; then
+    list=$(for reply in "$@"; do printf '%s\n' "$reply"; done | jq -R . | jq -s -c '.') || return 1
+  fi
+  # shellcheck disable=SC2016 # A jq filter, expanded by jq.
+  lb_claim_rewrite "$state" "$id" \
+    '.consumed = (((.consumed // []) + $r) | unique)
+     | if $resend == "true" then .resend_required = "true" else . end' \
+    --argjson r "$list" --arg resend "$resend"
 }
 
 # --- credential refusal -----------------------------------------------------

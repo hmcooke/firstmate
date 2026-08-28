@@ -65,19 +65,19 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
 The hints came from that run's `fm-test-timing-portable-serial` artifacts on 2026-08-27, where the lane ran 116 scripts in 2404395 ms of serial work.
-Two letterbox scripts were added on 2026-08-27 with locally measured hints, re-measured on 2026-08-28 after the cross-vendor review round (576 ms and 17454 ms), bringing the lane to 118 scripts and 2422425 ms.
+Two letterbox scripts were added on 2026-08-27 with locally measured hints, re-measured on 2026-08-28 after the second independent review round (569 ms and 34794 ms).
 A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default, which stays close to the 20727 ms measured per-script mean.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 Balance is the whole point of refreshing them on schedule, because an unhinted script assigned the flat default can be an order of magnitude heavier than that default and lands its whole error on one shard.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of5` | 23 | 484483 ms (~8.07 min) |
-| `portable-serial-2of5` | 23 | 484487 ms (~8.07 min) |
-| `portable-serial-3of5` | 24 | 484482 ms (~8.07 min) |
-| `portable-serial-4of5` | 25 | 484492 ms (~8.07 min) |
-| `portable-serial-5of5` | 23 | 484481 ms (~8.07 min) |
-| imbalance | | 11 ms |
+| `portable-serial-1of5` | 23 | 488226 ms (~8.14 min) |
+| `portable-serial-2of5` | 24 | 488238 ms (~8.14 min) |
+| `portable-serial-3of5` | 24 | 488238 ms (~8.14 min) |
+| `portable-serial-4of5` | 24 | 488228 ms (~8.14 min) |
+| `portable-serial-5of5` | 24 | 488225 ms (~8.14 min) |
+| imbalance | | 13 ms |
 
 The single longest script, `tests/fm-pr-check-security.test.sh` at 226928 ms, is the floor for any shard count.
 

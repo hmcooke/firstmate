@@ -511,8 +511,10 @@ record_receipt() {
   # 0 = created here, 1 = already claimed by an earlier attempt; both are fine.
   [ "$rc" -le 1 ] || die "cannot record the sent claim for $id"
   if [ -n "$resends" ]; then
-    if ! lb_claim_set "$STATE" "$resends" resent_as "$id" \
-      || ! lb_claim_set "$STATE" "$resends" resend_required ""; then
+    # Both halves of the discharge in ONE rewrite: separately, a failure between
+    # them leaves resent_as recorded with resend_required still set, or the flag
+    # cleared with no pointer to the letter that discharged it.
+    if ! lb_claim_set_many "$STATE" "$resends" resent_as "$id" resend_required ""; then
       die "letter $id was sent, but the resend of notice $resends could not be recorded; run status"
     fi
   fi
@@ -686,8 +688,9 @@ cmd_reply() {
     || die "the transport refused the reply"
   # The responder NEVER closes: the requester closes when it consumes this.
   if lb_status_terminal "$status" "$class"; then
-    lb_claim_set "$STATE" "$id" replied "$status" || true
-    lb_claim_set "$STATE" "$id" reply_id "$reply_id" || true
+    # One rewrite: replied is what stops the stale backstop raising this letter,
+    # so it must never be recorded without the reply id that explains it.
+    lb_claim_set_many "$STATE" "$id" replied "$status" reply_id "$reply_id" || true
     printf 'replied %s to %s; the requester closes the letter when it consumes this\n' "$status" "$id"
   else
     printf 'acknowledged %s (non-terminal); a terminal reply is still owed\n' "$id"
@@ -695,7 +698,8 @@ cmd_reply() {
 }
 
 cmd_close() {
-  local id=${1-} number reply file winner winner_status class replies='' found=0
+  local id=${1-} number reply file winner winner_status class resend replies='' found=0
+  local -a reply_list=()
   require_active
   lb_id_valid "$id" || die "not a letter id: ${id:-<none>}"
   lb_claim_exists "$STATE" "$id" || die "no claimed letter $id in this home"
@@ -745,13 +749,19 @@ cmd_close() {
   # with nothing left to re-close it.
   require_private_channel
   transport_write close "$number" >/dev/null || die "the transport refused the close"
+  # The consumed reply and any resend obligation are published in ONE rewrite.
+  # Written as two steps, a failure between them left a closed issue, a consumed
+  # reply and no visible obligation: status suppresses a consumed sent claim and
+  # the stale backstop needs an open issue, so nothing asked for the retry.
+  # Atomically, a failure consumes nothing, the letter is still reported as
+  # awaiting a reply, and close can simply be run again.
+  resend=
+  if [ "$class" = notice ] && [ "$winner_status" = unable ]; then resend=true; fi
   for reply in $replies; do
-    lb_claim_consume "$STATE" "$id" "$reply" || die "cannot record the consumed reply $reply"
+    reply_list+=("$reply")
   done
-  if [ "$class" = notice ] && [ "$winner_status" = unable ]; then
-    lb_claim_set "$STATE" "$id" resend_required true \
-      || die "cannot record that notice $id needs to be re-sent"
-  fi
+  lb_claim_close_record "$STATE" "$id" "$resend" "${reply_list[@]+"${reply_list[@]}"}" \
+    || die "cannot record the close of $id; the letter is still reported as awaiting a reply, so run close again"
   printf 'closed %s (issue %s)\n' "$id" "$number"
 }
 
