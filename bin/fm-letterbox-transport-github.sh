@@ -60,7 +60,7 @@
 # against core's 5,000/hour, so it would be the first thing to break under
 # polling. find-title reads the most recent 100 issues in one call instead,
 # which is what an idempotent create retry needs and no more.
-set -u
+set -euo pipefail
 LC_ALL=C
 export LC_ALL
 
@@ -92,7 +92,7 @@ transport_dependencies() {
 }
 
 VERB=${1-}
-shift 2>/dev/null || true
+if [ "$#" -gt 0 ]; then shift; fi
 
 if [ "$VERB" = dependencies ]; then
   transport_dependencies
@@ -125,7 +125,8 @@ paginated_json() {
   else
     rc=$?
   fi
-  rm -f -- "$tmp"
+  # A failed private-temp cleanup cannot invalidate a completed read.
+  rm -f -- "$tmp" || true
   return "$rc"
 }
 
@@ -141,23 +142,32 @@ find_title_number() {
   else
     rc=$?
   fi
-  rm -f -- "$tmp"
+  # A failed private-temp cleanup cannot invalidate a completed read.
+  rm -f -- "$tmp" || true
   return "$rc"
 }
 
 extract_last_url() {
   local pattern=$1 value=$2 tmp rc line last=''
   tmp=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-letterbox-github.XXXXXX") || return 1
-  grep -oE -e "$pattern" <<< "$value" > "$tmp" 2>/dev/null
-  rc=$?
+  if grep -oE -e "$pattern" <<< "$value" > "$tmp" 2>/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
   case "$rc" in
     0|1) : ;;
-    *) rm -f -- "$tmp"; return 1 ;;
+    *)
+      # A failed private-temp cleanup cannot replace the extraction failure.
+      rm -f -- "$tmp" || true
+      return 1
+      ;;
   esac
   while IFS= read -r line; do
     last=$line
   done < "$tmp"
-  rm -f -- "$tmp"
+  # A failed private-temp cleanup cannot invalidate a completed extraction.
+  rm -f -- "$tmp" || true
   printf '%s\n' "$last"
 }
 
@@ -168,7 +178,11 @@ extract_last_url() {
 # visibility refusal rather than a generic failure.
 gate_write() {
   local reason rc
-  reason=$(require_private); rc=$?
+  if reason=$(require_private); then
+    rc=0
+  else
+    rc=$?
+  fi
   [ "$rc" -ne 0 ] || return 0
   printf '%s\n' "letterbox transport: refusing to write, $reason" >&2
   case "$rc" in
@@ -251,7 +265,10 @@ case "$VERB" in
     # The letter did land; only its URL was not printed in a shape this adapter
     # recognises. Resolve the number the same way a retry would, by exact title,
     # rather than reporting a failure that would cause a duplicate letter.
-    NUMBER=$(find_title_number "$TITLE") || NUMBER=
+    if ! NUMBER=$(find_title_number "$TITLE"); then
+      # The landed create still falls through to the explicit unresolved-number failure.
+      NUMBER=
+    fi
     case "$NUMBER" in
       ''|*[!0-9]*)
         printf '%s\n' "letterbox transport: create returned no issue URL and the letter could not be found by title" >&2
@@ -280,7 +297,10 @@ case "$VERB" in
     }
     # The URL is informational; the reply landed either way, so a CLI that does
     # not print one is not a failure.
-    URL=$(extract_last_url 'https://[A-Za-z0-9._#/-]+' "$OUT") || URL=
+    if ! URL=$(extract_last_url 'https://[A-Za-z0-9._#/-]+' "$OUT"); then
+      # A comment URL is informational after the write has already landed.
+      URL=
+    fi
     [ -z "$URL" ] || printf '%s\n' "$URL"
     ;;
 

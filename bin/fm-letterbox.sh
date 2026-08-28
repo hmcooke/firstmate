@@ -62,7 +62,7 @@
 # class is cleared by a read; both keep alarming until a write lands. Every write
 # that carries card bytes also runs bin/fm-secret-scan.sh over the assembled card
 # first and refuses on anything but a clean result; it refuses, it never redacts.
-set -u
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -79,7 +79,8 @@ LB_SCRIPT_DIR=$SCRIPT_DIR
 . "$SCRIPT_DIR/fm-letterbox-lib.sh"
 
 WORK=
-trap '[ -z "$WORK" ] || rm -rf -- "$WORK"' EXIT HUP INT TERM
+# Cleanup failure cannot change the command result after private work is done.
+trap '[ -z "$WORK" ] || rm -rf -- "$WORK" || true' EXIT HUP INT TERM
 
 die() {
   printf 'error: %s\n' "$1" >&2
@@ -128,11 +129,12 @@ ensure_dirs() {
 # line is the class (visibility or transport) so the poll reports it structurally
 # rather than inferring its kind from the prose.
 record_write_error() {
-  lb_text_publish "$(ROOT_DIR)" "write-error" 600 "$1" "$2" 2>/dev/null || true
+  lb_text_publish "$(ROOT_DIR)" "write-error" 600 "$1" "$2" 2>/dev/null
 }
 
 clear_write_error() {
   fmx_private_artifact_dir_device "$(ROOT_DIR)" >/dev/null 2>&1 || return 0
+  # A failed cleanup leaves the prior alarm loud, which is safer than hiding it.
   rm -f "$(ROOT_DIR)/write-error" 2>/dev/null || true
 }
 
@@ -141,14 +143,19 @@ clear_write_error() {
 # ongoing exposure into a hard stop plus an alarm.
 require_private_channel() {
   local reason rc class
-  reason=$(lb_transport require-private 2>/dev/null); rc=$?
+  if reason=$(lb_transport require-private 2>/dev/null); then
+    rc=0
+  else
+    rc=$?
+  fi
   [ "$rc" -ne 0 ] || return 0
   case "$rc" in
     2) class=visibility ;;
     *) class=transport ;;
   esac
   [ -n "$reason" ] || reason="cannot confirm $LB_REPO is private"
-  record_write_error "$class" "letterbox write refused: $reason"
+  record_write_error "$class" "letterbox write refused: $reason" \
+    || die "refusing to write: $reason; cannot record the required letterbox alarm"
   die "refusing to write: $reason"
 }
 
@@ -169,7 +176,11 @@ transport_write() {
   local verb=$1 out rc reason
   shift
   workdir
-  out=$(lb_transport "$verb" "$@" 2>"$WORK/transport.err"); rc=$?
+  if out=$(lb_transport "$verb" "$@" 2>"$WORK/transport.err"); then
+    rc=0
+  else
+    rc=$?
+  fi
   case "$rc" in
     0)
       clear_write_error
@@ -177,18 +188,24 @@ transport_write() {
       return 0
       ;;
     2|3)
-      reason=$(sed -n 's/^letterbox transport: refusing to write, //p' "$WORK/transport.err" 2>/dev/null) || reason=
+      if ! reason=$(sed -n 's/^letterbox transport: refusing to write, //p' "$WORK/transport.err" 2>/dev/null); then
+        # The adapter status still identifies the refusal class when its detail is unreadable.
+        reason=
+      fi
       reason=${reason##*$'\n'}
       [ -n "$reason" ] || reason="cannot confirm $LB_REPO is private"
       if [ "$rc" -eq 2 ]; then
-        record_write_error visibility "letterbox write refused: $reason"
+        record_write_error visibility "letterbox write refused: $reason" \
+          || die "refusing to write: $reason; cannot record the required letterbox alarm"
       else
-        record_write_error transport "letterbox write refused: $reason"
+        record_write_error transport "letterbox write refused: $reason" \
+          || die "refusing to write: $reason; cannot record the required letterbox alarm"
       fi
       die "refusing to write: $reason"
       ;;
   esac
-  cat "$WORK/transport.err" >&2 2>/dev/null
+  # An unreadable optional diagnostic must not replace the transport's real status.
+  cat "$WORK/transport.err" >&2 2>/dev/null || true
   return "$rc"
 }
 
@@ -211,10 +228,11 @@ file_size_bytes() {
 # Prints one reason and returns 0 when the card must not be transmitted;
 # prints nothing and returns 1 when it may.
 card_unsendable_reason() {
-  local file=$1 kind=$2 expected_id=$3 expected=$4 correlate=${5-} size self peer rc
+  local file=$1 kind=$2 expected_id=$3 expected=$4 correlate=${5-} size self peer rc card
   size=$(file_size_bytes "$file") || { printf 'unreadable size\n'; return 0; }
   [ "$size" -le 65536 ] || { printf 'implausibly large\n'; return 0; }
-  if lb_has_host_path "$(cat "$file")"; then printf 'absolute host path\n'; return 0; fi
+  card=$(cat "$file") || { printf 'unreadable card\n'; return 0; }
+  if lb_has_host_path "$card"; then printf 'absolute host path\n'; return 0; fi
   self=$LB_SELF
   peer=$LB_PEER
   LB_SELF=$peer
@@ -269,7 +287,7 @@ outbox_unsendable_reason() {
 # Sender-side grammar enforcement. The same refusals the receiver applies, so a
 # card that this estate could not accept is never emitted either.
 require_sendable() {
-  local subject=$1 bodyfile=$2 size
+  local subject=$1 bodyfile=$2 size body
   [ "${#subject}" -le 120 ] || die "subject is longer than 120 characters"
   case "$subject" in
     *[[:cntrl:]]*) die "subject must be one line" ;;
@@ -277,7 +295,8 @@ require_sendable() {
   lb_has_host_path "$subject" && die "subject names an absolute host path; refer to files by role"
   size=$(file_size_bytes "$bodyfile") || die "cannot measure body size"
   [ "$size" -le 8192 ] || die "body is larger than 8 KiB; it is refused, not truncated"
-  lb_has_host_path "$(cat "$bodyfile")" \
+  body=$(cat "$bodyfile") || die "cannot read body"
+  lb_has_host_path "$body" \
     && die "body names an absolute host path; refer to files by role"
   return 0
 }
@@ -456,14 +475,30 @@ cmd_read() {
 # the send, because creating without an authoritative miss is exactly the
 # duplicate this reconciliation exists to prevent.
 reconcile_unsent() {
-  local id class title number url out reason resends
+  local id class title number url out reason resends record normalized
   for id in $(unsent_ids); do
-    class=$(jq -r '.class // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
+    workdir
+    record="$(lb_dir "$STATE" outbox)/$id.json"
+    normalized="$WORK/outbox.$id.json"
+    if ! jq -ce '
+      if type == "object"
+        and (.class | type == "string")
+        and ((.resends // "") | type == "string")
+        and (.card | type == "string")
+      then {class: .class, resends: (.resends // ""), card: .card}
+      else error("invalid outbox record")
+      end' "$record" > "$normalized" 2>/dev/null; then
+      printf 'UNSENDABLE: %s (unreadable outbox record); the outbox record is kept and skipped\n' "$id" >&2
+      continue
+    fi
+    class=$(jq -er '.class' "$normalized" 2>/dev/null) \
+      || die "cannot read the validated class for unsent letter $id"
+    resends=$(jq -er '.resends' "$normalized" 2>/dev/null) \
+      || die "cannot read the validated resend target for unsent letter $id"
     if ! lb_class_allowed "$class"; then
       printf 'UNSENDABLE: %s (invalid class); the outbox record is kept and skipped\n' "$id" >&2
       continue
     fi
-    resends=$(jq -r '.resends // ""' "$(lb_dir "$STATE" outbox)/$id.json" 2>/dev/null)
     title=$(lb_issue_title "$class" "$id")
     # Both create and find-title answer "<number> <url>", so this script never
     # has to know what a forge URL looks like.
@@ -513,8 +548,11 @@ reconcile_unsent() {
 # both from the same outbox record.
 record_receipt() {
   local id=$1 number=$2 url=$3 class=$4 resends=${5-} rc
-  lb_claim_create "$STATE" "$id" "$class" "$LB_SELF" "$number" >/dev/null 2>&1
-  rc=$?
+  if lb_claim_create "$STATE" "$id" "$class" "$LB_SELF" "$number" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
   # 0 = created here, 1 = already claimed by an earlier attempt; both are fine.
   [ "$rc" -le 1 ] || die "cannot record the sent claim for $id"
   if [ -n "$resends" ]; then
@@ -549,7 +587,7 @@ require_resend_target() {
 }
 
 cmd_send() {
-  local class='' subject='' file='' expires='' resends='' id title out number url body
+  local class='' subject='' file='' expires='' resends='' id title out number url body card
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --class) need_value "$@"; class=$2; shift 2 ;;
@@ -587,20 +625,22 @@ cmd_send() {
 
   id=$(lb_id_new) || die "cannot generate a letter id"
   title=$(lb_issue_title "$class" "$id")
-  lb_card_request_write "$WORK/card.md" "$id" "$class" "$subject" "$(lb_now_iso)" "$expires" "$body"
+  lb_card_request_write "$WORK/card.md" "$id" "$class" "$subject" "$(lb_now_iso)" "$expires" "$body" \
+    || die "cannot serialize the letter card"
   # The whole assembled card is validated as the receiver would, immediately
   # before it is recorded or transmitted, and scanned BEFORE the outbox write
   # and before the transport call: a server-side rejection would already be too
   # late, and so would a local record.
   require_card_sendable "$WORK/card.md" request "$id" "$class"
   require_clean "$WORK/card.md"
+  card=$(cat "$WORK/card.md") || die "cannot read the serialized letter card"
 
   # The id and the exact bytes are recorded BEFORE the transport call, which is
   # what makes the retry above an adoption instead of a second letter.
   # shellcheck disable=SC2016 # A jq filter, expanded by jq.
   lb_json_publish "$(lb_dir "$STATE" outbox)" "$id.json" \
     --arg id "$id" --arg class "$class" --arg subject "$subject" \
-    --arg expires "$expires" --arg resends "$resends" --arg card "$(cat "$WORK/card.md")" \
+    --arg expires "$expires" --arg resends "$resends" --arg card "$card" \
     --argjson issued "$(date -u +%s)" \
     '{id:$id,class:$class,subject:$subject,expires:$expires,resends:$resends,issued:$issued,card:$card}' \
     || die "cannot record the outbox entry for $id"
@@ -618,7 +658,7 @@ cmd_send() {
 
 cmd_link() {
   local id=${1-} task=''
-  shift 2>/dev/null || true
+  if [ "$#" -gt 0 ]; then shift; fi
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --task) need_value "$@"; task=$2; shift 2 ;;
@@ -638,7 +678,7 @@ cmd_link() {
 
 cmd_reply() {
   local id=${1-} status='' file='' number reply_id class sender stash body
-  shift 2>/dev/null || true
+  if [ "$#" -gt 0 ]; then shift; fi
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --status) need_value "$@"; status=$2; shift 2 ;;
@@ -657,13 +697,13 @@ cmd_reply() {
   # is created here so the reply has somewhere to record itself.
   stash="$(lb_dir "$STATE" inbox)/$id.json"
   if lb_claim_exists "$STATE" "$id"; then
-    sender=$(lb_claim_field "$STATE" "$id" from)
-    class=$(lb_claim_field "$STATE" "$id" class)
-    number=$(lb_claim_field "$STATE" "$id" issue)
+    sender=$(lb_claim_field "$STATE" "$id" from) || die "cannot read the claim for $id"
+    class=$(lb_claim_field "$STATE" "$id" class) || die "cannot read the claim for $id"
+    number=$(lb_claim_field "$STATE" "$id" issue) || die "cannot read the claim for $id"
   elif [ -f "$stash" ] && [ ! -L "$stash" ]; then
-    sender=$(jq -r '.from // ""' "$stash" 2>/dev/null)
-    class=$(jq -r '.class // ""' "$stash" 2>/dev/null)
-    number=$(jq -r '.issue // ""' "$stash" 2>/dev/null)
+    sender=$(jq -er '.from | strings' "$stash" 2>/dev/null) || die "cannot read the stashed card for $id"
+    class=$(jq -er '.class | strings' "$stash" 2>/dev/null) || die "cannot read the stashed card for $id"
+    number=$(jq -er '.issue | numbers' "$stash" 2>/dev/null) || die "cannot read the stashed card for $id"
   else
     die "no letter $id in this home"
   fi
@@ -687,7 +727,8 @@ cmd_reply() {
   ensure_dirs
 
   reply_id=$(lb_id_new) || die "cannot generate a reply id"
-  lb_card_reply_write "$WORK/reply.md" "$reply_id" "$id" "$status" "$(lb_now_iso)" "$body"
+  lb_card_reply_write "$WORK/reply.md" "$reply_id" "$id" "$status" "$(lb_now_iso)" "$body" \
+    || die "cannot serialize the reply card"
   require_card_sendable "$WORK/reply.md" reply "$reply_id" "$status" "$id"
   require_clean "$WORK/reply.md"
   require_private_channel
@@ -697,7 +738,8 @@ cmd_reply() {
   if lb_status_terminal "$status" "$class"; then
     # One rewrite: replied is what stops the stale backstop raising this letter,
     # so it must never be recorded without the reply id that explains it.
-    lb_claim_set_many "$STATE" "$id" replied "$status" reply_id "$reply_id" || true
+    lb_claim_set_many "$STATE" "$id" replied "$status" reply_id "$reply_id" \
+      || die "the reply landed, but its local record failed; the letter remains visible for recovery"
     printf 'replied %s to %s; the requester closes the letter when it consumes this\n' "$status" "$id"
   else
     printf 'acknowledged %s (non-terminal); a terminal reply is still owed\n' "$id"
@@ -705,48 +747,61 @@ cmd_reply() {
 }
 
 cmd_close() {
-  local id=${1-} number reply file winner winner_status class resend replies='' found=0
+  local id=${1-} number reply file winner winner_status class sender resend found=0 rc
   local -a reply_list=()
   require_active
   lb_id_valid "$id" || die "not a letter id: ${id:-<none>}"
   lb_claim_exists "$STATE" "$id" || die "no claimed letter $id in this home"
-  [ "$(lb_claim_field "$STATE" "$id" from)" = "$LB_SELF" ] \
+  sender=$(lb_claim_field "$STATE" "$id" from) || die "cannot read the sent claim for $id"
+  [ "$sender" = "$LB_SELF" ] \
     || die "$id was received, not sent, by this estate; the requester closes a letter, never the responder"
-  number=$(lb_claim_field "$STATE" "$id" issue)
-  class=$(lb_claim_field "$STATE" "$id" class)
+  number=$(lb_claim_field "$STATE" "$id" issue) || die "cannot read the sent claim for $id"
+  class=$(lb_claim_field "$STATE" "$id" class) || die "cannot read the sent claim for $id"
   case "$number" in ''|*[!0-9]*) die "the claim for $id records no issue" ;; esac
+  lb_class_allowed "$class" || die "the claim for $id records no valid request class"
 
   # FIRST TERMINAL REPLY WINS. The winner is derived from the reply claim that
   # names this letter (lb_first_reply), with the sent claim's first_reply field
   # as its cache, so close consumes exactly that one even when the poll died
   # before writing the cache; any later reply is ignored rather than folded in
   # as a second answer.
-  winner=$(lb_first_reply "$STATE" "$id") || winner=
+  if winner=$(lb_first_reply "$STATE" "$id"); then
+    rc=0
+  else
+    rc=$?
+    winner=
+  fi
+  [ "$rc" -ne 2 ] || die "cannot read the winning reply state for $id"
   winner_status=${winner#* }
   winner=${winner%% *}
   [ "$winner_status" != "$winner" ] || winner_status=
   if [ -n "$winner" ]; then
-    if [ -z "$winner_status" ] && [ -f "$(lb_dir "$STATE" inbox)/$winner.json" ] \
-      && [ ! -L "$(lb_dir "$STATE" inbox)/$winner.json" ]; then
-      winner_status=$(jq -r '.status // ""' "$(lb_dir "$STATE" inbox)/$winner.json" 2>/dev/null)
-    fi
     found=1
-    lb_claim_consumed "$STATE" "$id" "$winner" || replies=" $winner"
+    lb_claim_consumed "$STATE" "$id" "$winner" || reply_list+=("$winner")
   else
     for file in "$(lb_dir "$STATE" inbox)"/*.json; do
       [ -e "$file" ] || continue
       reply=$(jq -r --arg id "$id" \
-        'select(.kind == "reply" and ."in-reply-to" == $id) | .id' "$file" 2>/dev/null)
+        'select(.kind == "reply" and ."in-reply-to" == $id) | .id // ""' "$file" 2>/dev/null) \
+        || die "cannot read a stashed reply while closing $id"
       [ -n "$reply" ] || continue
-      winner_status=$(jq -r '.status // ""' "$file" 2>/dev/null)
+      winner_status=$(jq -er '.status | strings | select(length > 0)' "$file" 2>/dev/null) \
+        || die "cannot read the winning reply status for $id"
       found=1
       lb_claim_consumed "$STATE" "$id" "$reply" && continue
-      replies="$replies $reply"
+      reply_list+=("$reply")
       break
     done
   fi
   [ "$found" -eq 1 ] \
     || die "no terminal reply to $id has been received; an open letter means somebody still owes something"
+  lb_status_allowed_for_class "$winner_status" "$class" \
+    || die "the winning reply to $id has no valid status for class $class"
+  lb_status_terminal "$winner_status" "$class" \
+    || die "the winning reply to $id is not terminal"
+
+  resend=
+  if [ "$class" = notice ] && [ "$winner_status" = unable ]; then resend=true; fi
 
   # ORDER: close the issue FIRST, then record what was consumed. Closing is
   # idempotent, so a crash between the two simply re-closes harmlessly on the
@@ -762,18 +817,13 @@ cmd_close() {
   # the stale backstop needs an open issue, so nothing asked for the retry.
   # Atomically, a failure consumes nothing, the letter is still reported as
   # awaiting a reply, and close can simply be run again.
-  resend=
-  if [ "$class" = notice ] && [ "$winner_status" = unable ]; then resend=true; fi
-  for reply in $replies; do
-    reply_list+=("$reply")
-  done
   lb_claim_close_record "$STATE" "$id" "$resend" "${reply_list[@]+"${reply_list[@]}"}" \
     || die "cannot record the close of $id; the letter is still reported as awaiting a reply, so run close again"
   printf 'closed %s (issue %s)\n' "$id" "$number"
 }
 
 CMD=${1-}
-shift 2>/dev/null || true
+if [ "$#" -gt 0 ]; then shift; fi
 case "$CMD" in
   arm) cmd_arm "$@" ;;
   retire) cmd_retire "$@" ;;

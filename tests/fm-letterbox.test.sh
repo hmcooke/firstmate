@@ -215,6 +215,11 @@ if [ -n "\${LB_MKTEMP_ALLOW:-}" ]; then
     esac
   done
 fi
+if [ -n "\${LB_MKTEMP_FAIL_TEXT:-}" ]; then
+  for a in "\$@"; do
+    case "\$a" in *fm-letterbox-text*) exit 1 ;; esac
+  done
+fi
 exec $(command -v mktemp) "\$@"
 SH
   chmod +x "$fakebin/mktemp"
@@ -2147,6 +2152,17 @@ SH
   chmod +x "$fakebin/jq"
 }
 
+install_failing_card_cat() {
+  local fakebin=$1 real
+  real=$(command -v cat)
+  cat > "$fakebin/cat" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in */fm-letterbox.*/card.md) exit 5 ;; esac
+exec "$real" "\$@"
+SH
+  chmod +x "$fakebin/cat"
+}
+
 test_a_failed_stash_is_never_published_announced_or_claimed() {
   local home store fakebin out id
   read -r home store fakebin <<< "$(fixture stash-jq | tr '\n' ' ')"
@@ -2484,6 +2500,114 @@ test_inbound_subject_control_characters_are_refused() {
   pass "inbound subjects reject control characters before list can emit them"
 }
 
+test_close_refuses_unreadable_class_and_winning_status_before_the_forge_write() {
+  local home store fakebin out rc id number reply_id claim reply_claim inbox
+  read -r home store fakebin <<< "$(fixture close-state-reads | tr '\n' ' ')"
+  printf 'notice\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  reply_id=archie-20260824T150000Z-0c1ea11e
+  inject_reply "$store" "$number" "$reply_id" "$id" unable "cannot accept"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  claim="$home/state/letterbox/claims/$id.json"
+  reply_claim="$home/state/letterbox/claims/$reply_id.json"
+  inbox="$home/state/letterbox/inbox/$reply_id.json"
+
+  jq 'del(.class)' "$claim" > "$claim.new" && chmod 600 "$claim.new" && mv "$claim.new" "$claim"
+  out=$(run_lb "$home" "$store" "$fakebin" close "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "close must refuse a sent claim whose class cannot be read"
+  assert_contains "$out" "no valid request class" "the malformed sent class must be named before closing"
+  jq -e --argjson n "$number" 'map(select(.number == $n)) | first | .state == "open"' \
+    "$store/issues.json" >/dev/null || fail "an unreadable sent class must leave the forge issue open"
+  [ "$(jq -r '.consumed | length' "$claim")" = 0 ] || fail "an unreadable class must consume nothing"
+
+  jq '.class = "notice" | del(.first_reply_status)' "$claim" > "$claim.new" \
+    && chmod 600 "$claim.new" && mv "$claim.new" "$claim"
+  jq 'del(.status)' "$reply_claim" > "$reply_claim.new" \
+    && chmod 600 "$reply_claim.new" && mv "$reply_claim.new" "$reply_claim"
+  jq 'del(.status)' "$inbox" > "$inbox.new" \
+    && chmod 600 "$inbox.new" && mv "$inbox.new" "$inbox"
+  out=$(run_lb "$home" "$store" "$fakebin" close "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "close must refuse a winning reply whose status cannot be read"
+  assert_contains "$out" "cannot read the winning reply state" "the unreadable winning status must be named"
+  jq -e --argjson n "$number" 'map(select(.number == $n)) | first | .state == "open"' \
+    "$store/issues.json" >/dev/null || fail "an unreadable winning status must leave the forge issue open"
+  [ "$(jq -r '.consumed | length' "$claim")" = 0 ] || fail "an unreadable winning status must consume nothing"
+  pass "close validates the sent class and winning status before touching the forge"
+}
+
+test_a_visibility_refusal_reports_when_its_alarm_cannot_be_published() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture visibility-alarm-write | tr '\n' ' ')"
+  printf 'false\n' > "$store/private"
+  printf 'body\n' > "$home/body.txt"
+  out=$(env PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FAKE_STORE="$store" LB_MKTEMP_FAIL_TEXT=1 \
+    "$ROOT/bin/fm-letterbox.sh" send --class notice --subject update --file "$home/body.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a visibility refusal whose durable alarm failed must fail"
+  assert_contains "$out" "cannot record the required letterbox alarm" \
+    "the caller must be told that the promised wake was not made durable"
+  assert_absent "$home/state/letterbox/write-error" "a failed alarm publication must not pretend a wake is durable"
+  [ "$(jq -r 'length' "$store/issues.json")" = 0 ] || fail "the refused write must still reach no forge issue"
+  pass "a refused write reports when its required durable wake cannot be recorded"
+}
+
+test_output_failure_cannot_flush_announcement_or_diagnostic_suppressions() {
+  local home store fakebin id out rc fault_home fault_store fault_fakebin
+  read -r home store fakebin <<< "$(fixture output-failure | tr '\n' ' ')"
+  id=archie-20260824T140311Z-9f2c1ab4
+  inject_letter "$store" "$id" fact-lookup q body >/dev/null
+  run_poll "$home" "$store" "$fakebin" >&- 2>/dev/null; rc=$?
+  [ "$rc" -ne 0 ] || fail "a failed announcement write must fail the poll"
+  assert_absent "$home/state/letterbox/claims/$id.json" "an unprinted announcement must not take its claim"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "new $id" "the unprinted letter must be announced again"
+
+  read -r fault_home fault_store fault_fakebin <<< "$(fixture diagnostic-output-failure | tr '\n' ' ')"
+  sed -i.bak 's/FM_LETTERBOX_TRANSPORT=github/FM_LETTERBOX_TRANSPORT=carrier-pigeon/' "$fault_home/.env"
+  run_poll "$fault_home" "$fault_store" "$fault_fakebin" >&- 2>/dev/null; rc=$?
+  [ "$rc" -ne 0 ] || fail "a failed diagnostic write must fail the poll"
+  assert_absent "$fault_home/state/letterbox/poll-error" "an unprinted diagnostic must not get a rate-limit marker"
+  out=$(run_poll "$fault_home" "$fault_store" "$fault_fakebin")
+  assert_contains "$out" "unsupported transport carrier-pigeon" "the unprinted diagnostic must be announced again"
+  pass "output must land before any announcement or diagnostic suppression"
+}
+
+test_reconciliation_never_adopts_after_a_required_outbox_field_read_fails() {
+  local home store fakebin out rc id
+  read -r home store fakebin <<< "$(fixture reconcile-required-fields | tr '\n' ' ')"
+  printf 'first\n' > "$home/first.txt"
+  run_lb "$home" "$store" "$fakebin" send --class fact-lookup --subject first --file "$home/first.txt" >/dev/null \
+    || fail "the first send must succeed"
+  id=$(sole_sent_id "$home") || fail "the first send must leave a receipt"
+  rm -f "$home/state/letterbox/sent/$id.receipt"
+  install_failing_jq "$fakebin" ".resends"
+  printf 'second\n' > "$home/second.txt"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/second.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a failed required outbox-field read must stop reconciliation"
+  assert_absent "$home/state/letterbox/sent/$id.receipt" "a failed resend-target read must not publish an adoption receipt"
+  rm -f "$fakebin/jq"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject second --file "$home/second.txt") \
+    || fail "reconciliation must recover once the outbox record is readable: $out"
+  assert_contains "$out" "adopted existing letter $id" "the unreadable record must remain retryable"
+  pass "all required outbox fields are checked before adoption or receipt publication"
+}
+
+test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record() {
+  local home store fakebin out rc
+  read -r home store fakebin <<< "$(fixture serialized-card-read | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  install_failing_card_cat "$fakebin"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unreadable serialized card must stop the send"
+  assert_contains "$out" "unreadable card" "the failed serialized-card read must be named"
+  [ "$(count_files "$home/state/letterbox/outbox")" = 0 ] \
+    || fail "an unreadable card must never become an empty outbox record"
+  [ "$(jq -r 'length' "$store/issues.json")" = 0 ] || fail "an unreadable card must never reach the forge"
+  pass "a checked serialized-card read precedes outbox publication and transport"
+}
+
 # ---------------------------------------------------------------------------
 
 test_poll_unconfigured_is_a_hard_noop
@@ -2573,3 +2697,8 @@ test_a_failed_deferred_claim_cannot_advance_the_cursor
 test_close_reply_array_building_cannot_mask_a_failed_stage
 test_duplicate_ids_are_reserved_within_one_poll_cycle
 test_inbound_subject_control_characters_are_refused
+test_close_refuses_unreadable_class_and_winning_status_before_the_forge_write
+test_a_visibility_refusal_reports_when_its_alarm_cannot_be_published
+test_output_failure_cannot_flush_announcement_or_diagnostic_suppressions
+test_reconciliation_never_adopts_after_a_required_outbox_field_read_fails
+test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record

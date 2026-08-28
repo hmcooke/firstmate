@@ -65,7 +65,7 @@
 # the unrecoverable one. EVERY CONSUMER OF AN ANNOUNCEMENT MUST THEREFORE BE
 # IDEMPOTENT ON CARD ID - the letterbox-correspondence skill owns what that means
 # for a handling turn, and docs/letterbox.md carries the full crash matrix.
-set -u
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -105,18 +105,22 @@ error_raised_within() {
 }
 
 mark_error_raised() {
-  lb_text_publish "$ROOT" "poll-error" 600 "$(date -u +%s)" "$1" 2>/dev/null || true
+  lb_text_publish "$ROOT" "poll-error" 600 "$(date -u +%s)" "$1" 2>/dev/null
 }
 
 emit_error_once() {
   local msg=$1
   error_raised_within "$msg" 0 && return 0
-  mark_error_raised "$msg"
-  printf 'letterbox error: %s\n' "$msg"
+  printf 'letterbox error: %s\n' "$msg" || return 1
+  if ! mark_error_raised "$msg"; then
+    # A missing marker deliberately leaves a delivered diagnostic eligible to repeat.
+    :
+  fi
 }
 
 clear_error() {
   fmx_private_artifact_dir_device "$ROOT" >/dev/null 2>&1 || return 0
+  # A failed cleanup leaves the prior diagnostic eligible to repeat.
   rm -f "$ROOT/poll-error" 2>/dev/null || true
 }
 
@@ -136,8 +140,11 @@ WRITE_ERROR_CLASS=
 WRITE_ERROR_MSG=
 WRITE_ERROR_WINDOW=0
 if fmx_private_artifact_file_valid "$ROOT" "write-error" 600; then
-  WRITE_ERROR_CLASS=$(head -n1 "$WRITE_ERROR_FILE" 2>/dev/null || true)
-  WRITE_ERROR_MSG=$(sed '1d' "$WRITE_ERROR_FILE" 2>/dev/null || true)
+  if ! WRITE_ERROR_CLASS=$(head -n1 "$WRITE_ERROR_FILE" 2>/dev/null) \
+    || ! WRITE_ERROR_MSG=$(sed '1d' "$WRITE_ERROR_FILE" 2>/dev/null); then
+    WRITE_ERROR_CLASS=transport
+    WRITE_ERROR_MSG="cannot read the durable letterbox write alarm"
+  fi
   case "$WRITE_ERROR_CLASS" in
     visibility) : ;;
     transport) : ;;
@@ -154,7 +161,8 @@ if [ -n "$WRITE_ERROR_MSG" ] && ! error_raised_within "$WRITE_ERROR_MSG" "$WRITE
 fi
 
 WORK=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-letterbox-poll.XXXXXX") || exit 0
-trap 'rm -rf -- "$WORK"' EXIT HUP INT TERM
+# Cleanup failure cannot change the poll result after private work is done.
+trap 'rm -rf -- "$WORK" || true' EXIT HUP INT TERM
 
 OPEN_JSON="$WORK/open.json"
 if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
@@ -162,8 +170,12 @@ if ! lb_transport list-open > "$OPEN_JSON" 2>/dev/null \
   # The read failed, so nothing below can run this cycle; a pending write-error
   # is still raised rather than waiting on a transport that may stay down.
   if [ -n "$PENDING_ERROR" ]; then
-    mark_error_raised "$PENDING_ERROR"
-    printf 'letterbox error: %s\n' "$PENDING_ERROR"
+    if printf 'letterbox error: %s\n' "$PENDING_ERROR"; then
+      if ! mark_error_raised "$PENDING_ERROR"; then
+        # A missing marker deliberately leaves a delivered diagnostic eligible to repeat.
+        :
+      fi
+    fi
   fi
   exit 0
 fi
@@ -243,16 +255,23 @@ reserve_cycle_id() {
 }
 
 flush_suppressions() {
-  local cid cclass cfrom cissue crefusal ccorrelate cstatus
-  [ -z "$PENDING_ERROR" ] || mark_error_raised "$PENDING_ERROR"
+  local cid cclass cfrom cissue crefusal ccorrelate cstatus rc
+  if [ -n "$PENDING_ERROR" ] && ! mark_error_raised "$PENDING_ERROR"; then
+    # A missing marker leaves the already delivered diagnostic eligible to repeat.
+    :
+  fi
   # A reply claim carries the letter it answers and its status in the same
   # O_EXCL write, so the first-terminal-reply winner is durable from this one
   # step: the first_reply cache written below may be lost to a crash and is
   # recovered from the claim by lb_first_reply.
   while IFS="$SEP" read -r cid cclass cfrom cissue crefusal ccorrelate cstatus; do
     [ -n "$cid" ] || continue
-    lb_claim_create "$STATE" "$cid" "$cclass" "$cfrom" "$cissue" "$crefusal" "$ccorrelate" "$cstatus" >/dev/null 2>&1
-    case "$?" in
+    if lb_claim_create "$STATE" "$cid" "$cclass" "$cfrom" "$cissue" "$crefusal" "$ccorrelate" "$cstatus" >/dev/null 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    case "$rc" in
       0) : ;;
       1)
         if [ -n "$crefusal" ] && ! lb_claim_set "$STATE" "$cid" refusal "$crefusal" >/dev/null 2>&1; then
@@ -274,14 +293,20 @@ EOF
   local sid rid rstatus
   while IFS="$SEP" read -r sid rid rstatus; do
     [ -n "$sid" ] && [ -n "$rid" ] && [ -n "$rstatus" ] || continue
-    lb_claim_set_many "$STATE" "$sid" first_reply_status "$rstatus" first_reply "$rid" >/dev/null 2>&1 || true
+    if ! lb_claim_set_many "$STATE" "$sid" first_reply_status "$rstatus" first_reply "$rid" >/dev/null 2>&1; then
+      # The reply claim is the durable winner; this cache may safely be rebuilt from it.
+      :
+    fi
   done <<EOF
 $PENDING_FIRST_REPLY
 EOF
   # The cursor suppresses future comment fetches, so an early advance could hide
   # a reply whose announcement was lost. It lands with the other suppressions.
   if [ "$SUPPRESSIONS_COMPLETE" -eq 1 ] && [ -n "$PENDING_CURSOR" ] && [ -f "$PENDING_CURSOR" ]; then
-    fmx_private_artifact_publish_stdin "$ROOT" "cursor" 600 < "$PENDING_CURSOR" 2>/dev/null || true
+    if ! fmx_private_artifact_publish_stdin "$ROOT" "cursor" 600 < "$PENDING_CURSOR" 2>/dev/null; then
+      # A missing cursor only causes a safe refetch and never hides an announcement.
+      :
+    fi
   fi
 }
 
@@ -290,18 +315,28 @@ OPEN_NUMBERS=" ${OPEN_NUMBERS//$'\n'/ } "
 
 # --- inbound letters --------------------------------------------------------
 
-COUNT=$(jq -r 'length' "$OPEN_JSON" 2>/dev/null) || COUNT=0
+if ! COUNT=$(jq -r 'length' "$OPEN_JSON" 2>/dev/null); then
+  # An unreadable listing is treated as empty and advances no durable state.
+  COUNT=0
+fi
 case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
 i=0
 while [ "$i" -lt "$COUNT" ]; do
   [ "$ITEMS" -lt "$WAKE_ITEM_MAX" ] || break
   RAW="$WORK/body.$i"
   jq -r --argjson i "$i" '.[$i].body' "$OPEN_JSON" > "$RAW" 2>/dev/null || { i=$((i + 1)); continue; }
-  NUMBER=$(jq -r --argjson i "$i" '.[$i].number' "$OPEN_JSON" 2>/dev/null)
+  if ! NUMBER=$(jq -r --argjson i "$i" '.[$i].number' "$OPEN_JSON" 2>/dev/null); then
+    i=$((i + 1))
+    continue
+  fi
   case "$NUMBER" in ''|*[!0-9]*) i=$((i + 1)); continue ;; esac
 
-  lb_card_parse "$RAW"
-  case "$?" in
+  if lb_card_parse "$RAW"; then
+    CRC=0
+  else
+    CRC=$?
+  fi
+  case "$CRC" in
     2)
       # Not addressed to this estate, or not a card at all. Ignored, never
       # answered: replying would answer a letter nobody sent here.
@@ -393,17 +428,23 @@ for receipt in "$SENT"/*.receipt; do
   [ "$FETCHES" -lt "$FETCH_MAX" ] || break
   SENT_ID=$(basename "$receipt" .receipt)
   lb_id_valid "$SENT_ID" || continue
-  SENT_NUMBER=$(head -n1 "$receipt" 2>/dev/null)
+  SENT_NUMBER=$(head -n1 "$receipt" 2>/dev/null) || continue
   case "$SENT_NUMBER" in ''|*[!0-9]*) continue ;; esac
   case "$OPEN_NUMBERS" in
     *" $SENT_NUMBER "*) : ;;
     *) continue ;;
   esac
   UPDATED=$(jq -r --argjson n "$SENT_NUMBER" \
-    'map(select(.number == $n)) | first | .updated // ""' "$OPEN_JSON" 2>/dev/null)
-  SEEN_AT=$(jq -r --arg n "$SENT_NUMBER" '.[$n] // ""' "$CURSOR_JSON" 2>/dev/null)
-  UPDATED_EPOCH=$(lb_iso_epoch "$UPDATED" 2>/dev/null) || UPDATED_EPOCH=
-  SEEN_EPOCH=$(lb_iso_epoch "$SEEN_AT" 2>/dev/null) || SEEN_EPOCH=
+    'map(select(.number == $n)) | first | .updated // ""' "$OPEN_JSON" 2>/dev/null) || continue
+  SEEN_AT=$(jq -r --arg n "$SENT_NUMBER" '.[$n] // ""' "$CURSOR_JSON" 2>/dev/null) || continue
+  if ! UPDATED_EPOCH=$(lb_iso_epoch "$UPDATED" 2>/dev/null); then
+    # An invalid forge timestamp forces a refetch and advances no cursor.
+    UPDATED_EPOCH=
+  fi
+  if ! SEEN_EPOCH=$(lb_iso_epoch "$SEEN_AT" 2>/dev/null); then
+    # An invalid optional cursor timestamp is treated as unseen.
+    SEEN_EPOCH=
+  fi
   if [ -n "$UPDATED_EPOCH" ] && [ -n "$SEEN_EPOCH" ] && [ "$UPDATED_EPOCH" -eq "$SEEN_EPOCH" ]; then
     continue
   fi
@@ -424,8 +465,15 @@ for receipt in "$SENT"/*.receipt; do
   # once one is recorded no later reply is ever stashed or consumed. The winner
   # is recovered from its own reply claim (lb_first_reply), so a crash between
   # that claim and the first_reply cache on the sent claim cannot hide it.
-  FIRST_REPLY=$(lb_first_reply "$STATE" "$SENT_ID") || FIRST_REPLY=
-  if [ -n "$FIRST_REPLY" ] && [ -z "$(lb_claim_field "$STATE" "$SENT_ID" first_reply)" ]; then
+  if FIRST_REPLY=$(lb_first_reply "$STATE" "$SENT_ID"); then
+    :
+  else
+    CRC=$?
+    [ "$CRC" -eq 1 ] || continue
+    FIRST_REPLY=
+  fi
+  FIRST_REPLY_CACHE=$(lb_claim_field "$STATE" "$SENT_ID" first_reply) || continue
+  if [ -n "$FIRST_REPLY" ] && [ -z "$FIRST_REPLY_CACHE" ]; then
     queue_first_reply "$SENT_ID" "${FIRST_REPLY%% *}" "${FIRST_REPLY#* }"
   fi
   FIRST_REPLY=${FIRST_REPLY%% *}
@@ -450,8 +498,11 @@ for receipt in "$SENT"/*.receipt; do
       COMMENT_ID=
     fi
     case "$COMMENT_ID" in ''|*[!0-9]*) COMMENT_ID= ;; esac
-    lb_card_parse "$CRAW"
-    CRC=$?
+    if lb_card_parse "$CRAW"; then
+      CRC=0
+    else
+      CRC=$?
+    fi
     if [ "$CRC" -eq 1 ]; then
       # A reply refused at parse gets the SAME refusal item, refusal claim and
       # notice/backstop path as a scanner refusal. Without this the reason was
@@ -537,8 +588,11 @@ for receipt in "$SENT"/*.receipt; do
   # stamp inside this cycle's own second is never recorded (see above).
   [ "$COMMENTS_COMPLETE" -eq 1 ] || continue
   [ -n "$UPDATED_EPOCH" ] && [ "$UPDATED_EPOCH" -lt "$NOW" ] || continue
-  jq --arg n "$SENT_NUMBER" --arg u "$UPDATED" '.[$n] = $u' "$CURSOR_JSON" > "$CURSOR_JSON.new" 2>/dev/null \
-    && mv -f "$CURSOR_JSON.new" "$CURSOR_JSON" 2>/dev/null || true
+  if ! jq --arg n "$SENT_NUMBER" --arg u "$UPDATED" '.[$n] = $u' "$CURSOR_JSON" > "$CURSOR_JSON.new" 2>/dev/null \
+    || ! mv -f "$CURSOR_JSON.new" "$CURSOR_JSON" 2>/dev/null; then
+    # A failed staged cursor update leaves this issue eligible for a safe refetch.
+    rm -f "$CURSOR_JSON.new" 2>/dev/null || true
+  fi
 done
 PENDING_CURSOR=$CURSOR_JSON
 
@@ -569,30 +623,32 @@ for claim in "$CLAIMS"/*.json; do
   # re-surfacing it would be a loop with no action that could end it.
   lb_id_valid "$CID" || continue
   jq -e '.' "$claim" >/dev/null 2>&1 || continue
-  CFROM=$(lb_claim_field "$STATE" "$CID" from)
-  CCLASS=$(lb_claim_field "$STATE" "$CID" class)
+  CFROM=$(lb_claim_field "$STATE" "$CID" from) || continue
+  CCLASS=$(lb_claim_field "$STATE" "$CID" class) || continue
   [ "$CCLASS" != reply ] || continue
   if [ "$CFROM" = "$LB_PEER" ]; then
     VERB=stale
-    [ -z "$(lb_claim_field "$STATE" "$CID" replied)" ] || continue
-    CTASK=$(lb_claim_field "$STATE" "$CID" task)
+    CREPLIED=$(lb_claim_field "$STATE" "$CID" replied) || continue
+    [ -z "$CREPLIED" ] || continue
+    CTASK=$(lb_claim_field "$STATE" "$CID" task) || continue
     if [ -n "$CTASK" ] && [ -e "$STATE/$CTASK.meta" ]; then continue; fi
   elif [ "$CFROM" = "$LB_SELF" ]; then
     VERB=unanswered
     [ -e "$SENT/$CID.receipt" ] || continue
-    [ -z "$(lb_claim_field "$STATE" "$CID" consumed)" ] || continue
+    CCONSUMED=$(lb_claim_field "$STATE" "$CID" consumed) || continue
+    [ -z "$CCONSUMED" ] || continue
   else
     continue
   fi
-  CNUMBER=$(lb_claim_field "$STATE" "$CID" issue)
+  CNUMBER=$(lb_claim_field "$STATE" "$CID" issue) || continue
   case "$OPEN_NUMBERS" in
     *" $CNUMBER "*) : ;;
     *) continue ;;
   esac
-  CLAIMED=$(lb_claim_field "$STATE" "$CID" claimed)
+  CLAIMED=$(lb_claim_field "$STATE" "$CID" claimed) || continue
   case "$CLAIMED" in ''|*[!0-9]*) continue ;; esac
   [ "$((NOW - CLAIMED))" -ge "$LB_STALE_SECS" ] || continue
-  RESURFACED=$(lb_claim_field "$STATE" "$CID" resurfaced)
+  RESURFACED=$(lb_claim_field "$STATE" "$CID" resurfaced) || continue
   case "$RESURFACED" in ''|*[!0-9]*) RESURFACED=0 ;; esac
   [ "$((NOW - RESURFACED))" -ge "$LB_STALE_SECS" ] || continue
   announce "$VERB $CID $CCLASS"
@@ -606,7 +662,7 @@ if [ "$ITEMS" -eq 0 ]; then
   exit 0
 fi
 
-printf 'letterbox %s items: %s\n' "$ITEMS" "$LINE"
+printf 'letterbox %s items: %s\n' "$ITEMS" "$LINE" || exit 1
 
 # CLAIM-LAST. Only now that the announcement has been printed may anything that
 # suppresses a future announcement be written. A crash above this line re-runs

@@ -44,6 +44,10 @@
 # control ordering); lb_* reuses its private-artifact primitives rather than
 # keeping a second copy of that contract.
 
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+fi
+
 # The four activation keys. All four must be present for the letterbox to exist
 # at all; any one missing leaves the whole feature inert, which is the Relay
 # activation contract applied to a second source.
@@ -509,8 +513,13 @@ lb_card_validate() {
 # --- serialising ------------------------------------------------------------
 
 lb_body_block() {
-  printf 'body: |\n'
-  sed -e 's/^/  /' < "$1"
+  local tail_byte
+  printf 'body: |\n' || return 1
+  sed -e 's/^/  /' < "$1" || return 1
+  if [ -s "$1" ]; then
+    tail_byte=$(tail -c 1 "$1") || return 1
+    [ -z "$tail_byte" ] || printf '\n' || return 1
+  fi
 }
 
 lb_card_preamble() {
@@ -525,14 +534,14 @@ lb_card_preamble() {
 lb_card_request_write() {
   local out=$1 id=$2 class=$3 subject=$4 issued=$5 expires=$6 bodyfile=$7
   {
-    lb_card_preamble
-    printf '%s\n' "$LB_CARD_FENCE"
+    lb_card_preamble || return 1
+    printf '%s\n' "$LB_CARD_FENCE" || return 1
     printf 'kind: request\nv: 1\nid: %s\nfrom: %s\nto: %s\nclass: %s\nissued: %s\n' \
-      "$id" "$LB_SELF" "$LB_PEER" "$class" "$issued"
-    [ -z "$expires" ] || printf 'expires: %s\n' "$expires"
-    printf 'subject: %s\n' "$subject"
-    lb_body_block "$bodyfile"
-    printf '%s\n' '```'
+      "$id" "$LB_SELF" "$LB_PEER" "$class" "$issued" || return 1
+    [ -z "$expires" ] || printf 'expires: %s\n' "$expires" || return 1
+    printf 'subject: %s\n' "$subject" || return 1
+    lb_body_block "$bodyfile" || return 1
+    printf '%s\n' '```' || return 1
   } > "$out"
 }
 
@@ -540,12 +549,12 @@ lb_card_request_write() {
 lb_card_reply_write() {
   local out=$1 id=$2 correlate=$3 status=$4 issued=$5 bodyfile=$6
   {
-    lb_card_preamble
-    printf '%s\n' "$LB_CARD_FENCE"
+    lb_card_preamble || return 1
+    printf '%s\n' "$LB_CARD_FENCE" || return 1
     printf 'kind: reply\nv: 1\nid: %s\nin-reply-to: %s\nfrom: %s\nto: %s\nstatus: %s\nissued: %s\n' \
-      "$id" "$correlate" "$LB_SELF" "$LB_PEER" "$status" "$issued"
-    lb_body_block "$bodyfile"
-    printf '%s\n' '```'
+      "$id" "$correlate" "$LB_SELF" "$LB_PEER" "$status" "$issued" || return 1
+    lb_body_block "$bodyfile" || return 1
+    printf '%s\n' '```' || return 1
   } > "$out"
 }
 
@@ -707,10 +716,13 @@ lb_claim_set_number() {
 # Prints "<reply-id> <status>" or nothing.
 lb_first_reply() {
   local state=$1 sent=$2 winner status dir claim
-  winner=$(lb_claim_field "$state" "$sent" first_reply)
+  winner=$(lb_claim_field "$state" "$sent" first_reply) || return 2
   if [ -n "$winner" ]; then
-    status=$(lb_claim_field "$state" "$sent" first_reply_status)
-    [ -n "$status" ] || status=$(lb_claim_field "$state" "$winner" status)
+    status=$(lb_claim_field "$state" "$sent" first_reply_status) || return 2
+    if [ -z "$status" ]; then
+      status=$(lb_claim_field "$state" "$winner" status) || return 2
+    fi
+    [ -n "$status" ] || return 2
     printf '%s %s\n' "$winner" "$status"
     return 0
   fi
@@ -719,8 +731,10 @@ lb_first_reply() {
     [ -e "$claim" ] || continue
     winner=$(jq -r --arg s "$sent" \
       'select(.class == "reply" and .in_reply_to == $s and (.refusal // "") == "")
-       | "\(.id) \(.status // "")"' "$claim" 2>/dev/null)
+       | "\(.id) \(.status // "")"' "$claim" 2>/dev/null) || return 2
     [ -n "$winner" ] || continue
+    status=${winner#* }
+    [ -n "$status" ] && [ "$status" != "$winner" ] || return 2
     printf '%s\n' "$winner"
     return 0
   done
@@ -796,7 +810,11 @@ lb_claim_close_record() {
 # LB_SCAN_REASON names the class and never the value.
 lb_scan_refuses() {
   local file=$1 out rc
-  out=$("${LB_SCRIPT_DIR:?}/fm-secret-scan.sh" "$file" 2>/dev/null); rc=$?
+  if out=$("${LB_SCRIPT_DIR:?}/fm-secret-scan.sh" "$file" 2>/dev/null); then
+    rc=0
+  else
+    rc=$?
+  fi
   case "$rc" in
     0) LB_SCAN_REASON=; return 1 ;;
     1) LB_SCAN_REASON=${out#refused: } ;;
@@ -827,8 +845,11 @@ lb_transport_dependencies() {
     LB_TRANSPORT_DIAGNOSTIC="transport adapter $LB_TRANSPORT is missing or unreadable"
     return 1
   fi
-  out=$(FM_LETTERBOX_REPO="$LB_REPO" bash "$adapter" dependencies 2>/dev/null)
-  rc=$?
+  if out=$(FM_LETTERBOX_REPO="$LB_REPO" bash "$adapter" dependencies 2>/dev/null); then
+    rc=0
+  else
+    rc=$?
+  fi
   if [ "$rc" -eq 0 ]; then
     LB_TRANSPORT_DIAGNOSTIC=
     return 0
