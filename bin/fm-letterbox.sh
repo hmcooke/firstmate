@@ -669,6 +669,22 @@ resend_in_flight() {
   printf '%s\n' "$corrected"
 }
 
+# The corrected notice recorded as resent_as whose receipt is now present and
+# whose outbox record names this notice: the obligation is discharged. Reported
+# outcomes are a function of this STATE, not of which crash window an earlier
+# attempt happened to die in, because firstmate and replayed agents route on
+# exit codes and a failing exit for finished work causes retries of nothing.
+resend_discharged() {
+  local notice=$1 corrected record
+  corrected=$(lb_claim_field "$STATE" "$notice" resent_as) || return 1
+  [ -n "$corrected" ] || return 1
+  lb_id_valid "$corrected" || return 1
+  record="$(lb_dir "$STATE" outbox)/$corrected.json"
+  [ -f "$record" ] && [ -e "$(lb_dir "$STATE" sent)/$corrected.receipt" ] || return 1
+  [ "$(jq -r '.resends // ""' "$record" 2>/dev/null)" = "$notice" ] || return 1
+  printf '%s\n' "$corrected"
+}
+
 require_resend_target() {
   local notice=$1 class=$2
   [ "$class" = notice ] || die "--resends is only valid for a notice; the corrected letter must be class notice"
@@ -685,7 +701,7 @@ require_resend_target() {
 }
 
 cmd_send() {
-  local class='' subject='' file='' expires='' resends='' id title out number url body card in_flight=''
+  local class='' subject='' file='' expires='' resends='' id title out number url body card in_flight='' completed
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --class) need_value "$@"; class=$2; shift 2 ;;
@@ -730,16 +746,22 @@ cmd_send() {
   # Reconciliation can discharge the very obligation this send names: a
   # corrected notice that failed at the transport is retried or adopted above
   # and recorded as resent_as, so the target is checked AGAIN before a new id
-  # exists, or one transport failure would yield two corrected notices. When
-  # the invocation is itself the retry of an interrupted corrected notice, the
-  # receipt reconciliation just completed IS the whole job.
-  if [ -n "$in_flight" ]; then
-    [ -e "$(lb_dir "$STATE" sent)/$in_flight.receipt" ] \
+  # exists, or one transport failure would yield two corrected notices. The
+  # early check above admitted this invocation only while the target was NOT
+  # yet discharged, so a discharge present now was completed by the
+  # reconciliation this invocation just ran, whichever window the earlier
+  # attempt died in: create failed outright, death between the sent claim and
+  # the resent_as rewrite, or death before the receipt. All three are the same
+  # success, reported the same way.
+  if [ -n "$resends" ]; then
+    if completed=$(resend_discharged "$resends"); then
+      printf 'completed the corrected notice %s for %s; nothing new was sent\n' "$completed" "$resends"
+      return 0
+    fi
+    [ -z "$in_flight" ] \
       || die "the corrected notice $in_flight for $resends is still unsent; run status"
-    printf 'completed the corrected notice %s for %s; nothing new was sent\n' "$in_flight" "$resends"
-    return 0
+    require_resend_target "$resends" "$class"
   fi
-  [ -z "$resends" ] || require_resend_target "$resends" "$class"
 
   id=$(lb_id_new) || die "cannot generate a letter id"
   title=$(lb_issue_title "$class" "$id")

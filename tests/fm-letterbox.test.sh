@@ -2861,9 +2861,52 @@ test_a_retried_corrected_notice_is_sent_exactly_once() {
   assert_present "$home/state/letterbox/sent/$new_id.receipt" "resent_as must name the notice that actually landed"
   [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = "" ] \
     || fail "the resend obligation must be discharged"
-  [ "$rc" -ne 0 ] || fail "a rerun whose target reconciliation already discharged must not report a second send"
-  assert_contains "$out" "already re-sent as $new_id" "the rerun must name the notice that discharged the obligation"
-  pass "rerunning a corrected-notice send after a transport failure sends exactly one corrected notice"
+  [ "$rc" -eq 0 ] || fail "completing an existing discharge is a success, not a failure (rc=$rc): $out"
+  assert_contains "$out" "completed the corrected notice $new_id for $id; nothing new was sent" \
+    "the rerun must report completion with the same wording as every other interrupted window"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject again --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a second corrected notice for a discharged target must still be refused"
+  assert_contains "$out" "already re-sent as $new_id" "the genuine rejection must name the discharge"
+  [ "$(jq -r --arg t "[letterbox] notice " '[.[] | select(.title | startswith($t))] | length' "$store/issues.json")" = 2 ] \
+    || fail "the refused second attempt must create nothing"
+  pass "rerunning a corrected-notice send after a transport failure sends exactly one corrected notice and reports completion"
+}
+
+test_a_resend_interrupted_before_its_bookkeeping_is_completed_by_the_same_invocation() {
+  local home store fakebin out rc id number new_id count
+  read -r home store fakebin <<< "$(fixture resend-bookkeeping-crash | tr '\n' ' ')"
+  printf 'notice\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  inject_reply "$store" "$number" archie-20260824T141902Z-3b71c40d "$id" unable "not acceptable"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
+  printf 'fixed\n' > "$home/fixed.txt"
+  # The create lands and the sent claim is written; the resent_as rewrite that
+  # follows it is the claim write that fails.
+  out=$(LB_MKTEMP_ALLOW=2 LB_MKTEMP_COUNTER="$home/mktemp.count" \
+    run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "the send must fail when the resend bookkeeping cannot be recorded (got: $out)"
+  assert_contains "$out" "could not be recorded" "the failure must be the bookkeeping itself"
+  [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "the crash must land before resent_as is recorded"
+  count=$(jq -r --arg t "[letterbox] notice " '[.[] | select(.title | startswith($t))] | length' "$store/issues.json")
+  [ "$count" = 2 ] || fail "the corrected notice must already exist on the forge"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "rerunning the interrupted invocation must complete it with exit 0 (rc=$rc): $out"
+  new_id=$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")
+  [ -n "$new_id" ] && [ "$new_id" != null ] || fail "resent_as must be completed by the rerun"
+  assert_contains "$out" "adopted existing letter $new_id" "the rerun must adopt the notice that already landed"
+  assert_contains "$out" "completed the corrected notice $new_id for $id; nothing new was sent" \
+    "the rerun must report completion with the shared wording"
+  assert_present "$home/state/letterbox/sent/$new_id.receipt" "the rerun must complete the receipt"
+  count=$(jq -r --arg t "[letterbox] notice " '[.[] | select(.title | startswith($t))] | length' "$store/issues.json")
+  [ "$count" = 2 ] || fail "the rerun must not create a second corrected notice (found $((count - 1)))"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "the obligation must be discharged"
+  pass "a resend interrupted between the sent claim and its bookkeeping is completed by the same invocation"
 }
 
 
@@ -3073,3 +3116,4 @@ test_a_retried_corrected_notice_is_sent_exactly_once
 test_a_reply_whose_record_fails_after_the_post_is_never_posted_twice
 test_a_failed_poll_workdir_still_raises_the_durable_alarm
 test_the_same_resend_invocation_completes_its_own_interrupted_receipt
+test_a_resend_interrupted_before_its_bookkeeping_is_completed_by_the_same_invocation
