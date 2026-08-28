@@ -194,6 +194,7 @@ The adapter reports the class of its refusal in its exit status (2 for not priva
 
 That converts "the repository was accidentally made public" from a silent, ongoing exposure into a hard stop plus an alarm.
 The refusal is recorded durably under `state/letterbox/write-error`, so the poll raises it as a wake even if the turn that hit it was lost, and it re-alarms once per `FM_LETTERBOX_STALE_SECS` window until a write lands.
+A `visibility` record is never replaced by a later `transport` one, and the poll carries the alarm on its configuration and dependency diagnostics too, so no earlier fault can silence it.
 
 A refused write never stops the read path: intake, reply detection and the backstops all continue.
 A successful read does **not** retire the record, for either error class.

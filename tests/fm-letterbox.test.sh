@@ -2755,6 +2755,108 @@ test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record() {
   pass "a checked serialized-card read precedes outbox publication and transport"
 }
 
+test_a_visibility_alarm_is_never_downgraded_by_a_later_transport_failure() {
+  local home store fakebin out
+  read -r home store fakebin <<< "$(fixture visibility-preserved | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  printf 'false\n' > "$store/private"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" >/dev/null 2>&1 \
+    && fail "a write into a public channel must be refused"
+  [ "$(head -n1 "$home/state/letterbox/write-error")" = visibility ] \
+    || fail "the confirmed-public refusal must be recorded under visibility"
+  # The visibility check itself now cannot run: a weaker, transport-class failure.
+  rm -f "$store/private"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" 2>&1) \
+    && fail "a write whose visibility check cannot run must be refused"
+  assert_contains "$out" "cannot read $CHANNEL visibility" "the second refusal must name its own cause"
+  [ "$(head -n1 "$home/state/letterbox/write-error")" = visibility ] \
+    || fail "a confirmed-public alarm must never be downgraded to transport by a later, weaker failure (got: $(head -n1 "$home/state/letterbox/write-error"))"
+  printf 'true\n' > "$store/private"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "is not private" "the poll must still raise the confirmed-public event"
+  # A write that lands is still the only thing that retires the alarm.
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" >/dev/null \
+    || fail "the send must succeed once the channel is private again"
+  assert_absent "$home/state/letterbox/write-error" "a landed write clears the alarm"
+  pass "a confirmed-public visibility alarm survives a later transport-class failure until a write lands"
+}
+
+test_a_durable_alarm_is_raised_on_every_diagnostic_early_exit() {
+  local home store fakebin out no_gh
+  read -r home store fakebin <<< "$(fixture alarm-early-exit | tr '\n' ' ')"
+  printf 'body\n' > "$home/body.txt"
+  printf 'false\n' > "$store/private"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject s --file "$home/body.txt" >/dev/null 2>&1 \
+    && fail "a write into a public channel must be refused"
+  assert_present "$home/state/letterbox/write-error" "the refusal must leave its durable alarm"
+  printf 'true\n' > "$store/private"
+
+  # The configuration-fault exit.
+  printf 'FM_LETTERBOX_TRANSPORT=carrier-pigeon\n' >> "$home/.env"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  assert_contains "$out" "unsupported transport carrier-pigeon" "the configuration fault must be announced"
+  assert_contains "$out" "is not private" \
+    "the durable visibility alarm must ride the same wake as the configuration fault, not be suppressed by it"
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] || fail "the fault and the alarm must share one wake line"
+  out=$(run_poll "$home" "$store" "$fakebin")
+  [ -z "$out" ] || fail "the combined diagnostic must be rate-limited (got: $out)"
+
+  # The missing-dependency exit.
+  sed 's/FM_LETTERBOX_TRANSPORT=carrier-pigeon/FM_LETTERBOX_TRANSPORT=github/' "$home/.env" \
+    > "$home/env.new" && mv "$home/env.new" "$home/.env"
+  rm -f "$fakebin/gh"
+  no_gh="$home/no-gh.bash"
+  cat > "$no_gh" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = gh ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+SH
+  out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$no_gh")
+  assert_contains "$out" "missing transport dependency: gh" "the missing dependency must be announced"
+  assert_contains "$out" "is not private" \
+    "the durable visibility alarm must ride the same wake as the dependency fault"
+  out=$(run_poll "$home" "$store" "$fakebin" BASH_ENV="$no_gh")
+  [ -z "$out" ] || fail "the combined dependency diagnostic must be rate-limited (got: $out)"
+  assert_present "$home/state/letterbox/write-error" "no read path may retire the alarm"
+  pass "a durable write alarm is raised on the configuration and dependency early exits"
+}
+
+test_a_retried_corrected_notice_is_sent_exactly_once() {
+  local home store fakebin out rc id number new_id count
+  read -r home store fakebin <<< "$(fixture resend-retry | tr '\n' ' ')"
+  printf 'The notice that needs correction.\n' > "$home/body.txt"
+  run_lb "$home" "$store" "$fakebin" send --class notice --subject update --file "$home/body.txt" >/dev/null \
+    || fail "the notice send must succeed"
+  id=$(sole_sent_id "$home") || fail "the send must leave a receipt"
+  number=$(head -n1 "$home/state/letterbox/sent/$id.receipt")
+  inject_reply "$store" "$number" archie-20260824T141902Z-3b71c40d "$id" unable "not acceptable"
+  run_poll "$home" "$store" "$fakebin" >/dev/null
+  run_lb "$home" "$store" "$fakebin" close "$id" >/dev/null || fail "the unable notice must close"
+  printf 'The corrected notice.\n' > "$home/fixed.txt"
+  : > "$store/fail-create"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "the corrected notice's create is deliberately failed"
+  [ "$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "a corrected notice that never landed must not be recorded as the resend"
+  rm -f "$store/fail-create"
+  out=$(run_lb "$home" "$store" "$fakebin" send --class notice --subject fixed --file "$home/fixed.txt" --resends "$id" 2>&1); rc=$?
+  count=$(jq -r --arg t "[letterbox] notice " '[.[] | select(.title | startswith($t))] | length' "$store/issues.json")
+  [ "$count" = 2 ] \
+    || fail "one transport failure must produce exactly one corrected notice beside the original, not $((count - 1)) (output: $out)"
+  new_id=$(jq -r '.resent_as' "$home/state/letterbox/claims/$id.json")
+  [ -n "$new_id" ] && [ "$new_id" != null ] || fail "resent_as must point at the corrected notice"
+  assert_present "$home/state/letterbox/sent/$new_id.receipt" "resent_as must name the notice that actually landed"
+  [ "$(jq -r '.resend_required' "$home/state/letterbox/claims/$id.json")" = "" ] \
+    || fail "the resend obligation must be discharged"
+  [ "$rc" -ne 0 ] || fail "a rerun whose target reconciliation already discharged must not report a second send"
+  assert_contains "$out" "already re-sent as $new_id" "the rerun must name the notice that discharged the obligation"
+  pass "rerunning a corrected-notice send after a transport failure sends exactly one corrected notice"
+}
+
+
 # ---------------------------------------------------------------------------
 
 if [ -n "${FM_LETTERBOX_TEST_ONLY:-}" ]; then
@@ -2867,3 +2969,6 @@ test_a_visibility_refusal_reports_when_its_alarm_cannot_be_published
 test_output_failure_cannot_flush_announcement_or_diagnostic_suppressions
 test_reconciliation_never_adopts_after_a_required_outbox_field_read_fails
 test_a_failed_serialized_card_read_cannot_publish_an_empty_outbox_record
+test_a_visibility_alarm_is_never_downgraded_by_a_later_transport_failure
+test_a_durable_alarm_is_raised_on_every_diagnostic_early_exit
+test_a_retried_corrected_notice_is_sent_exactly_once

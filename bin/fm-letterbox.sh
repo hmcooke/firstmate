@@ -59,7 +59,8 @@
 # when the check itself could not run. The transport adapter re-checks at its
 # own boundary and reports the class in its exit status, so a repository that
 # flips between the two checks is still recorded under "visibility". Neither
-# class is cleared by a read; both keep alarming until a write lands. Every write
+# class is cleared by a read, and a visibility record is never downgraded by a
+# later transport failure; both keep alarming until a write lands. Every write
 # that carries card bytes also runs bin/fm-secret-scan.sh over the assembled card
 # first and refuses on anything but a clean result; it refuses, it never redacts.
 set -euo pipefail
@@ -128,8 +129,21 @@ ensure_dirs() {
 # on the next cycle. Cleared by the next write that actually lands. The first
 # line is the class (visibility or transport) so the poll reports it structurally
 # rather than inferring its kind from the prose.
+#
+# A visibility record is NEVER replaced by a transport one: a confirmed-public
+# channel is the most captain-facing event this feature can raise, and a later
+# check that merely could not run proves nothing about whether the channel is
+# private again. Only a landed write retires it, through clear_write_error.
 record_write_error() {
-  lb_text_publish "$(ROOT_DIR)" "write-error" 600 "$1" "$2" 2>/dev/null
+  local class=$1 msg=$2 existing
+  if [ "$class" = transport ] && fmx_private_artifact_file_valid "$(ROOT_DIR)" "write-error" 600; then
+    if ! existing=$(head -n1 "$(ROOT_DIR)/write-error" 2>/dev/null); then
+      # An unreadable existing alarm is preserved rather than overwritten blind.
+      existing=visibility
+    fi
+    [ "$existing" != visibility ] || return 0
+  fi
+  lb_text_publish "$(ROOT_DIR)" "write-error" 600 "$class" "$msg" 2>/dev/null
 }
 
 clear_write_error() {
@@ -682,6 +696,11 @@ cmd_send() {
   require_sendable "$subject" "$body"
   ensure_dirs
   reconcile_unsent
+  # Reconciliation can discharge the very obligation this send names: a
+  # corrected notice that failed at the transport is retried or adopted above
+  # and recorded as resent_as, so the target is checked AGAIN before a new id
+  # exists, or one transport failure would yield two corrected notices.
+  [ -z "$resends" ] || require_resend_target "$resends" "$class"
 
   id=$(lb_id_new) || die "cannot generate a letter id"
   title=$(lb_issue_title "$class" "$id")

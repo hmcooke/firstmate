@@ -25,7 +25,9 @@
 #                                          retries, so a flaky network never
 #                                          spends a firstmate turn
 #   a configuration fault or a
-#   missing dependency                  -> one rate-limited diagnostic line
+#   missing dependency                  -> one rate-limited diagnostic line,
+#       which also carries any durable write alarm below, so a fault found
+#       first can never silence a refused write
 #   a refused write recorded by
 #   fm-letterbox.sh                     -> raised as an error item, and READS
 #       CONTINUE: a refused write never disables intake. Neither the "transport"
@@ -108,27 +110,10 @@ mark_error_raised() {
   lb_text_publish "$ROOT" "poll-error" 600 "$(date -u +%s)" "$1" 2>/dev/null
 }
 
-emit_error_once() {
-  local msg=$1
-  error_raised_within "$msg" 0 && return 0
-  printf 'letterbox error: %s\n' "$msg" || return 1
-  if ! mark_error_raised "$msg"; then
-    # A missing marker deliberately leaves a delivered diagnostic eligible to repeat.
-    :
-  fi
-}
-
 clear_error() {
   fmx_private_artifact_dir_device "$ROOT" >/dev/null 2>&1 || return 0
   rm -f "$ROOT/poll-error" 2>/dev/null
 }
-
-if [ -n "$LB_CONFIG_ERROR" ]; then
-  emit_error_once "$LB_CONFIG_ERROR"
-  exit 0
-fi
-command -v jq >/dev/null 2>&1 || { emit_error_once "missing jq"; exit 0; }
-lb_transport_dependencies || { emit_error_once "$LB_TRANSPORT_DIAGNOSTIC"; exit 0; }
 
 # A write that fm-letterbox.sh refused - most importantly the visibility
 # precondition - is durable state, so it survives the turn that hit it and is
@@ -158,6 +143,32 @@ PENDING_ERROR=
 if [ -n "$WRITE_ERROR_MSG" ] && ! error_raised_within "$WRITE_ERROR_MSG" "$WRITE_ERROR_WINDOW"; then
   PENDING_ERROR=$WRITE_ERROR_MSG
 fi
+
+# THE ONE DIAGNOSTIC BOUNDARY. Every path that ends this cycle with a diagnostic
+# instead of the ordinary announcement line goes through here, so the durable
+# write alarm loaded above rides the same wake rather than being silenced by a
+# fault that happens to be found first. The combined text is what is printed,
+# and it is what the rate-limit marker records, so the marker can only ever
+# suppress a wake that was actually delivered: it is written AFTER the print,
+# which is claim-last applied to alarms.
+diagnostic_exit() {
+  local text=$1 window=0
+  if [ -n "$WRITE_ERROR_MSG" ]; then
+    text="$text; error: $WRITE_ERROR_MSG"
+    window=$WRITE_ERROR_WINDOW
+  fi
+  error_raised_within "$text" "$window" && exit 0
+  printf 'letterbox error: %s\n' "$text" || exit 1
+  if ! mark_error_raised "$text"; then
+    # A missing marker deliberately leaves a delivered diagnostic eligible to repeat.
+    :
+  fi
+  exit 0
+}
+
+[ -z "$LB_CONFIG_ERROR" ] || diagnostic_exit "$LB_CONFIG_ERROR"
+command -v jq >/dev/null 2>&1 || diagnostic_exit "missing jq"
+lb_transport_dependencies || diagnostic_exit "$LB_TRANSPORT_DIAGNOSTIC"
 
 WORK=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/fm-letterbox-poll.XXXXXX") || exit 0
 # Cleanup failure cannot change the poll result after private work is done.
@@ -394,8 +405,7 @@ while [ "$i" -lt "$COUNT" ]; do
     '{id:$id,kind:$kind,class:$class,from:$from,to:$to,subject:$subject,
       issued:$issued,expires:$expires,expired:($expired=="true"),body:$body,
       issue:$issue,seen:$seen}'; then
-    emit_error_once "cannot write the letterbox inbox"
-    exit 0
+    diagnostic_exit "cannot write the letterbox inbox"
   fi
   announce "new $ID $LB_F_CLASS $LB_F_FROM"
   queue_claim "$ID" "$LB_F_CLASS" "$LB_F_FROM" "$NUMBER" ""
