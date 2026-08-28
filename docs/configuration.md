@@ -211,7 +211,7 @@ The full cmux home label also includes a short hash of the resolved `FM_ROOT` pa
 
 claude, codex, opencode, pi, pi-signed, grok, kimi, and cursor are empirically verified for crewmate and secondmate launches; [README requirements](../README.md#requirements) own the set supported for the primary session.
 A cursor secondmate or primary runs the tracked project-scope `.cursor/hooks.json` in its own home and must be launched with `--trust`, or no project hook loads; [`docs/supervision-protocols/cursor.md`](supervision-protocols/cursor.md) owns its supervision protocol.
-Cursor submit confirmation remains available on the verified tmux and Herdr paths, while the [Herdr backend contract](herdr-backend.md#native-agent-state-submit-confirmation) owns the narrow composer exclusions and active limits and [runtime backend verification](verification/runtime-backends.md#cursor-agent-cli) owns the empirical evidence.
+Cursor submit confirmation remains available on the verified tmux and Herdr paths, while the [Herdr backend contract](herdr-backend.md#current-transport-behavior) owns the narrow composer exclusions and active limits and [runtime backend verification](verification/runtime-backends.md#cursor-agent-cli) owns the empirical evidence.
 muse is verified for crewmate and scout launches ONLY, and `fm-spawn.sh` refuses it for a secondmate, because muse ships no usable hook surface for a primary session's turn-end supervision; [`docs/verification/muse.md`](verification/muse.md) owns that evidence.
 muse also needs a worker-reachable credential before spawning, and the portable fleet path is the `<config>/muse/auth.json` credential stored by `muse login`, because a caller-only `META_API_KEY` does not cross a long-lived backend daemon.
 New harnesses get verified through a supervised trial task before joining the set.
@@ -362,7 +362,8 @@ The watcher accepts the shim only when its bytes match the expected generated co
 This section is the single owner of the Relay cadence contract: a Relay instance polls every 30 seconds instead of the default 300, only a Relay instance speeds up because a non-Relay home has no `config/x-mode.env`, and the session-start supervision operating block includes the cadence instruction when that file exists.
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
-While away mode is active the daemon owns the watcher and its default cadence applies; away-mode Relay cadence is a deferred follow-up.
+While away mode is active, the daemon's default cadence applies once it owns the watcher cycle; [`watcher-continuity.md`](watcher-continuity.md) owns the bounded collision behavior while an earlier cycle retains the singleton.
+Away-mode Relay cadence remains a deferred follow-up.
 When the token is removed or empty, the next locked session-start bootstrap step removes those artifacts.
 Steady-state off is silent and writes nothing.
 Relay remains additive to non-Relay lifecycle behavior: homes without the generated artifacts keep the default watcher cadence and do not run the Relay poll.
@@ -620,10 +621,12 @@ FM_WEDGE_ALARM_CHANNEL=            # override config/wedge-alarm with one active
 FM_WEDGE_ALARM_EXEC=              # notifier seam: route every channel (osascript, herdr, command:) through this command as `<cmd> <channel> <summary>`; "discard" fires nothing; unset in production; the daemon defaults it to "discard" when sourced so no test posts a real notification (docs/wedge-alarm.md)
 FM_WEDGE_ALARM_TIMEOUT_SECS=10    # maximum seconds for each osascript, herdr, override, or command: notifier before its watchdog terminates it and continues to the next channel; invalid or zero values use 10
 FM_INJECT_FAIL_SLEEP=30            # seconds to back off when the supervisor pane is unavailable
-FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts after typing a digest once
+FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts per confirmed-submit call, both after typing a digest and during own-unsent recovery
 FM_INJECT_CONFIRM_SLEEP=0.5        # seconds between daemon submit checks
+FM_INJECT_RECOVER_ATTEMPTS=3       # Enter-only recovery cycles allowed for one buffered digest; an affirmatively empty composer resets the episode
 FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
 FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale/pause-recheck, and scan passes
+FM_WATCHER_COLLISION_ESCALATE_SECS=600 # seconds before one persistent pre-away watcher-ownership collision escalation is queued; 0 disables
 FM_CRASH_THRESHOLD=10              # watcher crashes allowed inside FM_CRASH_WINDOW before daemon backoff
 FM_CRASH_WINDOW=60                 # seconds in the crash-loop detection window
 FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash threshold

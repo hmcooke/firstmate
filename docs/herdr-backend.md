@@ -243,7 +243,8 @@ ANSI capture preserves de-emphasized placeholder style.
 If the ANSI capture ever fails, the plain fallback declares itself unstyled and the classifier degrades a glyph row carrying trailing text to `unknown` instead of misreading ghost suggestions as typed input, which safely defers injection and eventually raises the wedge alarm.
 
 A bare shell prompt is never an empty agent composer.
-Away-mode injection proceeds only on an affirmative `empty` result, never on unknown.
+Typing a new away-mode digest proceeds only on an affirmative `empty` result, never on unknown.
+The [own-unsent recovery](#own-unsent-recovery) below is the sole later-cycle exception to the away-mode pre-injection guard for a pending composer.
 This prevents a dead agent pane from receiving and possibly executing an escalation as shell input.
 
 The current operational envelope starts with U+2063 and `FIRSTMATE_OP: `.
@@ -303,9 +304,10 @@ The daemon types a digest once and never retypes it, so an Enter that does not c
 Without recovery the composer guard then reads `pending` on every later cycle and refuses to type for as long as the text sits there, which turns one swallowed Enter into an indefinite away-mode delivery outage that only a human clearing the pane can end.
 
 The daemon may therefore resubmit a pending composer with Enter alone, and only when the extracted composer content begins with its own away-supervisor envelope (`bin/fm-operational-input.sh`).
-That envelope is authorship evidence, so the recovery can never submit or alter text somebody else typed: any other pending content keeps deferring and alarming exactly as before.
+Only content carrying that envelope at the start is treated as daemon-authored; every other pending composer keeps deferring and alarming exactly as before.
 Recovery reads the composer through `fm_backend_composer_content`, which returns the composer region only, so a digest already delivered and echoed into the transcript above cannot be mistaken for unsent text.
 Re-sends are bounded per buffered digest, and an unrecoverable composer still raises the max-defer wedge alarm.
+An affirmatively empty composer ends the episode and restores the full recovery budget, so an exhausted budget cannot starve a later digest.
 When the buffer has grown since the digest was typed, the recovered submit does not clear it and the newer items are delivered by the next flush.
 
 Authorship is proven from the envelope alone, so recovery only reaches a digest whose envelope is still visible in the composer.
@@ -352,6 +354,8 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 
 ```sh
 tests/fm-backend-herdr.test.sh
+tests/fm-composer-lib.test.sh
+tests/fm-daemon.test.sh
 tests/fm-backend-presence.test.sh
 tests/fm-backend-herdr-smoke.test.sh
 tests/fm-backend-herdr-prune-safety-e2e.test.sh

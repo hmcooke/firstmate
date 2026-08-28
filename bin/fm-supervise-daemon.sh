@@ -23,8 +23,8 @@
 #
 # IN-BAND OPERATIONAL INPUT. bin/fm-operational-input.sh constructs every
 # current daemon injection as the typed away-supervisor kind after the stable
-# FM_OPERATIONAL_PREFIX. A human cannot type its leading U+2063 from a normal
-# keyboard at the start of a message, and Herdr transports it as text.
+# FM_OPERATIONAL_PREFIX. U+2063 has no normal keyboard keystroke, and Herdr
+# transports it as text.
 # Firstmate's contract: a message that starts with the current prefix, or a
 # legacy bare-marker daemon escalation, is internal (stay afk); an unmarked
 # message means the captain is back (exit afk, flush catch-up, resume per-wake
@@ -33,12 +33,11 @@
 # /afk.
 #
 # Reliability model (see the /afk skill):
-#   - Nothing is lost in away mode: while state/.afk exists, the watcher reverts
-#     to daemon-owned one-shot behavior and enqueues every wake to
-#     state/.wake-queue BEFORE advancing its suppression markers, so a
-#     crash/restart/missed injection is recovered on the next fm-wake-drain.sh.
-#     After a watcher cycle, the daemon handles every durable row through that
-#     drain and acknowledges it only after routing completes.
+#   - Nothing is lost in away mode: while state/.afk exists, every watcher cycle
+#     uses one-shot behavior and enqueues each wake to state/.wake-queue BEFORE
+#     advancing its suppression markers. Once the daemon wins the home-scoped
+#     singleton, it handles every durable row through fm-wake-drain.sh and
+#     acknowledges it only after routing completes.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
 #   - Bounded wedge latency: a stale pane without a declared external wait is
@@ -134,6 +133,15 @@
 #                                   not misread as pending input.
 #          FM_INJECT_CONFIRM_SLEEP  seconds between daemon submit checks
 #                                   (default 0.5)
+#          FM_INJECT_RECOVER_ATTEMPTS Enter-only recovery cycles allowed for
+#                                   one buffered digest (default 3). An
+#                                   affirmatively empty composer ends the
+#                                   episode and restores the full budget.
+#          FM_WATCHER_COLLISION_ESCALATE_SECS seconds before a persistent
+#                                   pre-away watcher ownership collision is
+#                                   queued once for escalation (default 600;
+#                                   0 disables). Verified daemon ownership ends
+#                                   the episode.
 #          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
@@ -1110,18 +1118,13 @@ window_for_task() {  # <task-key> [state]
 # One swallowed Enter used to end away-mode delivery permanently. inject_msg
 # types the digest ONCE and deliberately leaves it in the composer when the
 # submit cannot be confirmed; from the next cycle the composer guard reads
-# `pending` and refuses to type, forever. Measured on the live fleet
-# (2026-08-27/28): 5,545 consecutive `composer not confirmed-empty
-# (state=pending)` deferrals over 22.9h, ended only by a human touching the
-# pane, with the wedge alarm firing into an empty room the whole time.
+# `pending` and refuses to type for as long as the text remains.
 #
 # Recovery is permitted for EXACTLY one thing: our OWN away-supervisor envelope
-# still sitting unsent in the composer. That envelope is authorship evidence -
-# a human draft cannot begin with the U+2063 FIRSTMATE_OP header - so
-# re-sending Enter submits our own message and can never submit, alter, or
-# destroy someone else's input. Every other pending composer keeps deferring
-# and alarming exactly as before, which is the captain-draft guarantee pinned
-# by tests/fm-daemon.test.sh.
+# still sitting unsent in the composer. Only content beginning with that
+# envelope is treated as daemon-authored, so every other pending composer keeps
+# deferring and alarming exactly as before. tests/fm-daemon.test.sh pins the
+# captain-draft guarantee.
 #
 # Enter ONLY, never a retype: the text is already there, and retyping would
 # concatenate two sentinel-prefixed digests into one corrupted turn.
@@ -1249,10 +1252,9 @@ inject_recover_own_unsent() {  # <target> <backend> <state> <current-msg>
 #     Pending means Enter was swallowed; unknown is treated as undelivered by
 #     this strict daemon path.
 #   - COMPOSER GUARD before typing: if the cursor line already has real content
-#     after dim/faint ghost text and borders are ignored (a human's half-typed
-#     line, or a previous injection's unsent text), defer entirely - injecting
-#     would merge with the human's text. The one exception is our OWN unsent
-#     envelope, which inject_recover_own_unsent above resubmits with Enter only
+#     after dim/faint ghost text and borders are ignored, never type a new
+#     digest. Human text remains deferred, while the one exception for our OWN
+#     unsent envelope lets inject_recover_own_unsent above resubmit Enter only
 #     so a single swallowed Enter cannot end away-mode delivery permanently.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded
@@ -1330,9 +1332,9 @@ inject_msg() {  # <message> [state]
     rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
     return 0  # Backend confirmed the submit.
   fi
-  # Our text is now sitting unsent in the composer. Record it verbatim so the
-  # next cycle can tell a full recovery (same digest, buffer clearable) from a
-  # partial one (buffer has grown since), and so recovery attempts stay bounded.
+  # Our text is now sitting unsent in the composer. Record it as session-scoped
+  # diagnostic evidence; recovery compares the extracted composer with the
+  # current digest directly and never trusts this sidecar as authorship proof.
   printf '%s' "$msg" > "$state/.subsuper-inject-unsent" 2>/dev/null || true
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1

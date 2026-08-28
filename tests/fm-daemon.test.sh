@@ -1189,9 +1189,8 @@ test_max_defer_pending_composer_alarms_without_typing() {
 #
 # A swallowed Enter leaves OUR digest in the composer, and before recovery
 # existed that state was permanent: the composer guard read `pending` and
-# refused to type for as long as the text sat there (measured live 2026-08-27/28
-# as 5,545 consecutive deferrals over 22.9h). Recovery resubmits our own
-# envelope with Enter only. A human's draft is still never touched.
+# refused to type for as long as the text sat there. Recovery resubmits our own
+# envelope with Enter only. Pending text without that envelope is untouched.
 
 test_own_unsent_recovery_after_swallowed_enter_clears_buffer() {
   local dir state fakebin sent attempts

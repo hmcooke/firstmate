@@ -916,7 +916,7 @@ Before those were taught to the shared edge detector, a bare composer's wrap reg
 Measured as an A/B on the same live pane, the pre-fix classifier returned `pending` and the current one returned `empty`.
 
 The 2026-08-12 rendered-footer transition made `bin/fm-send.sh` exit 0 after the steer executed, and its only stable token shared the selected composer row.
-The portable submit regression preserves that observed success while [`docs/herdr-backend.md`](../herdr-backend.md#native-agent-state-submit-confirmation) owns the current narrow exclusion contract and active limits.
+The portable submit regression preserves that observed success while [`docs/herdr-backend.md`](../herdr-backend.md#current-transport-behavior) owns the current narrow exclusion contract and active limits.
 
 The rest of the lifecycle was driven end to end on that worker:
 
