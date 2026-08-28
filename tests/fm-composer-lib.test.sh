@@ -809,6 +809,30 @@ test_composer_content_refuses_an_unselectable_screen() {
   pass "composer content read refuses a screen with no selectable composer"
 }
 
+test_busy_matcher_excludes_composer_text_and_keeps_external_footers() {
+  local harness token inside outside
+  while IFS="$(printf '\t')" read -r harness token; do
+    [ -n "$harness" ] || continue
+    inside=$(printf 'earlier transcript\n❯ pending text says %s\n' "$token")
+    if printf '%s' "$inside" | fm_busy_lines_match "$harness"; then
+      fail "$harness busy text inside the selected composer established busy"
+    fi
+    outside=$(printf '%s\n❯ ordinary pending text\n' "$token")
+    printf '%s' "$outside" | fm_busy_lines_match "$harness" \
+      || fail "$harness busy footer outside the selected composer stopped matching"
+  done <<'EOF'
+claude	esc to interrupt
+codex	esc to interrupt
+opencode	esc interrupt
+pi	Working...
+pi-signed	Working...
+grok	Ctrl+c:cancel
+kimi	🌑 · thinking
+cursor	ctrl+c to stop
+EOF
+  pass "the shared busy matcher excludes composer text and preserves every external harness footer"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
 test_bare_shell_prompt_with_command_is_not_empty
@@ -846,3 +870,4 @@ test_selected_content_is_composer_scoped_and_wrap_normalized
 test_composer_content_excludes_a_delivered_digest_above_it
 test_composer_content_anchors_our_unsent_envelope
 test_composer_content_refuses_an_unselectable_screen
+test_busy_matcher_excludes_composer_text_and_keeps_external_footers

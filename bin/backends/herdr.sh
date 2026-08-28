@@ -2780,23 +2780,12 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 #     re-invokes this function from scratch with the same text after seeing
 #     an error, which is a human/escalation decision, not an automatic
 #     retry).
-# Fallback path, for a harness whose native agent-state is never legibly idle
-# (measured live: herdr reports a cursor pane `blocked` in every state - idle,
-# mid-turn, and after - so the idle-baseline path above is structurally
-# unreachable for it). That harness always lands in the composer branch, and
-# cursor's mid-turn composer row renders its own placeholder beside a
-# right-aligned `ctrl+c to stop`, so the content verdict is `pending` on a
-# composer that holds no user text at all and every steer reported delivery
-# unconfirmed on a message that had actually landed.
-# The escape is the SAME semantic signal the idle-baseline path uses, read from
-# the pane's verified busy footer instead of native agent-state, and it is the
-# rendered-footer twin of the tmux submit core's turn-started confirmation
-# (bin/fm-tmux-lib.sh): an idle-to-busy transition ACROSS our Enter is proof the
-# harness accepted the submission. The baseline is taken before the first Enter
-# and only when the native baseline was not legibly idle, so the idle-baseline
-# path still never reads pane content, and a pane already mid-turn before we
-# typed keeps reporting `pending` rather than borrowing someone else's turn as
-# proof of our own delivery.
+# Fallback path, for a harness whose native agent-state is not legibly idle:
+# an idle-to-busy rendered-footer transition ACROSS our Enter proves the
+# harness accepted the submission. The shared matcher excludes the selected
+# composer region from both observations, so pending input cannot supply either
+# side of that proof. A pane already mid-turn before we typed keeps reporting
+# `pending` rather than borrowing someone else's turn as proof of our delivery.
 # Echoes empty|pending|unknown|send-failed, a subset of the proof-carrying
 # submit vocabulary. Empty means confirmed submitted for every backend; how
 # each backend confirms it is an internal decision, and herdr's is no longer
@@ -2819,11 +2808,15 @@ fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
     else
       sleep "$sleep_s"
       verdict=$(fm_backend_herdr_composer_state "$target")
-      if [ "$verdict" = pending ] && [ "$raw_status" != working ] \
-        && [ "$footer_baseline" = idle ] \
-        && [ "$(fm_backend_herdr_rendered_busy_state "$target")" = busy ]; then
-        verdict=busy
-      fi
+      case "$verdict" in
+        pending|unknown)
+          if [ "$raw_status" != working ] \
+            && [ "$footer_baseline" = idle ] \
+            && [ "$(fm_backend_herdr_rendered_busy_state "$target")" = busy ]; then
+            verdict=busy
+          fi
+          ;;
+      esac
     fi
     case "$verdict" in
       busy) printf 'empty'; return 0 ;;

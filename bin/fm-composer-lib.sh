@@ -319,10 +319,7 @@ fm_composer_strip_ghost() {
 # exposes no stable ASCII busy token.
 # The harness-less default is the UNION of the per-harness tokens below, used
 # when a caller has no recorded harness for the pane (the submit cores read the
-# baseline and the post-Enter transition this way). cursor's `ctrl+c to stop` is
-# part of that union for the same reason the others are: without it a cursor
-# submit could never be acknowledged, because cursor parks its terminal cursor
-# outside its composer and the composer verdict is therefore always `unknown`.
+# baseline and the post-Enter transition this way).
 FM_DELIVERY_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel|ctrl\+c to stop'
 FM_DELIVERY_CLAUDE_BUSY_REGEX_DEFAULT='esc to interrupt|…[[:space:]]+\([0-9]+[smh]'
 FM_DELIVERY_CODEX_BUSY_REGEX_DEFAULT='esc to interrupt'
@@ -342,6 +339,7 @@ FM_DELIVERY_KIMI_BUSY_REGEX_DEFAULT='^[[:space:]]*(🌑|🌒|🌓|🌔|🌕|🌖
 fm_busy_lines_match() {  # [harness]
   local harness=${1:-} lines regex
   IFS= read -r -d '' lines || true
+  lines=$(_fm_busy_lines_without_selected_composer "$lines")
   if [ -n "${FM_BUSY_REGEX:-}" ]; then
     regex=$FM_BUSY_REGEX
   else
@@ -362,6 +360,25 @@ fm_busy_lines_match() {  # [harness]
     esac
   fi
   [ -n "$regex" ] && printf '%s' "$lines" | grep -qiE "$regex"
+}
+
+_fm_busy_lines_without_selected_composer() {  # <screen>
+  local screen=$1 plain row=0 raw
+  plain=$(printf '%s\n' "$screen" | fm_composer_strip_ansi)
+  _fm_composer_scan_screen "$plain" '' 1
+  if ! _fm_composer_select_cursorless "$plain"; then
+    printf '%s' "$screen"
+    return 0
+  fi
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    if [ "$row" -lt "$FM_COMPOSER_SELECTED_FIRST" ] \
+       || [ "$row" -gt "$FM_COMPOSER_SELECTED_LAST" ]; then
+      printf '%s\n' "$raw"
+    fi
+    row=$((row + 1))
+  done <<EOF
+$screen
+EOF
 }
 
 # The prompt glyphs, each declared exactly once (see THE SAFETY RULE above).

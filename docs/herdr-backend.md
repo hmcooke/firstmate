@@ -218,9 +218,10 @@ A fully unreadable target stops retrying and reports unknown.
 
 Some harnesses never present a legibly idle native baseline at all, so the composer fallback is their only path.
 Herdr reports a Cursor pane `blocked` in every state, and Cursor's mid-turn composer renders its placeholder beside a right-aligned busy token, which is composer content and therefore `pending` on a composer that holds no user text.
-That fallback alone reported every delivered steer as unconfirmed, so it is paired with a rendered-footer transition: the pane's verified busy footer is read once before the first Enter, and an idle-to-busy transition across that Enter confirms the submit.
+The shared rendered-busy matcher excludes the selected composer region, so pending input can never establish either side of a rendered-footer transition.
+An idle-to-busy footer transition outside the composer still confirms the submit when native state is unavailable and the post-Enter composer is pending or unknown.
 It is the same semantic signal the native path uses and the same one the tmux submit core reads, so a pane already mid-turn before the text was typed still reports `pending` rather than borrowing another turn as proof of this delivery.
-The composer verdict itself is deliberately unchanged: a right-aligned status token on the composer row stays content for every other caller, including the away-mode pre-injection guard.
+Cursor's right-aligned status token shares its composer row, so a Cursor steer on Herdr lands but reports delivery unconfirmed rather than treating indistinguishable pending input as proof.
 The poll density bounds the residual possibility of an extremely fast complete turn; a missed transition can cause only a redundant Enter on an empty composer, never duplicate message text.
 
 `pane read --lines N` can return empty output when N is below the viewport height.
