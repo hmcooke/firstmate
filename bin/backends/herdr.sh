@@ -2711,12 +2711,12 @@ fm_backend_herdr_composer_content() {  # <target> -> composer text on stdout
 # harness whose native state never transitions. Without a harness argument the
 # shared matcher uses its union of verified tokens, which is what the submit
 # core wants: it has no recorded harness for the pane.
-fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unknown
-  local target=$1 harness=${2:-} cap visible
+fm_backend_herdr_rendered_busy_state() {  # <target> [harness] [composer-mode] -> busy|idle|unknown
+  local target=$1 harness=${2:-} composer_mode=${3:-exclude} cap visible
   cap=$(fm_backend_herdr_capture "$target" 40) || { printf 'unknown'; return 0; }
   visible=$(printf '%s' "$cap" | grep -v '^[[:space:]]*$' | tail -12)
   [ -n "$visible" ] || { printf 'unknown'; return 0; }
-  if printf '%s' "$cap" | fm_busy_lines_match "$harness" 12; then
+  if printf '%s' "$cap" | fm_busy_lines_match "$harness" 12 "$composer_mode"; then
     printf 'busy'
   else
     printf 'idle'
@@ -2776,10 +2776,9 @@ fm_backend_herdr_rendered_busy_state() {  # <target> [harness] -> busy|idle|unkn
 #     only another Enter retry.
 # Fallback path, for a harness whose native agent-state is not legibly idle:
 # an idle-to-busy rendered-footer transition ACROSS our Enter proves the
-# harness accepted the submission. The shared matcher excludes the selected
-# composer region from both observations, so pending input cannot supply either
-# side of that proof. A pane already mid-turn before we typed keeps reporting
-# `pending` rather than borrowing someone else's turn as proof of our delivery.
+# harness accepted the submission. The pre-Enter baseline excludes the selected
+# composer region, while the post-Enter read includes the cleared row so a
+# harness-owned status token there can prove that the turn started.
 # Echoes empty|pending|unknown|send-failed, a subset of the proof-carrying
 # submit vocabulary. Empty means confirmed submitted for every backend; how
 # each backend confirms it is an internal decision, and herdr's is no longer
@@ -2807,7 +2806,7 @@ fm_backend_herdr_submit_enter() {  # <target> <retries> <enter-sleep>
         pending|unknown)
           if [ "$raw_status" != working ] \
             && [ "$footer_baseline" = idle ] \
-            && [ "$(fm_backend_herdr_rendered_busy_state "$target")" = busy ]; then
+            && [ "$(fm_backend_herdr_rendered_busy_state "$target" '' include)" = busy ]; then
             verdict=busy
           fi
           ;;

@@ -3651,36 +3651,34 @@ test_send_text_submit_confirms_external_footer_transition() {
   pass "fm_backend_herdr_send_text_submit: an external rendered-footer transition confirms delivery when native state is not idle"
 }
 
-test_submit_enter_excludes_an_unsent_digest_from_its_footer_baseline() {
+test_submit_enter_confirms_cursor_footer_after_excluding_digest_baseline() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-enter-own-digest-footer"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/1.out"
-  printf '%b' 'transcript\n  ❯ \342\201\243FIRSTMATE_OP: v1 away-supervisor: done: captured esc to interrupt\n' > "$resp/2.out"
-  printf '  Working... esc to interrupt\n' > "$resp/4.out"
-  printf '  Working... esc to interrupt\n' > "$resp/5.out"
+  printf '%b' 'transcript\n  → \342\201\243FIRSTMATE_OP: v1 away-supervisor: done: captured ctrl+c to stop\n' > "$resp/2.out"
+  herdr_cursor_midturn_ansi > "$resp/4.out"
+  herdr_cursor_midturn_plain > "$resp/5.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_submit_enter default:w1:p2 2 0.01' "$ROOT" )
-  [ "$out" = empty ] || fail "an external busy transition did not confirm recovery after the composer-only token was excluded from its baseline: $out"
+  [ "$out" = empty ] || fail "cursor's post-Enter composer-row footer did not confirm recovery after the pending digest was excluded from its baseline: $out"
   enter_count=$(grep -c $'\x1f''pane'$'\x1f''send-keys'$'\x1f''w1:p2'$'\x1f''enter' "$log")
   [ "$enter_count" -eq 1 ] || fail "confirmed Enter-only recovery sent $enter_count Enter(s)"
   [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" 2>/dev/null || true)" -eq 0 ] \
     || fail "Enter-only recovery retyped the digest"
-  pass "fm_backend_herdr_submit_enter: composer-only busy text cannot poison the baseline or block confirmation"
+  pass "fm_backend_herdr_submit_enter: cursor confirms from its post-Enter row without letting digest text poison the baseline"
 }
 
-test_send_text_submit_never_idle_native_state_keeps_pending_without_a_transition() {
+test_send_text_submit_busy_baseline_keeps_pending_without_a_transition() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-cursor-no-transition"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   # The pane was ALREADY mid-turn before our Enter, so its busy footer is not
   # evidence about OUR message: the verdict must stay pending rather than
   # borrowing someone else's turn as proof of our delivery.
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/2.out"
-  herdr_cursor_midturn_plain > "$resp/3.out"
-  herdr_cursor_midturn_ansi > "$resp/5.out"
-  herdr_cursor_midturn_plain > "$resp/6.out"
-  herdr_cursor_midturn_ansi > "$resp/8.out"
-  herdr_cursor_midturn_plain > "$resp/9.out"
+  printf '  Working... esc to interrupt\n  ❯ hello captain\n' > "$resp/3.out"
+  printf '  Working... esc to interrupt\n  ❯ hello captain\n' > "$resp/5.out"
+  printf '  Working... esc to interrupt\n  ❯ hello captain\n' > "$resp/7.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "hello captain" 2 0.01 0.01' "$ROOT" )
@@ -4538,8 +4536,8 @@ test_composer_state_cursor_midturn_row_reads_pending
 test_rendered_busy_state_excludes_the_cursor_token_inside_composer
 test_rendered_busy_state_preserves_full_capture_geometry
 test_send_text_submit_confirms_external_footer_transition
-test_submit_enter_excludes_an_unsent_digest_from_its_footer_baseline
-test_send_text_submit_never_idle_native_state_keeps_pending_without_a_transition
+test_submit_enter_confirms_cursor_footer_after_excluding_digest_baseline
+test_send_text_submit_busy_baseline_keeps_pending_without_a_transition
 test_send_text_submit_confirms_despite_codex_idle_tip_composer
 test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint
 test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change

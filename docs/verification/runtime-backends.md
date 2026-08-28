@@ -848,7 +848,7 @@ with-cursor : unknown      cursorless : unknown   (agent exited to a shell)
 
 `bin/fm-tmux-lib.sh` therefore reclassifies cursorlessly only when the pane's foreground process group is provably Cursor, so every other harness keeps the strict blank-cursor-row posture.
 That supplies the genuine composer-empty proof required for away-mode escalation delivery.
-A live injection through `bin/fm-supervise-daemon.sh`'s own `inject_msg` into a real Cursor pane returned 0 and the pane processed the typed `FIRSTMATE_OP: v1 away-supervisor:` escalation.
+On 2026-08-13, a live injection through `bin/fm-supervise-daemon.sh`'s own `inject_msg` into a real Cursor pane on tmux returned 0 and the pane processed the typed `FIRSTMATE_OP: v1 away-supervisor:` escalation.
 
 `tests/fm-tmux-agent-liveness.test.sh` pins this with real processes and no Cursor installed: it asserts the cursor-anchored source is blind, that the composite still reads `empty` idle and `pending` with typed text, that an identical screen stays `unknown` when the pane is not Cursor, and that a stale Cursor screen over a dead shell never reads `empty`.
 
@@ -915,8 +915,8 @@ Herdr draws the composer's rules with the half-block glyphs U+2584 and U+2580 ra
 Before those were taught to the shared edge detector, a bare composer's wrap region ran through its own closing rule and swallowed the model and path footer, so an idle pane read `pending`.
 Measured as an A/B on the same live pane, the pre-fix classifier returned `pending` and the current one returned `empty`.
 
-The 2026-08-12 rendered-footer transition made `bin/fm-send.sh` exit 0 after the steer executed, but its only stable token shared the selected composer row.
-The shared matcher now excludes that row because unsent input can contain the same token, so current Herdr delivery fails safe as unconfirmed after the steer lands.
+The 2026-08-12 rendered-footer transition made `bin/fm-send.sh` exit 0 after the steer executed, and its only stable token shared the selected composer row.
+The current submit contract excludes that row from the pre-Enter baseline so unsent input cannot establish busy, then includes it in the post-Enter transition read after the submitted text has cleared.
 
 The rest of the lifecycle was driven end to end on that worker:
 
@@ -929,8 +929,8 @@ The rest of the lifecycle was driven end to end on that worker:
 Other harnesses on Herdr are unaffected by the edge-detector change.
 All seven live panes of the running default session - one Pi, four Claude, two plain shells - classified identically under the pre-fix and current classifiers.
 
-**Cursor delivery confirmation is unavailable on every backend.**
-The stable token shares the selected composer row, so the fleet-wide matcher excludes it and `fm-send` reports delivery unconfirmed after the steer lands.
+**Cursor delivery confirmation is available on the verified tmux and Herdr paths.**
+Herdr confirms the post-Enter transition from Cursor's stable composer-row token while keeping that row excluded from the pre-Enter baseline.
 
 The portable regression is `tests/fm-cursor-harness.test.sh`, the composer captures are pinned in `tests/fm-composer-lib.test.sh`, and the Herdr submit and footer behavior is pinned in `tests/fm-backend-herdr.test.sh`.
 Refresh this harness-dependent proof before accepting a cursor upgrade:

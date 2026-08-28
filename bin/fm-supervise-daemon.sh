@@ -1180,6 +1180,22 @@ _inject_recover_attempts_reset() {  # <state>
   [ ! -e "$counter" ] || rm -f "$counter" 2>/dev/null
 }
 
+_inject_unsent_matches() {  # <state> <message>
+  local record="$1/.subsuper-inject-unsent" saved
+  [ -f "$record" ] || return 1
+  saved=$(cat "$record" 2>/dev/null) || return 1
+  [ "$saved" = "$2" ]
+}
+
+_inject_unsent_store() {  # <state> <message>
+  local record="$1/.subsuper-inject-unsent" tmp
+  tmp="$record.tmp.$$"
+  if ! printf '%s' "$2" > "$tmp" 2>/dev/null || ! mv "$tmp" "$record" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
 # inject_recover_own_unsent: submit our own unsent digest with Enter only.
 #
 # Returns 0 ONLY when the submit was confirmed AND the recovered text is the
@@ -1316,11 +1332,23 @@ inject_msg() {  # <message> [state]
   # re-export of fm_tmux_submit_core - byte-identical to calling it directly.
   retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
+  if _inject_unsent_matches "$state" "$msg"; then
+    log "ERROR: away-mode escalation delivery ambiguous; refusing to retype the recorded digest and clearing its buffer."
+    rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
+    : > "$state/.subsuper-escalations"
+    rm -f "$state/.subsuper-escalations.since" 2>/dev/null || true
+    return 0
+  fi
   # Reaching an affirmatively empty composer ends any previous unsent episode:
   # whatever was stuck is gone, so a fresh digest starts with a full recovery
   # budget rather than inheriting an exhausted one.
   if ! _inject_recover_attempts_reset "$state"; then
     log "inject deferred: stale recovery budget could not be cleared"
+    inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
+    return 1
+  fi
+  if ! _inject_unsent_store "$state" "$msg"; then
+    log "inject deferred: unsent digest record could not be persisted"
     inject_wedge_alarm "$state" "$(_oldest_line_age "$state/.subsuper-escalations")"
     return 1
   fi
@@ -1331,10 +1359,12 @@ inject_msg() {  # <message> [state]
     rm -f "$state/.subsuper-inject-unsent" "$state/.subsuper-inject-recover-attempts" 2>/dev/null || true
     return 0  # Backend confirmed the submit.
   fi
+  if [ "$verdict" = send-failed ]; then
+    rm -f "$state/.subsuper-inject-unsent" 2>/dev/null || true
+  fi
   # Our text is now sitting unsent in the composer. Record it verbatim so the
   # next cycle can tell a full recovery (same digest, buffer clearable) from a
   # partial one (buffer has grown since), and so recovery attempts stay bounded.
-  printf '%s' "$msg" > "$state/.subsuper-inject-unsent" 2>/dev/null || true
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
   return 1
 }

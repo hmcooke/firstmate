@@ -336,11 +336,15 @@ FM_DELIVERY_GROK_BUSY_REGEX_DEFAULT='Ctrl\+c:cancel'
 FM_DELIVERY_CURSOR_BUSY_REGEX_DEFAULT='ctrl\+c to stop'
 FM_DELIVERY_KIMI_BUSY_REGEX_DEFAULT='^[[:space:]]*(🌑|🌒|🌓|🌔|🌕|🌖|🌗|🌘)[[:space:]]+·[[:space:]]+'
 
-fm_busy_lines_match() {  # [harness] [nonblank-limit]
-  local harness=${1:-} limit=${2:-12} lines regex
+fm_busy_lines_match() {  # [harness] [nonblank-limit] [composer-mode]
+  local harness=${1:-} limit=${2:-12} composer_mode=${3:-exclude} lines regex
   case "$limit" in ''|0|*[!0-9]*) return 1 ;; esac
   IFS= read -r -d '' lines || true
-  lines=$(_fm_busy_lines_without_selected_composer "$lines")
+  case "$composer_mode" in
+    exclude) lines=$(_fm_busy_lines_without_selected_composer "$lines") ;;
+    include) ;;
+    *) return 1 ;;
+  esac
   lines=$(printf '%s' "$lines" | grep -v '^[[:space:]]*$' | tail "-$limit")
   if [ -n "${FM_BUSY_REGEX:-}" ]; then
     regex=$FM_BUSY_REGEX
