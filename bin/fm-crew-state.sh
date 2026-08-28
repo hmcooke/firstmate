@@ -354,8 +354,9 @@ nm_effective_ci_step_status() {
 # actual PR #252 run). Reads the ci step's log tail via `axi logs` and scans it
 # for the MOST RECENT recognized marker (the log is append-only/chronological,
 # so the last match is current): green with nothing red after it means CI is
-# green right now, active repair is distinct from a pending external check, and
-# otherwise the run is still waiting on CI.
+# green right now, a failure or issue marker means active repair, a pending-check
+# marker means the run is waiting on CI, and missing or unrecognized evidence is
+# unknown.
 nm_ci_checks_state() {
   local run_id log_tail marker
   run_id=$(strip_quotes "$(nm_field id)")
